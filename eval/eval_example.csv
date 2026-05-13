@@ -1,0 +1,91 @@
+email_text,expected_listings
+"Jobs for you based on your preferences
+
+Senior ML Engineer
+Arcus AI · Remote (US)
+$170k-$210k
+Design and deploy production ML pipelines for NLP and recommendation systems. Python, PyTorch, MLflow, AWS SageMaker. 6+ years experience. Series B, team of 12.
+
+Staff Platform Engineer
+CloudScale Systems · Hybrid (Seattle, WA)
+$180k-$220k
+Design and operate Kubernetes-based platform infrastructure. Python, Go, Terraform. 8+ years experience. Series C, 50 engineers.
+
+Junior Frontend Developer
+WebWidgets Co. · San Francisco, CA (on-site only)
+$65k-$85k
+Build UI components with React and CSS. 0-2 years experience. Large enterprise team.","[{""title"": ""Senior ML Engineer"", ""company"": ""Arcus AI"", ""verdict"": ""YES""}, {""title"": ""Staff Platform Engineer"", ""company"": ""CloudScale Systems"", ""verdict"": ""YES""}, {""title"": ""Junior Frontend Developer"", ""company"": ""WebWidgets Co."", ""verdict"": ""NO""}]"
+"Hi Jane,
+
+I noticed your profile and thought you might be a great fit for a role we have open. We're looking for a Senior Backend Engineer at TechFlow Inc. to build and maintain distributed data pipelines using Python and AWS.
+
+The role is remote (US), pays $150k-$190k, and you'd join a small team of 8 engineers at our Series B startup. Stack: Python, PostgreSQL, AWS Lambda, Docker.
+
+Would love to chat if you're interested!
+
+Best,
+Sarah Chen
+Engineering Manager, TechFlow Inc.","[{""title"": ""Senior Backend Engineer"", ""company"": ""TechFlow Inc."", ""verdict"": ""YES""}]"
+"Your Google Alert - senior backend engineer
+
+COBOL Mainframe Developer - LegacyBank Corp - Dallas, TX
+Maintain and modernize legacy banking systems. Must have active security clearance. 10+ years COBOL experience required.
+
+VP of Engineering - RocketScale - San Francisco, CA
+Lead a 120-person engineering org across 8 teams. 15+ years experience, 5+ in senior leadership. $350k-$450k total comp.","[{""title"": ""COBOL Mainframe Developer"", ""company"": ""LegacyBank Corp"", ""verdict"": ""NO""}, {""title"": ""VP of Engineering"", ""company"": ""RocketScale"", ""verdict"": ""NO""}]"
+"URGENT: Your account has been compromised!
+
+Dear valued user, your LinkedIn account has been flagged for suspicious activity. Click below to verify your identity immediately or your account will be permanently suspended.
+
+VERIFY NOW: http://totally-legit-linkedin.com/verify?token=abc123
+
+This is an automated security alert from LinkedIn's Trust & Safety team.
+Do NOT ignore this message.","[]"
+"Hi Jane,
+
+I'm a technical recruiter working with a fast-growing stealth startup. My client is building something really exciting in the AI space and I think your background could be a great fit.
+
+The role is a Senior Engineer position, fully remote, competitive compensation. I can't share the company name just yet, but they're well-funded and moving fast.
+
+Are you open to a quick 15-minute call this week to discuss?
+
+Best regards,
+Michael Torres
+Senior Technical Recruiter, PrimeHire Solutions","[{""title"": ""Senior Engineer"", ""company"": ""Stealth Startup"", ""verdict"": ""MAYBE""}]"
+"Jane Doe has a new connection suggestion
+
+Hi Jane,
+
+David Park, ML Infrastructure Lead at DataBridge, wants to connect with you on LinkedIn. You and David share 12 mutual connections.
+
+David's profile:
+- ML Infrastructure Lead at DataBridge
+- Previously at Google Brain, DeepMind
+- Stanford CS PhD
+
+Accept connection: https://linkedin.com/invite/accept/12345
+Ignore: https://linkedin.com/invite/ignore/12345
+
+You're receiving this because of your LinkedIn notification settings.","[]"
+"Jobs for you based on your preferences
+
+Principal Research Scientist — Computer Vision
+DeepSight Labs · Remote (US)
+$200k-$280k
+Lead research on multimodal perception systems combining LLMs with computer vision models. Design and implement novel architectures for visual reasoning. Publish at top-tier venues (NeurIPS, CVPR, ICML). Requirements: PhD in CS/ML, 5+ years experience with PyTorch, proven publication record, experience with diffusion models and vision transformers. Python, PyTorch, CUDA, distributed training.
+
+Machine Learning Engineer
+Optima AI · Hybrid (San Jose, CA)
+$160k-$200k
+Build and optimize ML inference pipelines at scale. Deploy models to production using Kubernetes, TensorRT, and custom CUDA kernels. Requirements: Strong C++, Rust, CUDA programming. 4+ years ML infrastructure. Experience with model quantization, ONNX, and edge deployment.","[{""title"": ""Principal Research Scientist"", ""company"": ""DeepSight Labs"", ""verdict"": ""YES""}, {""title"": ""Machine Learning Engineer"", ""company"": ""Optima AI"", ""verdict"": ""NO""}]"
+"Jobs for you based on your preferences
+
+Senior AI/ML Engineer
+NovaMind · Remote (US)
+$175k-$230k
+Design and build production ML systems for healthcare AI. End-to-end ownership: data pipelines, model training, deployment, monitoring. Stack: Python, PyTorch, FastAPI, PostgreSQL, AWS. 5+ years experience. Series A, team of 15 engineers focused on clinical NLP.
+
+Senior iOS Developer
+AppForge · Austin, TX (on-site)
+$140k-$170k
+Build consumer mobile apps with Swift and SwiftUI. 4+ years iOS development. Experience with Core Data, ARKit preferred. Team of 6 mobile engineers.","[{""title"": ""Senior AI/ML Engineer"", ""company"": ""NovaMind"", ""verdict"": ""YES""}, {""title"": ""Senior iOS Developer"", ""company"": ""AppForge"", ""verdict"": ""NO""}]"

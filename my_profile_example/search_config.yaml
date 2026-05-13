@@ -1,0 +1,58 @@
+# JobSpy search configuration — generic Machine Learning / AI Engineer template
+#
+# This file drives Track A (proactive polling) in src/jobspy_ingest.py.
+# The pipeline reads from `my_profile/search_config.yaml` at runtime, so:
+#
+#   1. cp -r my_profile_example my_profile     (one-time setup)
+#   2. Edit my_profile/search_config.yaml      (your search terms and tiers)
+#
+# my_profile/ is gitignored — your customizations stay local and never
+# conflict with `git pull` updates to this template.
+
+# Boards grouped by scraping reliability.
+# Set results_wanted: 0 to disable a tier without removing it.
+site_tiers:
+  - name: friendly   # high success rate
+    sites: ["indeed"]
+    results_wanted: 15
+
+  - name: ok         # occasional blocks
+    sites: ["linkedin"]
+    results_wanted: 10
+
+  - name: hostile    # too unreliable; disabled by default
+    sites: ["glassdoor", "google"]
+    results_wanted: 0
+
+# Each entry runs against every enabled tier above.
+searches:
+  - search_term: "machine learning engineer"
+    location: "United States"
+    hours_old: 24        # only listings posted in the last 24 hours
+    country_indeed: "USA"
+    is_remote: true
+
+  - search_term: "AI engineer"
+    location: "San Francisco Bay Area, CA"
+    hours_old: 24
+    country_indeed: "USA"
+    is_remote: false
+
+delays:
+  between_queries_min: 7   # seconds — randomized to avoid IP bans
+  between_queries_max: 20
+
+# PROXY (OPTIONAL)
+# ----------------
+# When IPROYAL_USERNAME / IPROYAL_PASSWORD are set in .env, every
+# scrape_jobs() call is routed through a sticky residential session
+# (default lifetime 30m, see src/proxy_manager.py). The session id is
+# rotated automatically when:
+#   - the lifetime elapses, or
+#   - jobspy raises (block-prone exception → force_rotate), or
+#   - a downstream HTTP fetch returns 403 / 429 / 999 (DataDome, Cloudflare,
+#     LinkedIn auth wall).
+# No proxy config is needed in this file — it is purely env-driven.
+# Run `apply-pilot-test-proxy` after setting the env vars to verify the
+# stack end-to-end. Recommended for any tier with results_wanted>0 on
+# LinkedIn or Indeed.

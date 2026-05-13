@@ -1,0 +1,72 @@
+[project]
+name = "apply-pilot"
+version = "0.1.0"
+description = "Local-first job search automation pipeline"
+readme = "README.md"
+requires-python = ">=3.11"
+license = {text = "Apache-2.0"}
+
+dependencies = [
+    "python-dotenv>=1.0",
+    "beautifulsoup4>=4.12",
+    "openai>=1.0",
+    "slack-bolt>=1.18",
+    "python-docx>=1.1",
+    "rapidfuzz>=3.0",
+    "geopy>=2.4",
+    "trafilatura>=1.6",
+    "pdfplumber>=0.11",
+    "ddgs>=7.0",
+    "python-jobspy>=1.1",
+    "pyyaml>=6.0",
+]
+
+[project.optional-dependencies]
+dev = [
+    "pytest>=8.0",
+    "pytest-cov>=5.0",
+    "pytest-mock>=3.14",
+    "ruff>=0.5",
+    "pandas>=2.0",
+    "beautifulsoup4>=4.12",
+]
+
+[project.scripts]
+apply-pilot = "src.pipeline:main"
+apply-pilot-ingest = "src.jobspy_ingest:main"
+apply-pilot-digest = "src.digest:main"
+apply-pilot-tailor = "src.tailor:main"
+apply-pilot-sweeper = "src.sweeper:main"
+apply-pilot-batch = "src.batch_process:main"
+apply-pilot-test-proxy = "src.proxy_test:main"
+
+[tool.ruff]
+target-version = "py311"
+line-length = 100
+
+[tool.ruff.lint]
+select = ["E", "F", "W", "I"]
+
+[tool.ruff.lint.per-file-ignores]
+# E402: load_dotenv() must run before importing project modules that call
+# os.getenv at import time.
+# E501: triage.py and tailor.py hold LLM prompt templates as multi-line
+# strings; the prompts are deliberately one prose sentence per source line
+# so an LLM can read them as a single instruction. Splitting with implicit
+# concatenation would mangle the wire-format.
+"src/batch_process.py" = ["E402"]
+"src/digest.py"        = ["E402"]
+"src/jobspy_ingest.py" = ["E402"]
+"src/pipeline.py"      = ["E402"]
+"src/proxy_test.py"    = ["E402"]
+"src/sweeper.py"       = ["E402"]
+"src/triage.py"        = ["E501"]
+"src/tailor.py"        = ["E402", "E501"]
+# Test fixtures often inline long mock-response strings, JSON payloads,
+# URLs, and synthetic Slack/Slack-diff content. Allow long lines here.
+"tests/test_compile.py" = ["E501"]
+"tests/test_tailor.py"  = ["E501"]
+"tests/test_triage.py"  = ["E501"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
