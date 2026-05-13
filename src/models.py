@@ -1,4 +1,4 @@
-"""Data models for the apply-pilot pipeline."""
+"""Data models for the apply-daemon pipeline."""
 
 from __future__ import annotations
 

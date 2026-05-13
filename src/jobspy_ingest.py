@@ -12,7 +12,7 @@ Both tracks share the same database and Smart Upsert dedup logic.
 
 Usage:
     python -m src.jobspy_ingest           # run all configured searches
-    apply-pilot-ingest                    # same via CLI entry point
+    apply-daemon-ingest                    # same via CLI entry point
 """
 
 from __future__ import annotations
