@@ -12,7 +12,7 @@ from rapidfuzz.fuzz import token_set_ratio
 
 from src.models import JobListing
 
-DEFAULT_DB_PATH = Path("apply_pilot.db")
+DEFAULT_DB_PATH = Path("apply_daemon.db")
 
 SCHEMA = """
 CREATE TABLE IF NOT EXISTS listings (

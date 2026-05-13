@@ -78,7 +78,7 @@ def _fetch_ip(proxies: dict | None, timeout: float) -> str:
         IP_ECHO_URL,
         timeout=timeout,
         proxies=proxies or None,
-        headers={"User-Agent": "apply-pilot-proxy-test/1.0"},
+        headers={"User-Agent": "apply-daemon-proxy-test/1.0"},
     )
     response.raise_for_status()
     return response.json()["ip"]

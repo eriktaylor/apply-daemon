@@ -1927,7 +1927,7 @@ def _scrape_for_triage(url: str) -> str:
         try:
             response = session.get(
                 url, timeout=5, verify=True,
-                headers={"User-Agent": "Mozilla/5.0 (compatible; apply-pilot/1.0)"},
+                headers={"User-Agent": "Mozilla/5.0 (compatible; apply-daemon/1.0)"},
             )
         except Exception:
             logger.debug("HTTP fetch failed for %s", url)
