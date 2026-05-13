@@ -50,7 +50,7 @@ def _make_job_card(job_id: str, ts: str = "100.000") -> dict:
     return {
         "ts": ts,
         "metadata": {
-            "event_type": "apply_pilot_listing",
+            "event_type": "apply_daemon_listing",
             "event_payload": {"job_id": job_id},
         },
         "blocks": [],
@@ -103,7 +103,7 @@ class TestExtractJobId:
     def test_missing_job_id(self):
         msg = {
             "metadata": {
-                "event_type": "apply_pilot_listing",
+                "event_type": "apply_daemon_listing",
                 "event_payload": {},
             }
         }
@@ -712,7 +712,7 @@ class TestAutoPassNoVerdictCards:
         mock_app.client.chat_update.assert_not_called()
 
     def test_skips_messages_without_job_id_metadata(self, db, mocker):
-        # A bot message with no apply_pilot_listing metadata — must be a no-op.
+        # A bot message with no apply_daemon_listing metadata — must be a no-op.
         msg = {"ts": "999.000", "blocks": [], "reactions": []}
         mock_app = MagicMock()
         mocker.patch("src.sweeper.time.sleep")

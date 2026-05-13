@@ -43,7 +43,7 @@ def clock() -> _FakeClock:
 @pytest.fixture
 def manager(clock: _FakeClock) -> ProxyManager:
     return ProxyManager(
-        username="apply_pilot_user",
+        username="apply_daemon_user",
         password="hunter2",
         host="geo.iproyal.com",
         port=12321,
@@ -101,7 +101,7 @@ class TestMagicString:
         # IPRoyal magic-string lives in the PASSWORD field per their docs:
         # http://USER:PASS_session-XXXXXXXX_lifetime-30m@HOST:PORT
         match = re.match(
-            r"^http://apply_pilot_user:hunter2_session-([a-z0-9]{8})_lifetime-30m"
+            r"^http://apply_daemon_user:hunter2_session-([a-z0-9]{8})_lifetime-30m"
             r"@geo\.iproyal\.com:12321$",
             url,
         )
