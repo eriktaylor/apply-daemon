@@ -69,11 +69,24 @@ class TestExtractJobId:
     def test_valid_metadata(self):
         msg = {
             "metadata": {
-                "event_type": "apply_pilot_listing",
+                "event_type": "apply_daemon_listing",
                 "event_payload": {"job_id": "abc-123"},
             }
         }
         assert _extract_job_id(msg) == "abc-123"
+
+    def test_legacy_event_type_still_detected(self):
+        # Dual-read regression: cards posted before the apply-pilot →
+        # apply-daemon rename carry the legacy event_type. They must
+        # still be recognized for as long as the legacy tag is in
+        # _LISTING_EVENT_TYPES.
+        msg = {
+            "metadata": {
+                "event_type": "apply_pilot_listing",
+                "event_payload": {"job_id": "legacy-1"},
+            }
+        }
+        assert _extract_job_id(msg) == "legacy-1"
 
     def test_wrong_event_type(self):
         msg = {

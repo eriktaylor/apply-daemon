@@ -263,7 +263,7 @@ def post_digest() -> bool:
                 attachment = build_digest_listing_attachment(listing, history=history)
                 listing_id = listing.get("id", "")
                 metadata = {
-                    "event_type": "apply_pilot_listing",
+                    "event_type": "apply_daemon_listing",
                     "event_payload": {"job_id": listing_id},
                 }
                 app.client.chat_postMessage(
