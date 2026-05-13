@@ -1,4 +1,4 @@
-# apply-pilot — project briefing
+# apply-daemon — project briefing
 
 ## Project overview
 

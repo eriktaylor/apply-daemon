@@ -2616,7 +2616,7 @@ def _post_interview_prep_thread(
 
 def main() -> None:
     import argparse
-    parser = argparse.ArgumentParser(description="Apply Pilot Slack sweeper")
+    parser = argparse.ArgumentParser(description="Apply Daemon Slack sweeper")
     parser.add_argument(
         "--deep",
         metavar="N",

@@ -1,6 +1,6 @@
 ## Rotating residential proxy (recommended for heavy scraping)
 
-Apply Pilot is fully usable from your home IP for casual polling — a single Indeed tier and a few `!triage` commands per day will not draw attention. However, if you raise `results_wanted` on LinkedIn, run multiple proactive cycles per day, or aim Track C deep-research scrapes at hardened ATS pages, your home IP **will** eventually trip Cloudflare / DataDome / LinkedIn's auth wall and the pipeline will silently start returning empty descriptions to the LLM.
+Apply Daemon is fully usable from your home IP for casual polling — a single Indeed tier and a few `!triage` commands per day will not draw attention. However, if you raise `results_wanted` on LinkedIn, run multiple proactive cycles per day, or aim Track C deep-research scrapes at hardened ATS pages, your home IP **will** eventually trip Cloudflare / DataDome / LinkedIn's auth wall and the pipeline will silently start returning empty descriptions to the LLM.
 
 **Recommendation:**
 
@@ -32,7 +32,7 @@ When both credentials are set, every `scrape_jobs()` call configured in `my_prof
 **Verify the proxy is working — run this before firing the pipeline:**
 
 ```bash
-python -m src.proxy_test     # or: apply-pilot-test-proxy
+python -m src.proxy_test     # or: apply-daemon-test-proxy
 ```
 
 The smoke test runs five sequential checks against the live IPRoyal endpoint and exits non-zero on the first failure:
@@ -43,7 +43,7 @@ The smoke test runs five sequential checks against the live IPRoyal endpoint and
 4. Forced session rotation, exit IP fetched again — confirms the rotation path.
 5. The mocked unit suite (`tests/test_proxy_manager.py`, ~38 tests, no IPRoyal traffic) runs as a regression check.
 
-A successful run uses ≈200 bytes of IPRoyal data and leaves a sticky session warm in `.cache/iproyal_session.json`. The next `apply-pilot-ingest`, `apply-pilot`, or `!triage` reuses the **same** exit IP for the rest of the 30-minute lifetime — no second handshake, no second `session-{id}` allocation. If the lifetime has expired by the time you run them, a fresh session is opened automatically.
+A successful run uses ≈200 bytes of IPRoyal data and leaves a sticky session warm in `.cache/iproyal_session.json`. The next `apply-daemon-ingest`, `apply-daemon`, or `!triage` reuses the **same** exit IP for the rest of the 30-minute lifetime — no second handshake, no second `session-{id}` allocation. If the lifetime has expired by the time you run them, a fresh session is opened automatically.
 
 | Failure message | What to check |
 |---|---|
@@ -54,4 +54,4 @@ A successful run uses ≈200 bytes of IPRoyal data and leaves a sticky session w
 
 > **Pytest isolation:** the smoke test is the *only* surface that consumes IPRoyal data. The `tests/test_proxy_manager.py` unit suite is fully mocked, so a normal `pytest` run never touches the network or burns proxy traffic.
 
-> **Why not a desktop VPN?** A desktop VPN gives every request the same exit IP. After ~50 LinkedIn page loads the VPN's exit IP gets fingerprinted as "the apply-pilot machine" and you're back to manual reCAPTCHAs. Rotating residential proxies put each request behind a different real consumer Wi-Fi network, which is what fooled the anti-bot algorithm in the first place.
+> **Why not a desktop VPN?** A desktop VPN gives every request the same exit IP. After ~50 LinkedIn page loads the VPN's exit IP gets fingerprinted as "the apply-daemon machine" and you're back to manual reCAPTCHAs. Rotating residential proxies put each request behind a different real consumer Wi-Fi network, which is what fooled the anti-bot algorithm in the first place.

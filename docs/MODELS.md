@@ -11,7 +11,7 @@ All LLM calls route through [OpenRouter](https://openrouter.ai), giving access t
 
 ## Anthropic BYOK
 
-OpenRouter [Bring-Your-Own-Key](https://openrouter.ai/docs/guides/overview/auth/byok) is configured **server-side via the OpenRouter dashboard**, not via per-request HTTP headers or environment variables. Setting `ANTHROPIC_API_KEY` in `.env` alone does NOT enable BYOK — Apply Pilot will log a warning if you do that without dashboard configuration.
+OpenRouter [Bring-Your-Own-Key](https://openrouter.ai/docs/guides/overview/auth/byok) is configured **server-side via the OpenRouter dashboard**, not via per-request HTTP headers or environment variables. Setting `ANTHROPIC_API_KEY` in `.env` alone does NOT enable BYOK — Apply Daemon will log a warning if you do that without dashboard configuration.
 
 **To enable BYOK:**
 
