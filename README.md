@@ -142,35 +142,16 @@ python -m src.sweeper         # or: apply-daemon-sweeper
 # Run the batch processor — concurrent OpenRouter tailor requests for all saved listings
 python -m src.batch_process   # or: apply-daemon-batch
 
+# Run the sweeper — scans Slack for reactions and ChatOps commands
+python -m src.sweeper           # or: apply-daemon-sweeper
+python -m src.sweeper --deep 99 # Scan last 99 posts, default is 50
+
 # Run the funnel report — actionable batch vs reference period metrics
 python -m src.report            # All-time reference
 python -m src.report --days 7   # Last 7 days reference
 ```
 
-**Automated runs (cron):**
-
-Open your crontab with `crontab -e` and add the following entries. Replace `/path/to/apply-daemon` with your actual absolute path.
-
-```bash
-# 1. Track A — Proactive polling (Runs 3x daily)
-# Scrapes job boards for all configured searches in my_profile/search_config.yaml.
-# Runs before the email pipeline so the DB is already warm when Track B fires.
-0 */8 * * * cd /path/to/apply-daemon && /path/to/apply-daemon/.venv/bin/python -m src.jobspy_ingest >> /path/to/apply-daemon/ingest.log 2>&1
-
-# 2. Track B — Ingestion & Delivery Worker (Runs every 4 hours)
-# Fetches emails, scores them locally, and immediately pushes the Slack digest if successful.
-0 */4 * * * cd /path/to/apply-daemon && /path/to/apply-daemon/.venv/bin/python -m src.pipeline >> /path/to/apply-daemon/pipeline.log 2>&1 && /path/to/apply-daemon/.venv/bin/python -m src.digest >> /path/to/apply-daemon/digest.log 2>&1
-
-# 3. The Sweeper (Runs every 2 minutes)
-# Scans the Slack channel for user reactions (👍, 👎, ✏️), triggers Claude for tailoring, and mutates the UI.
-*/2 * * * * cd /path/to/apply-daemon && /path/to/apply-daemon/.venv/bin/python -m src.sweeper >> /path/to/apply-daemon/sweeper.log 2>&1
-
-# 4. The Batch Processor (Runs daily at 5:00 PM)
-# Tailors all saved listings concurrently via OpenRouter. All requests complete before the process exits.
-0 17 * * * cd /path/to/apply-daemon && /path/to/apply-daemon/.venv/bin/python -m src.batch_process >> /path/to/apply-daemon/batch.log 2>&1
-```
-
-Track A (JobSpy) runs 3× daily to keep the DB warm with fresh structured listings. Track B (email pipeline) and the digest are chained with `&&` so the digest only fires if ingestion succeeds. The sweeper runs independently on a fast 2-minute cycle. The batch processor tailors all saved listings concurrently via OpenRouter and completes synchronously. Both tracks write to the same SQLite database — the Smart Upsert deduplicates across them automatically.
+> **Automation:** Use cron to further automate runs at desired timing.
 
 **How reactions work:**
 
