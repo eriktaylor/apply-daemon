@@ -6,7 +6,7 @@ import pytest
 
 from src.profile_loader import load_profile
 
-EXAMPLE_PROFILE = Path("my_profile_example/profile.example.md")
+EXAMPLE_PROFILE = Path("my_profile_example/profile.md")
 
 
 @pytest.fixture

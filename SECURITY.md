@@ -104,7 +104,7 @@ The `.gitignore` enforces these patterns. Do not weaken them.
 These files MUST exist and MUST contain only synthetic data:
 
   - `.env.example` — placeholder values, comments per variable.
-  - `my_profile_example/profile.example.md` — fictional candidate.
+  - `my_profile_example/profile.md` — fictional candidate.
   - `my_profile_example/cover_letter.md` — fictional cover letter.
   - `my_profile_example/search_config.yaml` — generic ML/AI engineer template.
   - `eval/eval_example.csv` — synthetic listings.
