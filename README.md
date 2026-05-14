@@ -57,7 +57,7 @@ Drop your files into `my_profile/` — supported formats are `.docx`, `.md`, and
 | `base_resume` (.docx / .md / .pdf) | Required for resume tailoring. The LLM edits bullets against this document. |
 | `cover_letter` (.docx / .md / .pdf) | Optional style reference. The LLM matches your preferred tone and structure. |
 
-The **Pipeline Settings** table in `profile.md` (e.g. `max_listings_per_run`, `dedup_window_days`, `pass_window_days`, `batch_process_days`, `home_location`) controls runtime behaviour. See [`my_profile_example/profile.example.md`](my_profile_example/profile.example.md) for the full set of values and inline notes.
+The **Pipeline Settings** table in `profile.md` (e.g. `max_listings_per_run`, `dedup_window_days`, `pass_window_days`, `batch_process_days`, `home_location`) controls runtime behaviour. See [`my_profile_example/profile.md`](my_profile_example/profile.md) for the full set of values and inline notes.
 
 Runtime knobs that don't belong in `profile.md` (model slots, `CONFIDENCE_THRESHOLD`, `GENERATE_ASSETS`, Slack tokens, IPRoyal credentials) live in `.env`. See [`.env.example`](.env.example) for every variable with inline comments.
 
@@ -197,7 +197,7 @@ python -m eval.eval --input eval/eval_example.csv --model google/gemini-3.1-flas
 ```
 apply-daemon/
 ├── my_profile_example/          # Template — cp -r to my_profile/
-│   ├── profile.example.md
+│   ├── profile.md
 │   ├── base_resume.docx
 │   ├── cover_letter.md
 │   └── search_config.yaml       # JobSpy search config (Track A) — generic ML/AI engineer starter
