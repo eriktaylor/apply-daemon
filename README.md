@@ -1,6 +1,26 @@
 # apply-daemon
 
-A local-first job search automation pipeline that monitors job alert emails, triages listings against a candidate profile using an LLM via OpenRouter, and surfaces the best matches.
+**Stop scrolling job boards. Triage your job hunt from Slack.**
+
+**apply-daemon** is an open-source pipeline that automates the job search marathon. Built on an agentic architecture to monitor target roles, evade scraper blocks, and evaluate opportunities using cascading LLMs. Surface curated matches to your `profile.md` and resume to Slack, where a single click triggers deep-research resume synthesis and bespoke interview artifacts.
+
+- **Track A** — JobSpy automates LinkedIn and Indeed search.
+- **Track B** — Triage from email: Google job alerts, job board updates, and recruiter emails.
+
+**Tech stack:** Python · OpenRouter · Slack · JobSpy · Gmail · IPRoyal
+
+## Setup checklist
+
+Work through these once during onboarding, in order. Each item maps to a section below.
+
+- [ ] **A. Update your resume** (e.g. polish bullets with [claude.ai](https://claude.ai))
+- [ ] **B. Clone the repository**
+- [ ] **C. Install dependencies**
+- [ ] **D. Set up the Slack channel and Slack bot**
+- [ ] **E. Configure OpenRouter (required) and your `.env`**
+- [ ] **F. Configure `profile.md` (required), `search_config.yaml` (Track A), and/or email alerts (Track B)**
+- [ ] **G. Configure an IPRoyal residential proxy for heavy scraping (optional)**
+- [ ] **H. Run the pipeline**
 
 ## How it works
 
@@ -39,7 +59,18 @@ Stage 4b: Lazy-load full description     Stage 2: Field validation
 
 ## Setup
 
-### 1. Clone and configure
+### A. Update your resume
+
+The pipeline tailors a single `base_resume` document for every saved listing, so the strength of your starting resume sets the ceiling on every downstream tailor. Polish your bullets first — [claude.ai](https://claude.ai) is a good thinking partner for this — and have the file ready before step F.
+
+Supported formats are `.docx`, `.md`, and `.pdf`, resolved in that priority order.
+
+| File | Purpose |
+|---|---|
+| `base_resume` (.docx / .md / .pdf) | Required for resume tailoring. The LLM edits bullets against this document. |
+| `cover_letter` (.docx / .md / .pdf) | Optional style reference. The LLM matches your preferred tone and structure. |
+
+### B. Clone the repository
 
 ```bash
 git clone <repo-url>
@@ -48,30 +79,9 @@ cp -r my_profile_example my_profile
 cp .env.example .env
 ```
 
-Edit `my_profile/profile.md` — write naturally about who you are, what you want, and what you don't want. The LLM reads it like a person would. Richer descriptions produce better matching.
+> **`my_profile/` is gitignored** — your customizations stay local and never collide with `git pull`. To pick up template changes from the upstream repo, diff `my_profile_example/` against your copy.
 
-Drop your files into `my_profile/` — supported formats are `.docx`, `.md`, and `.pdf`, resolved in that priority order:
-
-| File | Purpose |
-|---|---|
-| `base_resume` (.docx / .md / .pdf) | Required for resume tailoring. The LLM edits bullets against this document. |
-| `cover_letter` (.docx / .md / .pdf) | Optional style reference. The LLM matches your preferred tone and structure. |
-
-The **Pipeline Settings** table in `profile.md` (e.g. `max_listings_per_run`, `dedup_window_days`, `pass_window_days`, `batch_process_days`, `home_location`) controls runtime behaviour. See [`my_profile_example/profile.md`](my_profile_example/profile.md) for the full set of values and inline notes.
-
-Runtime knobs that don't belong in `profile.md` (model slots, `CONFIDENCE_THRESHOLD`, `GENERATE_ASSETS`, Slack tokens, IPRoyal credentials) live in `.env`. See [`.env.example`](.env.example) for every variable with inline comments.
-
-Deep Research is always enabled and runs before every Tailor operation.
-
-### 2. Set up credentials
-
-Fill in your `.env` — every variable is documented inline in [`.env.example`](.env.example). The non-obvious ones:
-
-- **GMAIL_ADDRESS** / **GMAIL_APP_PASSWORD** — Create a dedicated Gmail account for job alerts. Enable 2FA and generate an [App Password](https://support.google.com/accounts/answer/185833).
-- **OPENROUTER_API_KEY** — Required for all LLM calls. Get your key from [openrouter.ai/keys](https://openrouter.ai/keys).
-- **CONFIDENCE_THRESHOLD** (optional, default `0.5`) — Minimum Stage 5 confidence (0.0–1.0) required to keep a listing. Set to `0.0` to disable auto-rejection, or `0.75`+ for stricter filtering. See [`docs/MODELS.md`](docs/MODELS.md) for how the threshold also gates the AUTO_MATCH band.
-
-### 3. Install dependencies
+### C. Install dependencies
 
 ```bash
 # Using uv (recommended)
@@ -83,28 +93,7 @@ python -m venv .venv && source .venv/bin/activate && pip install -e ".[dev]"
 
 > **Upgrading from an earlier version?** Run `pip install -e ".[dev]"` again to pick up the two new dependencies: `python-jobspy` and `pyyaml`.
 
-### 4. Configure JobSpy proactive search (Track A)
-
-Edit `my_profile/search_config.yaml` (created when you ran `cp -r my_profile_example my_profile`). The shipped template at `my_profile_example/search_config.yaml` is a generic Machine Learning / AI Engineer starting point — open it and tailor the `search_term`, `location`, and tier `results_wanted` values to your job hunt.
-
-The config has two top-level sections that the inline comments document in full:
-
-- **`site_tiers`** — boards grouped by scraping reliability (`friendly` / `ok` / `hostile`). Set `results_wanted: 0` to disable a tier without deleting it.
-- **`searches`** — one entry per search term × location. Every entry is run against every enabled tier, so `N searches × M active tiers` queries execute per run.
-
-A `delays` block randomizes the gap between queries (default 7–20 s) to avoid IP bans, and an env-driven `# PROXY (OPTIONAL)` comment block at the bottom of the file documents the IPRoyal integration. Results from all searches are deduplicated against each other and against any listings already in the database from Track B emails.
-
-> **`my_profile/` is gitignored** — your customizations stay local and never collide with `git pull`. To pick up template changes from the upstream repo, diff `my_profile_example/search_config.yaml` against your copy.
-
-> **LinkedIn:** `linkedin_fetch_description=True` is passed automatically when LinkedIn is included in a tier, fetching full job descriptions at scrape time instead of relying on the lazy-loader. **Indeed:** Truncated search-result previews trigger Stage 4b, which scrapes the `indeed.com/viewjob?jk=...` detail page for the full posting.
-
-#### Optional: Rotating residential proxy (recommended for heavy scraping)
-
-If you scrape LinkedIn aggressively, run multiple proactive cycles per day, or aim deep-research scrapes at hardened ATS pages, your home IP will eventually trip Cloudflare / DataDome / LinkedIn's auth wall. Apply Daemon integrates first-class with [IPRoyal](https://iproyal.com/) sticky residential sessions for these cases.
-
-See [`docs/PROXY.md`](docs/PROXY.md) for setup, rotation behaviour, and the smoke-test workflow.
-
-### 5. Slack notifications
+### D. Slack channel and Slack bot
 
 The digest, sweeper, and reaction workflow all run through Slack. Set this up before running the pipeline.
 
@@ -114,7 +103,7 @@ The digest, sweeper, and reaction workflow all run through Slack. Set this up be
 4. **Copy the Bot Token** — After install, copy the `xoxb-...` token from "OAuth & Permissions".
 5. **Get the channel ID** — In Slack, right-click your target channel → "View channel details" → copy the Channel ID (starts with `C`).
 6. **Invite the bot to the channel** — In the Slack channel, type: `/invite @YourBotName`
-7. **Set your `.env`**:
+7. **Save the bot token and channel ID** — you'll paste them into `.env` in step E:
    ```
    SLACK_BOT_TOKEN=xoxb-your-bot-token
    SLACK_CHANNEL_ID=C0123456789
@@ -122,7 +111,53 @@ The digest, sweeper, and reaction workflow all run through Slack. Set this up be
 
 > **Common error:** If you see `not_in_channel`, the bot hasn't been invited. Run `/invite @YourBotName` in the channel.
 
-### 6. Run the pipeline
+### E. OpenRouter and `.env`
+
+Fill in your `.env` — every variable is documented inline in [`.env.example`](.env.example). The non-obvious ones:
+
+- **OPENROUTER_API_KEY** *(required)* — Powers all LLM calls. Get your key at [openrouter.ai/keys](https://openrouter.ai/keys). All LLM calls route through OpenRouter; three independent model slots (`OPENROUTER_STAGE1_MODEL`, `OPENROUTER_MODEL`, `OPENROUTER_TAILOR_MODEL`, plus an optional `OPENROUTER_TREND_MODEL`) let you optimise cost and quality per pipeline stage. See [`docs/MODELS.md`](docs/MODELS.md) for per-slot defaults and BYOK setup.
+- **SLACK_BOT_TOKEN** / **SLACK_CHANNEL_ID** — From step D.
+- **GMAIL_ADDRESS** / **GMAIL_APP_PASSWORD** — Required only if you plan to use Track B email ingestion (step F). Create a dedicated Gmail account for job alerts, enable 2FA, and generate an [App Password](https://support.google.com/accounts/answer/185833).
+- **CONFIDENCE_THRESHOLD** *(optional, default `0.5`)* — Minimum Stage 5 confidence (0.0–1.0) required to keep a listing. Set to `0.0` to disable auto-rejection, or `0.75`+ for stricter filtering. See [`docs/MODELS.md`](docs/MODELS.md) for how the threshold also gates the AUTO_MATCH band.
+
+Runtime knobs that don't belong in `profile.md` (model slots, `CONFIDENCE_THRESHOLD`, `GENERATE_ASSETS`, Slack tokens, IPRoyal credentials) all live in `.env`.
+
+### F. Profile, search config, and/or email alerts
+
+Pick at least one of Track A or Track B. `profile.md` is required for both.
+
+#### `profile.md` (required)
+
+Edit `my_profile/profile.md` — write naturally about who you are, what you want, and what you don't want. The LLM reads it like a person would. Richer descriptions produce better matching. Drop your `base_resume` (and optional `cover_letter`) from step A into `my_profile/` alongside it.
+
+The **Pipeline Settings** table in `profile.md` (e.g. `max_listings_per_run`, `dedup_window_days`, `pass_window_days`, `batch_process_days`, `home_location`) controls runtime behaviour. See [`my_profile_example/profile.md`](my_profile_example/profile.md) for the full set of values and inline notes.
+
+Deep Research is always enabled and runs before every Tailor operation.
+
+#### `search_config.yaml` — Track A (JobSpy proactive search)
+
+Edit `my_profile/search_config.yaml`. The shipped template at `my_profile_example/search_config.yaml` is a generic Machine Learning / AI Engineer starting point — open it and tailor the `search_term`, `location`, and tier `results_wanted` values to your job hunt.
+
+The config has two top-level sections that the inline comments document in full:
+
+- **`site_tiers`** — boards grouped by scraping reliability (`friendly` / `ok` / `hostile`). Set `results_wanted: 0` to disable a tier without deleting it.
+- **`searches`** — one entry per search term × location. Every entry is run against every enabled tier, so `N searches × M active tiers` queries execute per run.
+
+A `delays` block randomizes the gap between queries (default 7–20 s) to avoid IP bans, and an env-driven `# PROXY (OPTIONAL)` comment block at the bottom of the file documents the IPRoyal integration. Results from all searches are deduplicated against each other and against any listings already in the database from Track B emails.
+
+> **LinkedIn:** `linkedin_fetch_description=True` is passed automatically when LinkedIn is included in a tier, fetching full job descriptions at scrape time instead of relying on the lazy-loader. **Indeed:** Truncated search-result previews trigger Stage 4b, which scrapes the `indeed.com/viewjob?jk=...` detail page for the full posting.
+
+#### Email alerts — Track B
+
+Track B reads from a dedicated Gmail inbox over IMAP. Point your existing job alert subscriptions (LinkedIn job alerts, Indeed saved-search digests, Google Alerts on `"<role> jobs"`, recruiter newsletters) at the dedicated address you set in `GMAIL_ADDRESS` (step E). The pipeline classifies each unread message by header (JOB_DIGEST / RECRUITER_OUTREACH / GOOGLE_ALERT / SKIP) and only the first three are processed.
+
+### G. Rotating residential proxy (optional)
+
+If you scrape LinkedIn aggressively, run multiple proactive cycles per day, or aim deep-research scrapes at hardened ATS pages, your home IP will eventually trip Cloudflare / DataDome / LinkedIn's auth wall. Apply Daemon integrates first-class with [IPRoyal](https://iproyal.com/) sticky residential sessions for these cases.
+
+See [`docs/PROXY.md`](docs/PROXY.md) for setup, rotation behaviour, and the smoke-test workflow.
+
+### H. Run the pipeline
 
 **Manual test run:**
 
@@ -137,14 +172,11 @@ python -m src.pipeline        # or: apply-daemon
 python -m src.digest          # or: apply-daemon-digest
 
 # Run the sweeper — scans Slack for reactions and ChatOps commands
-python -m src.sweeper         # or: apply-daemon-sweeper
+python -m src.sweeper           # or: apply-daemon-sweeper
+python -m src.sweeper --deep 99 # Scan last 99 posts, default is 50
 
 # Run the batch processor — concurrent OpenRouter tailor requests for all saved listings
 python -m src.batch_process   # or: apply-daemon-batch
-
-# Run the sweeper — scans Slack for reactions and ChatOps commands
-python -m src.sweeper           # or: apply-daemon-sweeper
-python -m src.sweeper --deep 99 # Scan last 99 posts, default is 50
 
 # Run the funnel report — actionable batch vs reference period metrics
 python -m src.report            # All-time reference
@@ -172,7 +204,7 @@ Reaction priority is `pass` > `tailor` > `save`, and a sweeper-level idempotency
 
 The post-triage workflow runs entirely on Slack reactions and thread commands, swept every 2 minutes. State-tracking commands (`!applied`, `!pass`, `!interview`, `!rejected`), on-demand asset generation (`!coverletter`, `!prep`, `!polish`), regeneration (`!regenerate`), the Smart Router (`❓` / `!answer`), manual ingestion (`!triage <URL>`) with its threaded scrape-failure recovery (`!update`), and the labor-market intelligence command (`!trend`) are all documented in [`docs/CHATOPS.md`](docs/CHATOPS.md).
 
-## Model Selection & Confidence Threshold
+## Model selection & confidence threshold
 
 All LLM calls route through [OpenRouter](https://openrouter.ai). Three independent model slots (`OPENROUTER_STAGE1_MODEL`, `OPENROUTER_MODEL`, `OPENROUTER_TAILOR_MODEL`, plus an optional `OPENROUTER_TREND_MODEL`) let you optimise cost and quality per pipeline stage, and `CONFIDENCE_THRESHOLD` (0.0–1.0) sets the minimum LLM confidence required to keep a listing in Stage 5.
 
