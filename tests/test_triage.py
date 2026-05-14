@@ -1217,6 +1217,7 @@ class TestValidateAndHealIntegration:
 
             session = TriageSession(
                 profile_llm_context="test profile",
+                confidence_threshold=0.5,
             )
             session._client = MagicMock()
 
