@@ -1,4 +1,4 @@
-# Contributing to apply-pilot
+# Contributing to apply-daemon
 
 Thanks for your interest. This is a small project with a narrow scope —
 local-first job-search automation — so contributions are most valuable

@@ -173,7 +173,7 @@ def _save_debug_email(msg, text: str, reason: str) -> None:
 def main() -> None:
     setup_logging()
 
-    parser = argparse.ArgumentParser(description="apply-pilot job search pipeline")
+    parser = argparse.ArgumentParser(description="apply-daemon job search pipeline")
     parser.add_argument(
         "--dry-run",
         type=str,

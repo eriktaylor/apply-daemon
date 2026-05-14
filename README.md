@@ -1,4 +1,4 @@
-# apply-pilot
+# apply-daemon
 
 A local-first job search automation pipeline that monitors job alert emails, triages listings against a candidate profile using an LLM via OpenRouter, and surfaces the best matches.
 
@@ -43,7 +43,7 @@ Stage 4b: Lazy-load full description     Stage 2: Field validation
 
 ```bash
 git clone <repo-url>
-cd apply-pilot
+cd apply-daemon
 cp -r my_profile_example my_profile
 cp .env.example .env
 ```
@@ -100,7 +100,7 @@ A `delays` block randomizes the gap between queries (default 7–20 s) to avoid 
 
 #### Optional: Rotating residential proxy (recommended for heavy scraping)
 
-If you scrape LinkedIn aggressively, run multiple proactive cycles per day, or aim deep-research scrapes at hardened ATS pages, your home IP will eventually trip Cloudflare / DataDome / LinkedIn's auth wall. Apply Pilot integrates first-class with [IPRoyal](https://iproyal.com/) sticky residential sessions for these cases.
+If you scrape LinkedIn aggressively, run multiple proactive cycles per day, or aim deep-research scrapes at hardened ATS pages, your home IP will eventually trip Cloudflare / DataDome / LinkedIn's auth wall. Apply Daemon integrates first-class with [IPRoyal](https://iproyal.com/) sticky residential sessions for these cases.
 
 See [`docs/PROXY.md`](docs/PROXY.md) for setup, rotation behaviour, and the smoke-test workflow.
 
@@ -128,19 +128,19 @@ The digest, sweeper, and reaction workflow all run through Slack. Set this up be
 
 ```bash
 # Track A — Proactive polling: scrape job boards for all configured searches
-python -m src.jobspy_ingest   # or: apply-pilot-ingest
+python -m src.jobspy_ingest   # or: apply-daemon-ingest
 
 # Track B — Reactive pipeline: process new email alerts
-python -m src.pipeline        # or: apply-pilot
+python -m src.pipeline        # or: apply-daemon
 
 # Fire the digest — reads triaged jobs from the DB and posts a Block Kit summary to Slack
-python -m src.digest          # or: apply-pilot-digest
+python -m src.digest          # or: apply-daemon-digest
 
 # Run the sweeper — scans Slack for reactions and ChatOps commands
-python -m src.sweeper         # or: apply-pilot-sweeper
+python -m src.sweeper         # or: apply-daemon-sweeper
 
 # Run the batch processor — concurrent OpenRouter tailor requests for all saved listings
-python -m src.batch_process   # or: apply-pilot-batch
+python -m src.batch_process   # or: apply-daemon-batch
 
 # Run the funnel report — actionable batch vs reference period metrics
 python -m src.report            # All-time reference
@@ -149,25 +149,25 @@ python -m src.report --days 7   # Last 7 days reference
 
 **Automated runs (cron):**
 
-Open your crontab with `crontab -e` and add the following entries. Replace `/path/to/apply-pilot` with your actual absolute path.
+Open your crontab with `crontab -e` and add the following entries. Replace `/path/to/apply-daemon` with your actual absolute path.
 
 ```bash
 # 1. Track A — Proactive polling (Runs 3x daily)
 # Scrapes job boards for all configured searches in my_profile/search_config.yaml.
 # Runs before the email pipeline so the DB is already warm when Track B fires.
-0 */8 * * * cd /path/to/apply-pilot && /path/to/apply-pilot/.venv/bin/python -m src.jobspy_ingest >> /path/to/apply-pilot/ingest.log 2>&1
+0 */8 * * * cd /path/to/apply-daemon && /path/to/apply-daemon/.venv/bin/python -m src.jobspy_ingest >> /path/to/apply-daemon/ingest.log 2>&1
 
 # 2. Track B — Ingestion & Delivery Worker (Runs every 4 hours)
 # Fetches emails, scores them locally, and immediately pushes the Slack digest if successful.
-0 */4 * * * cd /path/to/apply-pilot && /path/to/apply-pilot/.venv/bin/python -m src.pipeline >> /path/to/apply-pilot/pipeline.log 2>&1 && /path/to/apply-pilot/.venv/bin/python -m src.digest >> /path/to/apply-pilot/digest.log 2>&1
+0 */4 * * * cd /path/to/apply-daemon && /path/to/apply-daemon/.venv/bin/python -m src.pipeline >> /path/to/apply-daemon/pipeline.log 2>&1 && /path/to/apply-daemon/.venv/bin/python -m src.digest >> /path/to/apply-daemon/digest.log 2>&1
 
 # 3. The Sweeper (Runs every 2 minutes)
 # Scans the Slack channel for user reactions (👍, 👎, ✏️), triggers Claude for tailoring, and mutates the UI.
-*/2 * * * * cd /path/to/apply-pilot && /path/to/apply-pilot/.venv/bin/python -m src.sweeper >> /path/to/apply-pilot/sweeper.log 2>&1
+*/2 * * * * cd /path/to/apply-daemon && /path/to/apply-daemon/.venv/bin/python -m src.sweeper >> /path/to/apply-daemon/sweeper.log 2>&1
 
 # 4. The Batch Processor (Runs daily at 5:00 PM)
 # Tailors all saved listings concurrently via OpenRouter. All requests complete before the process exits.
-0 17 * * * cd /path/to/apply-pilot && /path/to/apply-pilot/.venv/bin/python -m src.batch_process >> /path/to/apply-pilot/batch.log 2>&1
+0 17 * * * cd /path/to/apply-daemon && /path/to/apply-daemon/.venv/bin/python -m src.batch_process >> /path/to/apply-daemon/batch.log 2>&1
 ```
 
 Track A (JobSpy) runs 3× daily to keep the DB warm with fresh structured listings. Track B (email pipeline) and the digest are chained with `&&` so the digest only fires if ingestion succeeds. The sweeper runs independently on a fast 2-minute cycle. The batch processor tailors all saved listings concurrently via OpenRouter and completes synchronously. Both tracks write to the same SQLite database — the Smart Upsert deduplicates across them automatically.
@@ -214,7 +214,7 @@ python -m eval.eval --input eval/eval_example.csv --model google/gemini-3.1-flas
 ## Project structure
 
 ```
-apply-pilot/
+apply-daemon/
 ├── my_profile_example/          # Template — cp -r to my_profile/
 │   ├── profile.example.md
 │   ├── base_resume.docx

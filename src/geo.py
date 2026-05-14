@@ -20,7 +20,7 @@ from src.profile_loader import load_profile
 
 logger = logging.getLogger(__name__)
 
-_geolocator = Nominatim(user_agent="apply-pilot/0.1", timeout=5)
+_geolocator = Nominatim(user_agent="apply-daemon/0.1", timeout=5)
 
 # Home coordinates — resolved lazily on first get_distance() call
 _home_coords: tuple[float, float] | None = None

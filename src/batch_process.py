@@ -1,7 +1,7 @@
 """Scheduled batch processor — runs concurrent OpenRouter tailor requests.
 
 Designed to run daily at 5:00 PM:
-    0 17 * * * cd /path/to/apply-pilot && .venv/bin/python -m src.batch_process
+    0 17 * * * cd /path/to/apply-daemon && .venv/bin/python -m src.batch_process
 
 Execution:
   Phase A (Housekeeping): Revert stuck batches and expire stale saved listings.

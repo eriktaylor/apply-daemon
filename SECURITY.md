@@ -18,7 +18,7 @@ stability. Security fixes are applied to `main` only.
 
 ## Threat model
 
-`apply-pilot` runs locally. It reads a candidate profile, ingests email
+`apply-daemon` runs locally. It reads a candidate profile, ingests email
 from a dedicated inbox, calls third-party LLM APIs, scrapes job-board
 content, and writes to a local SQLite database. The only trust boundary
 that matters is the user running it. The pipeline must:
@@ -30,7 +30,7 @@ that matters is the user running it. The pipeline must:
 
 ## Third-party services and outbound data flow
 
-`apply-pilot` talks to the following external services. Operators of any
+`apply-daemon` talks to the following external services. Operators of any
 of these can in principle observe the data the pipeline sends them.
 Decide whether you trust each one before pointing the tool at real data.
 

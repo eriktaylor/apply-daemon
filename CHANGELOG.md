@@ -1,6 +1,6 @@
 # Changelog
 
-All notable shipped features for Apply Pilot. For in-flight and upcoming work, see the **Roadmap** section in [`README.md`](README.md).
+All notable shipped features for Apply Daemon. For in-flight and upcoming work, see the **Roadmap** section in [`README.md`](README.md).
 
 ## Shipped
 

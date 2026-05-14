@@ -1,4 +1,4 @@
-# Apply-Pilot Test Coverage Summary
+# Apply-Daemon Test Coverage Summary
 
 **Generated:** 2026-04-24
 **Total tests:** 421 passing (0 failures, 0 collection errors)

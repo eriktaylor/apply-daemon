@@ -1,7 +1,7 @@
 """Daily Slack digest — posts a summary of triaged/saved listings.
 
 Intended to run via cron at 8:00 AM:
-    0 8 * * * cd /path/to/apply-pilot && python -m src.digest
+    0 8 * * * cd /path/to/apply-daemon && python -m src.digest
 
 Queries the DB for all listings where pipeline_status is 'triaged' or 'saved'
 from the last 14 days, sorted by confidence descending.
@@ -263,7 +263,7 @@ def post_digest() -> bool:
                 attachment = build_digest_listing_attachment(listing, history=history)
                 listing_id = listing.get("id", "")
                 metadata = {
-                    "event_type": "apply_pilot_listing",
+                    "event_type": "apply_daemon_listing",
                     "event_payload": {"job_id": listing_id},
                 }
                 app.client.chat_postMessage(

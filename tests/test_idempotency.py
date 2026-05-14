@@ -53,12 +53,19 @@ def _make_job_card(
     job_id: str,
     ts: str = "100.000",
     reactions: list | None = None,
+    event_type: str = "apply_daemon_listing",
 ) -> dict:
-    """Minimal Slack message payload representing a posted job card."""
+    """Minimal Slack message payload representing a posted job card.
+
+    The default ``event_type`` is the current wire-format tag. Pass
+    ``event_type="apply_pilot_listing"`` to exercise the dual-read path
+    against the legacy tag that lives on cards posted before the
+    apply-pilot → apply-daemon rename.
+    """
     return {
         "ts": ts,
         "metadata": {
-            "event_type": "apply_pilot_listing",
+            "event_type": event_type,
             "event_payload": {"job_id": job_id},
         },
         "blocks": [
@@ -119,6 +126,33 @@ class TestChatopsAssetIdempotency:
 
         assert count1 == 1, "First sweep must process the command"
         assert count2 == 0, "Second sweep must be skipped (idempotency)"
+        mock_asset.assert_called_once_with(
+            mock_app, "C_TEST", "100.000", listing.id, "coverletter"
+        )
+
+    def test_legacy_event_type_card_still_routes_chatops(self, db, mocker):
+        # Dual-read regression: a card carrying the legacy
+        # apply_pilot_listing tag must still be eligible for ChatOps
+        # routing for as long as the legacy entry remains in
+        # sweeper._LISTING_EVENT_TYPES.
+        mock_app = MagicMock()
+        listing = _make_listing()
+        db.insert_listing(listing)
+        db.update_pipeline_status(listing.id, "saved")
+
+        job_card = _make_job_card(
+            listing.id, ts="100.000", event_type="apply_pilot_listing"
+        )
+        unprocessed = _make_reply("200.000", "!coverletter", processed=False)
+        mock_app.client.conversations_replies.return_value = {
+            "messages": [job_card, unprocessed]
+        }
+
+        mock_asset = mocker.patch("src.sweeper._handle_ondemand_asset")
+        mocker.patch("src.sweeper._append_human_label")
+
+        count = _scan_chatops_commands(mock_app, db, "C_TEST", [job_card])
+        assert count == 1
         mock_asset.assert_called_once_with(
             mock_app, "C_TEST", "100.000", listing.id, "coverletter"
         )
@@ -406,7 +440,7 @@ class TestSweeperRoutesTriageCardReactions:
 
     The bug: if the job card was posted as a thread reply, conversations_history
     would never return it and the reaction would be invisible. The fix posts cards
-    at channel level. This test verifies that a card with apply_pilot_listing
+    at channel level. This test verifies that a card with apply_daemon_listing
     metadata at the channel level is correctly picked up and routed.
     """
 

@@ -477,7 +477,7 @@ def _scrape_url(url: str) -> str | None:
         try:
             response = session.get(
                 url, timeout=5, verify=True,
-                headers={"User-Agent": "Mozilla/5.0 (compatible; apply-pilot/1.0)"},
+                headers={"User-Agent": "Mozilla/5.0 (compatible; apply-daemon/1.0)"},
                 proxies=proxies or None,
             )
         except Exception:

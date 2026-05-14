@@ -7,11 +7,18 @@ Slack channel for user reactions on digest messages:
     :thumbsup:   (+1)     → pipeline_status = 'saved',   bot adds checkmark receipt
     :pencil2:    (pencil) → triggers tailor, status = 'tailored', UI updated with assets
 
+Slack message metadata tag: digest cards are written with
+``event_type='apply_daemon_listing'``. Cards posted before the
+apply-pilot → apply-daemon rename carry the legacy
+``event_type='apply_pilot_listing'``; both tags are accepted on read
+via ``_LISTING_EVENT_TYPES``. The legacy entry can be retired once the
+oldest still-actionable card has aged out.
+
 Usage:
     python -m src.sweeper
 
 Crontab:
-    */2 * * * * cd /path/to/apply-pilot && .venv/bin/python -m src.sweeper
+    */2 * * * * cd /path/to/apply-daemon && .venv/bin/python -m src.sweeper
 """
 
 from __future__ import annotations
@@ -36,6 +43,12 @@ logger = logging.getLogger(__name__)
 
 _LABELS_DIR = Path("data")
 _LABELS_PATH = _LABELS_DIR / "human_labels.jsonl"
+
+# Slack message metadata event_type values recognized as digest listings.
+# New cards are written with "apply_daemon_listing"; the legacy
+# "apply_pilot_listing" tag is still accepted on read so existing cards
+# remain actionable until they age out.
+_LISTING_EVENT_TYPES = frozenset({"apply_daemon_listing", "apply_pilot_listing"})
 
 
 def _append_human_label(job_id: str, action: str, listing: dict) -> None:
@@ -119,13 +132,13 @@ _CHATOPS_ELIGIBLE_STATUSES = {"tailored", "saved", "applied"}
 def _extract_job_id(message: dict) -> str | None:
     """Extract job_id from Slack message metadata.
 
-    The digest embeds metadata with event_type='apply_pilot_listing' and
-    event_payload={'job_id': '<listing_id>'}.
+    The digest embeds metadata with event_type='apply_daemon_listing'
+    (legacy: 'apply_pilot_listing') and event_payload={'job_id': '<listing_id>'}.
     """
     metadata = message.get("metadata")
     if not metadata:
         return None
-    if metadata.get("event_type") != "apply_pilot_listing":
+    if metadata.get("event_type") not in _LISTING_EVENT_TYPES:
         return None
     return metadata.get("event_payload", {}).get("job_id")
 
@@ -1476,7 +1489,7 @@ def _scan_triage_commands(
 
     for msg in messages:
         # Skip messages that already have listing metadata (already processed)
-        if msg.get("metadata", {}).get("event_type") == "apply_pilot_listing":
+        if msg.get("metadata", {}).get("event_type") in _LISTING_EVENT_TYPES:
             continue
         # Skip bot messages
         if msg.get("bot_id") or msg.get("subtype"):
@@ -1542,7 +1555,7 @@ def _scan_triage_fallback_commands(
 
     for msg in messages:
         # Only consider plain !triage messages — not existing job cards
-        if msg.get("metadata", {}).get("event_type") == "apply_pilot_listing":
+        if msg.get("metadata", {}).get("event_type") in _LISTING_EVENT_TYPES:
             continue
         if msg.get("bot_id") or msg.get("subtype"):
             continue
@@ -1914,7 +1927,7 @@ def _scrape_for_triage(url: str) -> str:
         try:
             response = session.get(
                 url, timeout=5, verify=True,
-                headers={"User-Agent": "Mozilla/5.0 (compatible; apply-pilot/1.0)"},
+                headers={"User-Agent": "Mozilla/5.0 (compatible; apply-daemon/1.0)"},
             )
         except Exception:
             logger.debug("HTTP fetch failed for %s", url)
@@ -2376,7 +2389,7 @@ def _scan_trend_commands(
     processed = 0
 
     for msg in messages:
-        if msg.get("metadata", {}).get("event_type") == "apply_pilot_listing":
+        if msg.get("metadata", {}).get("event_type") in _LISTING_EVENT_TYPES:
             continue
         if msg.get("bot_id") or msg.get("subtype"):
             continue
@@ -2468,7 +2481,7 @@ def _post_triage_result(
     })
 
     metadata = {
-        "event_type": "apply_pilot_listing",
+        "event_type": "apply_daemon_listing",
         "event_payload": {"job_id": effective_id},
     }
 
@@ -2603,7 +2616,7 @@ def _post_interview_prep_thread(
 
 def main() -> None:
     import argparse
-    parser = argparse.ArgumentParser(description="Apply Pilot Slack sweeper")
+    parser = argparse.ArgumentParser(description="Apply Daemon Slack sweeper")
     parser.add_argument(
         "--deep",
         metavar="N",

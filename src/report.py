@@ -139,7 +139,7 @@ def report(days: int | None = None) -> None:
     # Header
     print()
     print("  " + "\u2550" * 56)
-    print("    APPLY-PILOT FUNNEL REPORT")
+    print("    APPLY-DAEMON FUNNEL REPORT")
     print("  " + "\u2550" * 56)
 
     # Actionable batch
@@ -172,7 +172,7 @@ def main() -> None:
     )
 
     parser = argparse.ArgumentParser(
-        description="Application funnel report from the apply-pilot database.",
+        description="Application funnel report from the apply-daemon database.",
     )
     parser.add_argument(
         "--days",
