@@ -159,6 +159,14 @@ See [`docs/PROXY.md`](docs/PROXY.md) for setup, rotation behaviour, and the smok
 
 ### H. Run the pipeline
 
+**Integration evaluation:**
+
+```bash
+python -m src.integration_test   # or: apply-daemon-eval
+```
+
+Walks the A–H checklist and reports which components are configured and reachable: dependencies importable, Slack `auth.test`, a 1-token OpenRouter completion, `profile.md` parse, Track A `search_config.yaml`, Track B Gmail IMAP login, and IPRoyal credentials. Designed to consume the absolute minimum of paid credits — the only billable call is the single OpenRouter token. Pass `--no-llm` to skip even that, or `--no-network` to skip every remote check.
+
 **Manual test run:**
 
 ```bash
