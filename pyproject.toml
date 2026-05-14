@@ -39,6 +39,7 @@ apply-daemon-tailor = "src.tailor:main"
 apply-daemon-sweeper = "src.sweeper:main"
 apply-daemon-batch = "src.batch_process:main"
 apply-daemon-test-proxy = "src.proxy_test:main"
+apply-daemon-eval = "src.integration_test:main"
 
 [tool.ruff]
 target-version = "py311"
