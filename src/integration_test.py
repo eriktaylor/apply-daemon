@@ -185,10 +185,11 @@ def _check_slack(do_network: bool) -> CheckResult:
         )
     except Exception as exc:
         return CheckResult("D. Slack", FAIL, f"auth.test error: {exc}")
-    # Channel reachability: conversations.info is also free.
+    # Channel reachability: probe with conversations.history(limit=1), which
+    # only needs the channels:history scope the sweeper already requires.
+    # Avoids asking users to grant channels:read just to satisfy the eval.
     try:
-        info = client.conversations_info(channel=channel)
-        ch_name = info.get("channel", {}).get("name", channel)
+        client.conversations_history(channel=channel, limit=1)
     except SlackApiError as exc:
         err = exc.response.get("error", str(exc))
         return CheckResult(
@@ -199,7 +200,7 @@ def _check_slack(do_network: bool) -> CheckResult:
     return CheckResult(
         "D. Slack",
         PASS,
-        f"bot '{bot}' in '{team}'; channel #{ch_name} reachable",
+        f"bot '{bot}' in '{team}'; channel {channel} reachable",
     )
 
 
