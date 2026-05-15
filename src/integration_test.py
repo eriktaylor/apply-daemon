@@ -377,6 +377,41 @@ def run_all(do_network: bool, do_llm: bool) -> list[CheckResult]:
     ]
 
 
+_SHARED_REQUIRED_LABELS = (
+    "B. Repository layout",
+    "C. Dependencies",
+    "D. Slack",
+    "E. OpenRouter",
+    "F1. profile.md",
+)
+_TRACK_A_LABEL = "F2. Track A (search yaml)"
+_TRACK_B_LABEL = "F3. Track B (Gmail IMAP)"
+
+
+def _track_status(track_label: str, results: list[CheckResult]) -> tuple[str, str]:
+    """Return ('GO' | 'NO-GO', explanation) for one track.
+
+    A track is GO when every shared-required component plus the track's
+    own component is in PASS or WARN. WARN is treated as "configured but
+    a live check was suppressed" (e.g. --no-network); the user's setup
+    is still ready to run.
+    """
+    by_label = {r.label: r for r in results}
+    ok = {PASS, WARN}
+
+    for label in _SHARED_REQUIRED_LABELS:
+        r = by_label.get(label)
+        if r is None or r.status not in ok:
+            return "NO-GO", f"{label} not ready ({r.status if r else 'missing'})"
+
+    track = by_label.get(track_label)
+    if track is None:
+        return "NO-GO", f"{track_label} not evaluated"
+    if track.status not in ok:
+        return "NO-GO", f"{track_label} not configured ({track.status})"
+    return "GO", "all required components ready"
+
+
 def main() -> int:
     parser = argparse.ArgumentParser(
         description=(
@@ -417,27 +452,26 @@ def main() -> int:
     print(summary)
     print()
 
-    required_labels = {
-        "B. Repository layout",
-        "C. Dependencies",
-        "D. Slack",
-        "E. OpenRouter",
-        "F1. profile.md",
-    }
-    required_failures = [r for r in results if r.status == FAIL and r.label in required_labels]
-    if required_failures:
-        print("Required components failing — fix the items above before running the pipeline.")
-        return 1
+    track_a, reason_a = _track_status(_TRACK_A_LABEL, results)
+    track_b, reason_b = _track_status(_TRACK_B_LABEL, results)
+    light = {"GO": "🟢", "NO-GO": "🔴"}
+    print("Track readiness:")
+    print(f"  Track A (JobSpy proactive): {light[track_a]} {track_a} — {reason_a}")
+    print(f"  Track B (email reactive):   {light[track_b]} {track_b} — {reason_b}")
+    print()
 
-    track_a = next((r for r in results if r.label == "F2. Track A (search yaml)"), None)
-    track_b = next((r for r in results if r.label == "F3. Track B (Gmail IMAP)"), None)
-    if (track_a and track_a.status != PASS) and (track_b and track_b.status != PASS):
-        print("Configure at least one of Track A (search_config.yaml) or Track B (Gmail) "
-              "before running the pipeline.")
-        return 1
+    if track_a == "GO" or track_b == "GO":
+        ready = ", ".join(
+            cmd for cmd, go in (
+                ("`apply-daemon-ingest` (Track A)", track_a == "GO"),
+                ("`apply-daemon` (Track B)", track_b == "GO"),
+            ) if go
+        )
+        print(f"Setup looks good — run {ready}.")
+        return 0
 
-    print("Setup looks good — run `apply-daemon-ingest` (Track A) or `apply-daemon` (Track B).")
-    return 0
+    print("No track is ready — fix the items above before running the pipeline.")
+    return 1
 
 
 if __name__ == "__main__":

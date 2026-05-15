@@ -165,33 +165,30 @@ See [`docs/PROXY.md`](docs/PROXY.md) for setup, rotation behaviour, and the smok
 python -m src.integration_test   # or: apply-daemon-eval
 ```
 
-Walks the A–H checklist and reports which components are configured and reachable: dependencies importable, Slack `auth.test`, a 1-token OpenRouter completion, `profile.md` parse, Track A `search_config.yaml`, Track B Gmail IMAP login, and IPRoyal credentials. Designed to consume the absolute minimum of paid credits — the only billable call is the single OpenRouter token. Pass `--no-llm` to skip even that, or `--no-network` to skip every remote check.
+Walks the checklist, reporting which components are configured and reachable. Indicates a go-ahead for Track A, Track B, or both.
 
-**Manual test run:**
+> **Designed to consume the absolute minimum of paid credits** — the only billable call is the single OpenRouter token. Pass `--no-llm` to skip even that, or `--no-network` to skip every remote check.
+
+**Manual run:**
 
 ```bash
-# Track A — Proactive polling: scrape job boards for all configured searches
-python -m src.jobspy_ingest   # or: apply-daemon-ingest
+# Track A
+python -m src.jobspy_ingest && python -m src.digest
 
-# Track B — Reactive pipeline: process new email alerts
-python -m src.pipeline        # or: apply-daemon
+# Track B
+python -m src.pipeline && python -m src.digest
 
-# Fire the digest — reads triaged jobs from the DB and posts a Block Kit summary to Slack
-python -m src.digest          # or: apply-daemon-digest
+# Sweep Slack reactions and ChatOps commands
+python -m src.sweeper            # or: apply-daemon-sweeper
+python -m src.sweeper --deep 99  # Scan last 99 posts; default is 50
 
-# Run the sweeper — scans Slack for reactions and ChatOps commands
-python -m src.sweeper           # or: apply-daemon-sweeper
-python -m src.sweeper --deep 99 # Scan last 99 posts, default is 50
+# Batch tailor every saved listing (concurrent OpenRouter calls)
+python -m src.batch_process      # or: apply-daemon-batch
 
-# Run the batch processor — concurrent OpenRouter tailor requests for all saved listings
-python -m src.batch_process   # or: apply-daemon-batch
-
-# Run the funnel report — actionable batch vs reference period metrics
-python -m src.report            # All-time reference
-python -m src.report --days 7   # Last 7 days reference
+# Funnel report
+python -m src.report             # All-time reference
+python -m src.report --days 7    # Last 7 days reference
 ```
-
-> **Automation:** Use cron to further automate runs at desired timing.
 
 **How reactions work:**
 
@@ -210,7 +207,7 @@ Reaction priority is `pass` > `tailor` > `save`, and a sweeper-level idempotency
 
 ## ChatOps & Commands
 
-The post-triage workflow runs entirely on Slack reactions and thread commands, swept every 2 minutes. State-tracking commands (`!applied`, `!pass`, `!interview`, `!rejected`), on-demand asset generation (`!coverletter`, `!prep`, `!polish`), regeneration (`!regenerate`), the Smart Router (`❓` / `!answer`), manual ingestion (`!triage <URL>`) with its threaded scrape-failure recovery (`!update`), and the labor-market intelligence command (`!trend`) are all documented in [`docs/CHATOPS.md`](docs/CHATOPS.md).
+The post-triage workflow runs entirely on Slack reactions and thread commands, processed each time you run `python -m src.sweeper`. State-tracking commands (`!applied`, `!pass`, `!interview`, `!rejected`), on-demand asset generation (`!coverletter`, `!prep`, `!polish`), regeneration (`!regenerate`), the Smart Router (`❓` / `!answer`), manual ingestion (`!triage <URL>`) with its threaded scrape-failure recovery (`!update`), and the labor-market intelligence command (`!trend`) are all documented in [`docs/CHATOPS.md`](docs/CHATOPS.md).
 
 ## Model selection & confidence threshold
 

@@ -152,19 +152,73 @@ class TestSearchConfigCheck:
         assert "1 searches" in result.detail
 
 
+class TestTrackStatus:
+    def _result(self, label, status):
+        return it.CheckResult(label=label, status=status, detail="")
+
+    def _baseline_ready(self):
+        # Every shared-required component PASS, both tracks SKIP.
+        return [
+            self._result("A. Resume", it.PASS),
+            self._result("B. Repository layout", it.PASS),
+            self._result("C. Dependencies", it.PASS),
+            self._result("D. Slack", it.PASS),
+            self._result("E. OpenRouter", it.PASS),
+            self._result("F1. profile.md", it.PASS),
+            self._result("F2. Track A (search yaml)", it.SKIP),
+            self._result("F3. Track B (Gmail IMAP)", it.SKIP),
+        ]
+
+    def test_no_go_when_shared_required_fails(self):
+        results = self._baseline_ready()
+        # Knock out OpenRouter
+        for r in results:
+            if r.label == "E. OpenRouter":
+                r.status = it.FAIL
+        status, _ = it._track_status("F2. Track A (search yaml)", results)
+        assert status == "NO-GO"
+
+    def test_no_go_when_track_skipped(self):
+        results = self._baseline_ready()
+        status, _ = it._track_status("F2. Track A (search yaml)", results)
+        assert status == "NO-GO"
+
+    def test_go_when_track_pass(self):
+        results = self._baseline_ready()
+        for r in results:
+            if r.label == "F2. Track A (search yaml)":
+                r.status = it.PASS
+        status, _ = it._track_status("F2. Track A (search yaml)", results)
+        assert status == "GO"
+
+    def test_warn_counts_as_configured(self):
+        # WARN means "credentials present, live check skipped" — track ready.
+        results = self._baseline_ready()
+        for r in results:
+            if r.label == "D. Slack":
+                r.status = it.WARN
+            if r.label == "F3. Track B (Gmail IMAP)":
+                r.status = it.WARN
+        status, _ = it._track_status("F3. Track B (Gmail IMAP)", results)
+        assert status == "GO"
+
+
 class TestMain:
     def _run(self, monkeypatch, *args):
         monkeypatch.setattr(sys, "argv", ["integration_test", *args])
         return it.main()
 
-    def test_exit_1_when_required_components_missing(self, monkeypatch, capsys):
+    def test_exit_1_when_no_track_ready(self, monkeypatch, capsys):
+        # Bare environment — both tracks NO-GO.
         rc = self._run(monkeypatch, "--no-network")
         captured = capsys.readouterr()
         assert rc == 1
-        assert "Required components failing" in captured.out
+        assert "Track A" in captured.out
+        assert "Track B" in captured.out
+        assert "No track is ready" in captured.out
 
     def test_exit_1_when_neither_track_configured(self, monkeypatch, capsys):
-        # Satisfy required components; leave Track A + B unconfigured.
+        # Satisfy shared-required components; leave Track A + B unconfigured.
         Path("my_profile").mkdir()
         (Path("my_profile") / "base_resume.md").write_text("hi")
         (Path("my_profile") / "profile.md").write_text(
@@ -177,7 +231,8 @@ class TestMain:
         rc = self._run(monkeypatch, "--no-network")
         captured = capsys.readouterr()
         assert rc == 1
-        assert "Configure at least one" in captured.out
+        assert "🔴 NO-GO" in captured.out
+        assert "No track is ready" in captured.out
 
     def test_exit_0_when_track_a_configured(self, monkeypatch, capsys):
         Path("my_profile").mkdir()
@@ -196,4 +251,6 @@ class TestMain:
         rc = self._run(monkeypatch, "--no-network")
         captured = capsys.readouterr()
         assert rc == 0
+        assert "🟢 GO" in captured.out
+        assert "apply-daemon-ingest" in captured.out
         assert "Setup looks good" in captured.out

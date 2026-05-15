@@ -1,6 +1,6 @@
 # ChatOps & Commands
 
-The entire post-triage workflow is driven by Slack reactions and thread commands. The sweeper polls every 2 minutes — no Socket Mode or webhooks required.
+The entire post-triage workflow is driven by Slack reactions and thread commands, processed each time you run `python -m src.sweeper` — no Socket Mode or webhooks required.
 
 ## How reactions work
 
