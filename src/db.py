@@ -315,7 +315,14 @@ class Database:
         "triaged", "saved", "passed", "processing_batch", "tailored", "applied",
         "rejected", "interviewing",
         "expired", "failed_api", "failed_compilation",
+        # Autopilot lanes — speculative execution after Stage 5.
+        "auto_queued", "auto",
     }
+
+    # Lanes that should not be demoted by autopilot queueing.
+    _AUTOPILOT_BLOCKED_STATUSES = frozenset(
+        {"passed", "tailored", "auto", "applied", "rejected", "interviewing", "expired"}
+    )
 
     def update_pipeline_status(self, listing_id: str, status: str) -> bool:
         """Transition a listing to a new pipeline status.
@@ -403,6 +410,8 @@ class Database:
         "expired": "expired",
         "failed_api": "failed",
         "failed_compilation": "failed",
+        "auto_queued": "auto-queued",
+        "auto": "auto-evaluated",
     }
 
     def get_funnel_counts(self, max_age_days: int | None = None) -> dict[str, int]:
@@ -569,6 +578,35 @@ class Database:
         )
         self.conn.commit()
         return cursor.rowcount
+
+
+    # --- Autopilot queue ---
+
+    def mark_auto_queued(self, listing_id: str) -> bool:
+        """Flag a listing for the Speculative Agent (autopilot mode).
+
+        Honors lane priority: pass > tailored > auto > auto_queued > triaged.
+        A row already in a higher-priority lane is left untouched.
+        """
+        row = self.conn.execute(
+            "SELECT pipeline_status FROM listings WHERE id = ?",
+            (listing_id,),
+        ).fetchone()
+        if row is None:
+            return False
+        if row["pipeline_status"] in self._AUTOPILOT_BLOCKED_STATUSES:
+            return False
+        return self.update_pipeline_status(listing_id, "auto_queued")
+
+    def get_auto_queue(self) -> list[sqlite3.Row]:
+        """Return listings queued for the Speculative Agent, highest confidence first."""
+        return self.conn.execute(
+            """
+            SELECT * FROM listings
+            WHERE pipeline_status = 'auto_queued'
+            ORDER BY confidence DESC, date_ingested DESC
+            """,
+        ).fetchall()
 
 
 def _format_history_timeline(matches: list, status_display: dict) -> str:

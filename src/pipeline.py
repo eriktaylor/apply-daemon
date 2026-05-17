@@ -18,11 +18,16 @@ from src.email_classifier import SKIP, classify_email
 from src.email_fetcher import fetch_unread_emails
 from src.profile_loader import load_profile
 from src.text_extractor import extract_links, extract_text, get_html_body
-from src.triage import TriageSession
+from src.triage import TriageSession, get_confidence_threshold
 
 logger = logging.getLogger(__name__)
 
 DEBUG_DIR = Path("debug")
+
+
+def _autopilot_enabled() -> bool:
+    import os
+    return os.getenv("AUTOPILOT_ENABLED", "false").strip().lower() in ("1", "true", "yes")
 
 
 def _source_from_classification(classification: str) -> str:
@@ -62,8 +67,11 @@ def run_pipeline() -> None:
 
         stats = {
             "fetched": 0, "skipped": 0, "deduped": 0, "processed": 0,
-            "listings": 0, "yes": 0, "maybe": 0, "no": 0,
+            "listings": 0, "yes": 0, "maybe": 0, "no": 0, "auto_queued": 0,
         }
+
+        autopilot_on = _autopilot_enabled()
+        autopilot_cutoff = int(round(get_confidence_threshold() * 100))
 
         with TriageSession(profile["llm_context"]) as session:
             for msg in messages:
@@ -135,6 +143,13 @@ def run_pipeline() -> None:
                         verdict_key = listing.verdict.lower()
                         if verdict_key in stats:
                             stats[verdict_key] += 1
+                        if (
+                            autopilot_on
+                            and listing.verdict in ("YES", "MAYBE")
+                            and listing.confidence >= autopilot_cutoff
+                        ):
+                            if db.mark_auto_queued(listing.id):
+                                stats["auto_queued"] += 1
 
                 # Record email as processed for future dedup
                 text_hash = hashlib.sha256(text[:500].encode()).hexdigest()[:16]
@@ -153,6 +168,8 @@ def run_pipeline() -> None:
             "  Verdicts:         YES=%d, MAYBE=%d, NO=%d",
             stats["yes"], stats["maybe"], stats["no"],
         )
+        if autopilot_on:
+            logger.info("  Autopilot queued: %d", stats["auto_queued"])
 
 
 def _save_debug_email(msg, text: str, reason: str) -> None:

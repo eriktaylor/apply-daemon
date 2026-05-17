@@ -293,6 +293,25 @@ def _dispatch_reactions(
                 )
                 counts["tailored"] += 1
 
+            elif current_status == "auto":
+                # Speculative Agent already ran deep research + match analysis.
+                # Reuse the cached research context so the manual tailor only
+                # pays the resume-edit cost.
+                from src.tailor import _find_existing_output
+                folder = _find_existing_output(job_id)
+                cached_research = ""
+                if folder is not None:
+                    research_file = folder / "deep_research_context.txt"
+                    if research_file.exists():
+                        cached_research = research_file.read_text(encoding="utf-8")
+                _append_human_label(job_id, "tailor", row)
+                _handle_tailor(
+                    app, db, channel, ts, job_id, msg,
+                    action_to_reaction["tailor"],
+                    research_context_cache=cached_research,
+                )
+                counts["tailored"] += 1
+
             elif current_status == "tailored":
                 # DB says tailored — cross-check disk before skipping.
                 from src.tailor import _find_existing_output

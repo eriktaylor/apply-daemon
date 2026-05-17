@@ -393,6 +393,12 @@ def run_jobspy_ingest() -> None:
         "yes": 0, "maybe": 0, "no": 0,
     }
 
+    autopilot_on = os.getenv("AUTOPILOT_ENABLED", "false").strip().lower() in (
+        "1", "true", "yes",
+    )
+    from src.triage import get_confidence_threshold
+    autopilot_cutoff = int(round(get_confidence_threshold() * 100))
+
     query_count = 0
 
     with Database() as db, TriageSession(profile["llm_context"]) as session:
@@ -558,6 +564,12 @@ def run_jobspy_ingest() -> None:
                         verdict_key = listing.verdict.lower()
                         if verdict_key in stats:
                             stats[verdict_key] += 1
+                        if (
+                            autopilot_on
+                            and listing.verdict in ("YES", "MAYBE")
+                            and listing.confidence >= autopilot_cutoff
+                        ):
+                            db.mark_auto_queued(listing.id)
 
     logger.info("JobSpy ingest complete:")
     logger.info("  Total rows processed: %d", stats["total"])
