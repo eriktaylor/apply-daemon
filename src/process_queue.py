@@ -16,11 +16,14 @@ Heavier resume edits and cover letters are deferred to the manual Tailor run
 folder used by ``src.tailor`` so subsequent tailor runs reuse the artifacts.
 
 Usage:
-    python -m src.process_queue
+    python -m src.process_queue                  # process the queue
+    python -m src.process_queue --backfill       # backfill, then process
+    python -m src.process_queue --backfill-only  # backfill, exit
 """
 
 from __future__ import annotations
 
+import argparse
 import asyncio
 import json
 import logging
@@ -42,6 +45,7 @@ from src.notifications import _get_slack_config, _import_slack_app
 from src.profile_loader import load_profile
 from src.research import run_deep_research
 from src.tailor import _find_existing_output
+from src.triage import get_confidence_threshold
 
 logger = logging.getLogger(__name__)
 
@@ -498,6 +502,32 @@ async def _run_async(rows: list[dict]) -> dict[str, int]:
     return counts
 
 
+def backfill(min_confidence: float | None = None) -> int:
+    """Promote existing triaged/saved YES/MAYBE listings into the autopilot queue.
+
+    Use this when enabling autopilot after listings have already been ingested
+    through the normal pipeline. Honors lane priority — rows in passed,
+    tailored, auto, applied, etc. are left untouched.
+
+    Args:
+        min_confidence: Confidence cutoff as a 0.0–1.0 fraction. Defaults to
+            ``CONFIDENCE_THRESHOLD`` from the environment.
+
+    Returns:
+        Number of listings moved to ``auto_queued``.
+    """
+    threshold = min_confidence if min_confidence is not None else get_confidence_threshold()
+    cutoff_pct = int(round(threshold * 100))
+    with Database() as db:
+        promoted = db.backfill_auto_queue(cutoff_pct)
+    logger.info(
+        "Autopilot backfill: promoted %d triaged/saved listings to auto_queued "
+        "(confidence >= %d%%)",
+        promoted, cutoff_pct,
+    )
+    return promoted
+
+
 def run() -> int:
     """Process all auto_queued listings. Returns the number of listings handled."""
     if not _autopilot_enabled():
@@ -529,6 +559,28 @@ def main() -> None:
         datefmt="%Y-%m-%d %H:%M:%S",
         handlers=[logging.StreamHandler(sys.stdout)],
     )
+    parser = argparse.ArgumentParser(description="Autopilot Speculative Agent")
+    parser.add_argument(
+        "--backfill",
+        action="store_true",
+        help=(
+            "Promote existing triaged/saved listings (verdict YES/MAYBE with "
+            "confidence >= CONFIDENCE_THRESHOLD) into the autopilot queue "
+            "before processing. Useful when enabling autopilot after a batch "
+            "has already been ingested."
+        ),
+    )
+    parser.add_argument(
+        "--backfill-only",
+        action="store_true",
+        help="Run the backfill step and exit without processing the queue.",
+    )
+    args = parser.parse_args()
+
+    if args.backfill or args.backfill_only:
+        backfill()
+        if args.backfill_only:
+            return
     run()
 
 
