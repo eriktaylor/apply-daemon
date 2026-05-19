@@ -608,6 +608,28 @@ class Database:
             """,
         ).fetchall()
 
+    def backfill_auto_queue(self, min_confidence_pct: int) -> int:
+        """Promote existing triaged/saved listings to auto_queued.
+
+        Only rows with verdict YES/MAYBE and confidence >= ``min_confidence_pct``
+        are moved. Higher-priority lanes (passed, tailored, auto, applied,
+        rejected, interviewing, expired) are never demoted. Returns the number
+        of rows promoted.
+        """
+        now = datetime.now(timezone.utc).isoformat()
+        cursor = self.conn.execute(
+            """
+            UPDATE listings
+            SET pipeline_status = 'auto_queued', updated_at = ?
+            WHERE pipeline_status IN ('triaged', 'saved')
+              AND verdict IN ('YES', 'MAYBE')
+              AND confidence >= ?
+            """,
+            (now, min_confidence_pct),
+        )
+        self.conn.commit()
+        return cursor.rowcount
+
 
 def _format_history_timeline(matches: list, status_display: dict) -> str:
     """Format a list of historical matches into a timeline string.

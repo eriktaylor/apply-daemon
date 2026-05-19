@@ -169,6 +169,15 @@ Walks the checklist, reporting which components are configured and reachable. In
 
 > **Designed to consume the absolute minimum of paid credits** — the only billable call is the single OpenRouter token. Pass `--no-llm` to skip even that, or `--no-network` to skip every remote check.
 
+**Daily batch (recommended):**
+
+```bash
+# Chains: jobspy_ingest → digest → pipeline → digest → process_queue
+./script.sh
+```
+
+The bundled `script.sh` runs both tracks back-to-back and then fires the autopilot Speculative Agent. `process_queue` is a no-op when `AUTOPILOT_ENABLED=false`, so the script is safe to use either way. After it returns, the only command needed to triage the batch is `python -m src.sweeper`.
+
 **Manual run:**
 
 ```bash
@@ -184,6 +193,19 @@ python -m src.sweeper --deep 99  # Scan last 99 posts; default is 50
 
 # Batch tailor every saved listing (concurrent OpenRouter calls)
 python -m src.batch_process      # or: apply-daemon-batch
+
+# Autopilot — Speculative Agent (requires AUTOPILOT_ENABLED=true in .env).
+# Runs Deep Research + a Claude match-analysis pass for every listing the
+# pipeline flagged as auto_queued, posts the enriched card to Slack, and
+# auto-passes any post-research NO verdict. Resume tailoring still happens
+# on the manual ✏️ reaction and reuses the cached research.
+python -m src.process_queue
+
+# Enabling autopilot AFTER a batch is already ingested? Promote existing
+# triaged/saved YES/MAYBE listings (confidence >= CONFIDENCE_THRESHOLD)
+# into the queue first:
+python -m src.process_queue --backfill        # backfill, then process
+python -m src.process_queue --backfill-only   # backfill, exit
 
 # Funnel report
 python -m src.report             # All-time reference
