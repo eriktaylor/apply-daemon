@@ -85,13 +85,14 @@ cp .env.example .env
 
 ```bash
 # Using uv (recommended)
-uv venv && source .venv/bin/activate && uv pip install -e ".[dev]"
+# uv automatically creates the virtual environment and syncs dependencies from pyproject.toml
+uv sync
 
-# Or using pip
+# Or using pip (legacy)
 python -m venv .venv && source .venv/bin/activate && pip install -e ".[dev]"
 ```
 
-> **Upgrading from an earlier version?** Run `pip install -e ".[dev]"` again to pick up the two new dependencies: `python-jobspy` and `pyyaml`.
+> **Upgrading from an earlier version?** Re-run `uv sync` (or `pip install -e ".[dev]"`) to pick up the two newer dependencies: `python-jobspy` and `pyyaml`.
 
 ### D. Slack channel and Slack bot
 
@@ -249,50 +250,6 @@ Test extraction + matching accuracy on labeled emails:
 
 ```bash
 python -m eval.eval --input eval/eval_example.csv --model google/gemini-3.1-flash-lite-preview
-```
-
-## Project structure
-
-```
-apply-daemon/
-├── my_profile_example/          # Template — cp -r to my_profile/
-│   ├── profile.md
-│   ├── base_resume.docx
-│   ├── cover_letter.md
-│   └── search_config.yaml       # JobSpy search config (Track A) — generic ML/AI engineer starter
-├── my_profile/                  # Your data + customized search_config.yaml (gitignored)
-├── src/
-│   ├── jobspy_ingest.py       # Track A — Proactive polling via JobSpy
-│   ├── pipeline.py            # Track B — Silent worker (fetch, triage, store)
-│   ├── digest.py              # Slack digest (posts listings for reaction)
-│   ├── sweeper.py             # Reaction sweeper + ChatOps command parser
-│   ├── tailor.py              # Cloud LLM escalation engine
-│   ├── compile.py             # Document compiler (.docx generation)
-│   ├── research.py            # Deep Research agent (semantic scraping)
-│   ├── report.py              # CLI funnel report (pre-flight + metrics)
-│   ├── batch_process.py       # Batch processor — concurrent OpenRouter tailor requests
-│   ├── email_fetcher.py       # IMAP connection and retrieval
-│   ├── email_classifier.py    # Header-based email classification
-│   ├── text_extractor.py      # Generic HTML → text extraction
-│   ├── triage.py              # LLM extraction + matching (confidence threshold)
-│   ├── geo.py                 # Geo-distance calculator (Nominatim + haversine)
-│   ├── models.py              # JobListing dataclass
-│   ├── profile_loader.py      # Profile.md loader
-│   ├── notifications.py       # Slack integration (optional)
-│   ├── proxy_manager.py       # IPRoyal sticky residential-proxy rotator
-│   ├── proxy_test.py          # CLI smoke test for the IPRoyal stack
-│   └── db.py                  # SQLite schema and access layer
-├── eval/
-│   ├── eval.py                # Eval harness
-│   └── eval_example.csv       # Sample eval data
-├── tests/
-├── docs/
-│   ├── PROJECT_BRIEFING.md
-│   └── EVAL_GUIDE.md
-├── SECURITY.md
-├── .env.example
-├── .gitignore
-└── pyproject.toml
 ```
 
 ## Security
