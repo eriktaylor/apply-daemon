@@ -160,6 +160,8 @@ See [`docs/PROXY.md`](docs/PROXY.md) for setup, rotation behaviour, and the smok
 
 ### H. Run the pipeline
 
+Activate the virtualenv first if it isn't already (`source .venv/bin/activate`), then continue below.
+
 **Integration evaluation:**
 
 ```bash
