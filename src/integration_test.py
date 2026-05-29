@@ -4,7 +4,7 @@ Walks the README setup checklist (A–H) and reports which components
 are configured and reachable. Designed to consume the absolute
 minimum of paid credits — the only billable call is a single
 1-token OpenRouter completion against the Stage 5 model (well under
-$0.0001 with the default ``google/gemini-3.1-flash-lite-preview``).
+$0.0001 with the default ``google/gemini-3.1-flash-lite``).
 The Slack ``auth.test`` and Gmail IMAP ``LOGIN`` checks are free;
 the IPRoyal check verifies credentials are present without opening
 a session (use ``apply-daemon-test-proxy`` for the full smoke test).
@@ -207,7 +207,7 @@ def _check_slack(do_network: bool) -> CheckResult:
 def _check_openrouter(do_network: bool, do_llm: bool) -> CheckResult:
     """E. OPENROUTER_API_KEY + tiny live completion."""
     api_key = os.getenv("OPENROUTER_API_KEY")
-    model = os.getenv("OPENROUTER_MODEL", "google/gemini-3.1-flash-lite-preview")
+    model = os.getenv("OPENROUTER_MODEL", "google/gemini-3.1-flash-lite")
     if not api_key:
         return CheckResult(
             "E. OpenRouter",

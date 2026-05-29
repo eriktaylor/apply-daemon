@@ -292,7 +292,7 @@ def main():
     display_model = (
         model
         if model
-        else os.getenv("OPENROUTER_MODEL", "google/gemini-3.1-flash-lite-preview")
+        else os.getenv("OPENROUTER_MODEL", "google/gemini-3.1-flash-lite")
     )
     print(f"Running eval with model={display_model}, runs_per_email={args.runs}")
 

@@ -279,7 +279,7 @@ def get_openrouter_config() -> tuple[str, str]:
     """
     load_dotenv()
     api_key = os.getenv("OPENROUTER_API_KEY", "")
-    model = os.getenv("OPENROUTER_MODEL", "google/gemini-3.1-flash-lite-preview")
+    model = os.getenv("OPENROUTER_MODEL", "google/gemini-3.1-flash-lite")
     return api_key, model
 
 

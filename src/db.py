@@ -73,6 +73,23 @@ class Database:
 
     def _init_schema(self) -> None:
         self.conn.executescript(SCHEMA)
+        migrations = (
+            ("slack_message_ts", "ALTER TABLE listings ADD COLUMN slack_message_ts TEXT"),
+            (
+                "autopilot_processed_at",
+                "ALTER TABLE listings ADD COLUMN autopilot_processed_at TEXT",
+            ),
+            (
+                "distance_bucket",
+                "ALTER TABLE listings ADD COLUMN distance_bucket INTEGER",
+            ),
+        )
+        for col, ddl in migrations:
+            try:
+                self.conn.execute(ddl)
+            except sqlite3.OperationalError as exc:
+                if f"duplicate column name: {col}" not in str(exc):
+                    raise
         self.conn.commit()
 
     def close(self) -> None:
@@ -350,15 +367,32 @@ class Database:
             (listing_id,),
         ).fetchone()
 
-    def get_digest_listings(self, days: int = 14) -> list[sqlite3.Row]:
-        """Get listings for the daily digest (triaged or saved, last N days).
+    def get_digest_listings(
+        self,
+        days: int = 14,
+        min_confidence_pct: int | None = None,
+    ) -> list[sqlite3.Row]:
+        """Get listings for the daily digest.
 
+        Includes ``triaged``, ``saved``, and ``auto_queued`` rows so every
+        Stage-5-approved listing surfaces in Slack — autopilot enrichment later
+        edits the card in place rather than gating its initial visibility.
         Sorted by confidence descending so highest-scoring listings come first.
-        Only returns listings that have NOT yet been posted to Slack.
+
+        Only returns listings that have NOT yet been posted to Slack
+        (``slack_notified = 0``). This makes the digest self-healing: a row
+        stranded with ``slack_notified=0`` by a crashed run is picked up on the
+        next invocation.
 
         Defense in depth: any active-status row with verdict='NO' is flipped to
         ``pipeline_status='passed'`` before the query so it cannot surface in
         the digest — a NO is a NO regardless of how it reached the DB.
+
+        Args:
+            days: Only consider rows ingested within the last N days.
+            min_confidence_pct: If set, re-gate against the current confidence
+                threshold so a later threshold raise drops sub-threshold
+                un-notified rows from the digest.
         """
         self.conn.execute(
             """
@@ -366,21 +400,23 @@ class Database:
             SET pipeline_status = 'passed',
                 updated_at = ?
             WHERE verdict = 'NO'
-              AND pipeline_status IN ('triaged', 'saved')
+              AND pipeline_status IN ('triaged', 'saved', 'auto_queued')
             """,
             (datetime.now(timezone.utc).isoformat(),),
         )
         self.conn.commit()
-        return self.conn.execute(
-            """
-            SELECT * FROM listings
-            WHERE pipeline_status IN ('triaged', 'saved')
-            AND slack_notified = 0
-            AND date_ingested >= datetime('now', ?)
-            ORDER BY confidence DESC, date_ingested DESC
-            """,
-            (f"-{days} days",),
-        ).fetchall()
+        sql = (
+            "SELECT * FROM listings "
+            "WHERE pipeline_status IN ('triaged', 'saved', 'auto_queued') "
+            "AND slack_notified = 0 "
+            "AND date_ingested >= datetime('now', ?)"
+        )
+        params: list = [f"-{days} days"]
+        if min_confidence_pct is not None:
+            sql += " AND confidence >= ?"
+            params.append(min_confidence_pct)
+        sql += " ORDER BY confidence DESC, date_ingested DESC"
+        return self.conn.execute(sql, params).fetchall()
 
     def mark_slack_notified(self, listing_id: str) -> bool:
         """Mark a listing as having been posted to Slack.
@@ -394,6 +430,54 @@ class Database:
         )
         self.conn.commit()
         return cursor.rowcount > 0
+
+    def set_slack_message_ts(self, listing_id: str, ts: str) -> bool:
+        """Persist the Slack message timestamp for later chat.update calls."""
+        cursor = self.conn.execute(
+            "UPDATE listings SET slack_message_ts = ? WHERE id = ?",
+            (ts, listing_id),
+        )
+        self.conn.commit()
+        return cursor.rowcount > 0
+
+    def get_slack_message_ts(self, listing_id: str) -> str | None:
+        row = self.conn.execute(
+            "SELECT slack_message_ts FROM listings WHERE id = ?",
+            (listing_id,),
+        ).fetchone()
+        if row is None:
+            return None
+        return row["slack_message_ts"]
+
+    def set_distance_bucket(self, listing_id: str, bucket: int) -> bool:
+        """Persist the geo distance bucket (0=Remote, 1=Local, 2=Commute, 3=Relocation)."""
+        cursor = self.conn.execute(
+            "UPDATE listings SET distance_bucket = ? WHERE id = ?",
+            (bucket, listing_id),
+        )
+        self.conn.commit()
+        return cursor.rowcount > 0
+
+    def mark_autopilot_processed(self, listing_id: str) -> bool:
+        """Stamp the moment autopilot finalized this listing (auto or auto-pass)."""
+        now = datetime.now(timezone.utc).isoformat()
+        cursor = self.conn.execute(
+            "UPDATE listings SET autopilot_processed_at = ? WHERE id = ?",
+            (now, listing_id),
+        )
+        self.conn.commit()
+        return cursor.rowcount > 0
+
+    def count_autopilot_processed_today(self) -> int:
+        """Count listings autopilot has finalized since 00:00 UTC today."""
+        start = datetime.now(timezone.utc).replace(
+            hour=0, minute=0, second=0, microsecond=0,
+        ).isoformat()
+        row = self.conn.execute(
+            "SELECT COUNT(*) AS cnt FROM listings WHERE autopilot_processed_at >= ?",
+            (start,),
+        ).fetchone()
+        return int(row["cnt"]) if row else 0
 
     # --- Historical context ---
 
@@ -598,15 +682,28 @@ class Database:
             return False
         return self.update_pipeline_status(listing_id, "auto_queued")
 
-    def get_auto_queue(self) -> list[sqlite3.Row]:
-        """Return listings queued for the Speculative Agent, highest confidence first."""
-        return self.conn.execute(
-            """
-            SELECT * FROM listings
-            WHERE pipeline_status = 'auto_queued'
-            ORDER BY confidence DESC, date_ingested DESC
-            """,
-        ).fetchall()
+    def get_auto_queue(
+        self,
+        top_n: int | None = None,
+        min_confidence_pct: int = 0,
+    ) -> list[sqlite3.Row]:
+        """Return listings queued for the Speculative Agent, highest confidence first.
+
+        Filters to YES/MAYBE verdicts and ``confidence >= min_confidence_pct``.
+        When ``top_n`` is set, caps the result at that many rows.
+        """
+        sql = (
+            "SELECT * FROM listings "
+            "WHERE pipeline_status = 'auto_queued' "
+            "AND verdict IN ('YES', 'MAYBE') "
+            "AND confidence >= ? "
+            "ORDER BY confidence DESC, date_ingested DESC"
+        )
+        params: list = [min_confidence_pct]
+        if top_n is not None:
+            sql += " LIMIT ?"
+            params.append(top_n)
+        return self.conn.execute(sql, params).fetchall()
 
     def backfill_auto_queue(self, min_confidence_pct: int) -> int:
         """Promote existing triaged/saved listings to auto_queued.

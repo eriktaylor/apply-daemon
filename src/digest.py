@@ -3,8 +3,14 @@
 Intended to run via cron at 8:00 AM:
     0 8 * * * cd /path/to/apply-daemon && python -m src.digest
 
-Queries the DB for all listings where pipeline_status is 'triaged' or 'saved'
-from the last 14 days, sorted by confidence descending.
+Queries the DB for all un-notified listings where pipeline_status is
+'triaged', 'saved', or 'auto_queued' from the last 14 days, sorted by
+confidence descending. Cards posted here are edited in place by autopilot
+(top-N enrichment) — funnel-as-UI: post all, enrich a subset.
+
+Self-heals on un-posted rows: if a prior run crashed before posting, the
+next invocation picks up any `slack_notified=0` listing that still meets
+the current CONFIDENCE_THRESHOLD.
 """
 
 from __future__ import annotations
@@ -21,6 +27,7 @@ load_dotenv()
 from src.db import Database
 from src.geo import get_distance
 from src.notifications import _get_slack_config, _import_slack_app
+from src.triage import get_confidence_threshold
 
 logger = logging.getLogger(__name__)
 
@@ -234,8 +241,9 @@ def post_digest() -> bool:
     rate_limit_handler = RateLimitErrorRetryHandler(max_retry_count=3)
     app.client.retry_handlers.append(rate_limit_handler)
 
+    cutoff_pct = int(round(get_confidence_threshold() * 100))
     with Database() as db:
-        rows = db.get_digest_listings(days=14)
+        rows = db.get_digest_listings(days=14, min_confidence_pct=cutoff_pct)
 
         if not rows:
             logger.info("No listings for digest — nothing to post")
@@ -266,7 +274,7 @@ def post_digest() -> bool:
                     "event_type": "apply_daemon_listing",
                     "event_payload": {"job_id": listing_id},
                 }
-                app.client.chat_postMessage(
+                resp = app.client.chat_postMessage(
                     channel=channel,
                     text=(
                         f"{listing.get('verdict', '?')}: {listing.get('title', '')} "
@@ -275,6 +283,9 @@ def post_digest() -> bool:
                     attachments=[attachment],
                     metadata=metadata,
                 )
+                ts = resp.get("ts") if resp else None
+                if ts:
+                    db.set_slack_message_ts(listing_id, ts)
                 db.mark_slack_notified(listing_id)
                 time.sleep(1.5)
 

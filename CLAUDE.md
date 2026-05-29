@@ -6,7 +6,7 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
 
 ```bash
 # Install (Python 3.11+ required)
-uv venv .venv && source .venv/bin/activate && uv pip install -e ".[dev]"
+uv sync && source .venv/bin/activate
 
 # Lint + tests (CI runs exactly these two)
 ruff check .

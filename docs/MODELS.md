@@ -5,7 +5,7 @@ All LLM calls route through [OpenRouter](https://openrouter.ai), giving access t
 | Env Var | Stage | Default | Notes |
 |---|---|---|---|
 | `OPENROUTER_STAGE1_MODEL` | Track B extraction | `openai/gpt-5.4-nano` | Runs on every email — optimise for speed |
-| `OPENROUTER_MODEL` | Stage 5 scoring (both tracks) | `google/gemini-3.1-flash-lite-preview` | Used as fallback if STAGE1 is unset |
+| `OPENROUTER_MODEL` | Stage 5 scoring (both tracks) | `google/gemini-3.1-flash-lite` | Used as fallback if STAGE1 is unset |
 | `OPENROUTER_TAILOR_MODEL` | Resume, cover letter, interview prep | `anthropic/claude-sonnet-4.6` | Runs only on Tailor operations |
 | `OPENROUTER_TREND_MODEL` | `!trend` skill canonicalization | `openai/gpt-4o-mini` | On-demand only; 3 concurrent calls per `!trend` |
 

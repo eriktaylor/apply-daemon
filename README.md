@@ -86,7 +86,7 @@ cp .env.example .env
 ```bash
 # Using uv (recommended)
 # uv automatically creates the virtual environment and syncs dependencies from pyproject.toml
-uv sync
+uv sync && source .venv/bin/activate
 
 # Or using pip (legacy)
 python -m venv .venv && source .venv/bin/activate && pip install -e ".[dev]"
@@ -249,7 +249,7 @@ pytest
 Test extraction + matching accuracy on labeled emails:
 
 ```bash
-python -m eval.eval --input eval/eval_example.csv --model google/gemini-3.1-flash-lite-preview
+python -m eval.eval --input eval/eval_example.csv --model google/gemini-3.1-flash-lite
 ```
 
 ## Security

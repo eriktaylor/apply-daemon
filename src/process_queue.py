@@ -38,6 +38,7 @@ from dotenv import load_dotenv
 
 load_dotenv()
 
+from src.compile import _serialize_safe
 from src.db import Database
 from src.file_utils import read_dropzone_file
 from src.geo import get_distance
@@ -52,6 +53,17 @@ logger = logging.getLogger(__name__)
 OUTPUT_DIR = Path("output")
 
 _OPENROUTER_BASE_URL = "https://openrouter.ai/api/v1"
+
+# Ranking knobs for selecting the top-N out of the auto_queue.
+# Lexicographic primary: confidence band (5-point wide).
+# Within-band composite: verdict bonus + skill score + geo bonus.
+_BAND_WIDTH = 5
+_VERDICT_BONUS_YES = 3
+# Geo bucket scores: 0=Remote, 1=Local(<=30mi), 2=Commute(<=60mi), 3=Relocation(>60mi)
+_GEO_SCORES: dict[int, int] = {0: 5, 1: 4, 2: 3, 3: 1}
+# Mileage bucket boundaries (inclusive upper)
+_LOCAL_MILES_MAX = 30
+_COMMUTE_MILES_MAX = 60
 
 _MATCH_ANALYSIS_SCHEMA = (
     '"match_analysis": "<A structured 3-part analysis:\\n'
@@ -114,8 +126,117 @@ def _concurrency() -> int:
         return 3
 
 
+def _top_n() -> int:
+    """Max listings autopilot will finalize per UTC day. 0 disables autopilot."""
+    try:
+        return max(0, int(os.getenv("AUTOPILOT_TOP_N", "10")))
+    except ValueError:
+        return 10
+
+
 def _tailor_model() -> str:
     return os.getenv("OPENROUTER_TAILOR_MODEL", "anthropic/claude-sonnet-4.6")
+
+
+def _band(confidence: int) -> int:
+    """Map a 0-100 confidence to its 5-point band index (higher = better)."""
+    return int(confidence) // _BAND_WIDTH
+
+
+def _compute_distance_bucket(location: str) -> int:
+    """Resolve a location string to a coarse geo bucket.
+
+    Returns 0=Remote, 1=Local(<=30mi), 2=Commute(<=60mi), 3=Relocation(>60mi).
+    Unknown or unparseable locations bucket as 3 (worst-case for ranking).
+    """
+    if not location:
+        return 3
+    distance_str = get_distance(location)
+    if distance_str == "Remote":
+        return 0
+    if distance_str == "Distance unknown":
+        return 3
+    # Parse "N miles"
+    try:
+        miles = int(distance_str.split()[0])
+    except (ValueError, IndexError):
+        return 3
+    if miles <= _LOCAL_MILES_MAX:
+        return 1
+    if miles <= _COMMUTE_MILES_MAX:
+        return 2
+    return 3
+
+
+def _resolve_bucket(row: dict, db: Database) -> int:
+    """Return the row's distance_bucket, computing + persisting it on first use."""
+    cached = row.get("distance_bucket")
+    if cached is not None:
+        return int(cached)
+    bucket = _compute_distance_bucket(row.get("location", "") or "")
+    row["distance_bucket"] = bucket
+    db.set_distance_bucket(row["id"], bucket)
+    return bucket
+
+
+def _skill_score(row: dict) -> int:
+    """Net skill score: matching count - missing count. Tolerates malformed JSON."""
+    def _count(field: str) -> int:
+        raw = row.get(field) or ""
+        if not raw:
+            return 0
+        try:
+            value = json.loads(raw)
+            return len(value) if isinstance(value, list) else 0
+        except (json.JSONDecodeError, TypeError):
+            return 0
+    return _count("matching_skills") - _count("missing_skills")
+
+
+def _composite_score(row: dict, bucket: int) -> int:
+    """Within-band ordering signal. Higher = better."""
+    verdict_bonus = _VERDICT_BONUS_YES if (row.get("verdict") or "").upper() == "YES" else 0
+    return verdict_bonus + _skill_score(row) + _GEO_SCORES.get(bucket, 0)
+
+
+def _select_top_n(rows: list[dict], top_n: int, db: Database) -> list[dict]:
+    """Pick up to ``top_n`` rows using confidence bands + within-band composite.
+
+    Walks bands high → low. For each band, lazily resolves geo for its rows,
+    scores them, then slices the band by ``(composite DESC, date_ingested DESC)``.
+    Bands beyond the quota are never geocoded.
+    """
+    if top_n <= 0 or not rows:
+        return []
+
+    # Group by band, preserving descending confidence (rows are already sorted
+    # confidence DESC, date_ingested DESC by get_auto_queue).
+    bands: dict[int, list[dict]] = {}
+    band_order: list[int] = []
+    for r in rows:
+        b = _band(r.get("confidence", 0))
+        if b not in bands:
+            bands[b] = []
+            band_order.append(b)
+        bands[b].append(r)
+
+    selected: list[dict] = []
+    for band in band_order:
+        if len(selected) >= top_n:
+            break
+        band_rows = bands[band]
+        # Lazy geo resolution — only for rows in bands we actually consider.
+        for r in band_rows:
+            bucket = _resolve_bucket(r, db)
+            r["_composite"] = _composite_score(r, bucket)
+        # Sort within band: composite DESC, then date_ingested DESC. Two stable
+        # passes (least significant first) — Python's sort is stable.
+        band_rows.sort(key=lambda r: r.get("date_ingested", ""), reverse=True)
+        band_rows.sort(key=lambda r: int(r["_composite"]), reverse=True)
+        remaining = top_n - len(selected)
+        selected.extend(band_rows[:remaining])
+
+    return selected
 
 
 def _job_output_dir(job_id: str, listing: dict) -> Path:
@@ -306,47 +427,85 @@ def _build_slack_blocks(listing: dict, auto_json: dict, folder: Path) -> tuple[l
 
 
 def _post_results_to_slack(
-    app, channel: str, listing: dict, auto_json: dict, folder: Path,
-) -> bool:
-    """Post the auto-evaluated card + threaded Deep Evaluation. Returns True on success."""
+    app,
+    channel: str,
+    listing: dict,
+    auto_json: dict,
+    folder: Path,
+    existing_ts: str | None,
+) -> tuple[bool, str | None]:
+    """Post the auto-evaluated card + threaded Deep Evaluation.
+
+    When ``existing_ts`` is set, edits the prior digest card in place (mirroring
+    sweeper._handle_tailor) and posts the Deep Evaluation as a thread reply.
+    Otherwise posts a fresh card. Returns ``(success, message_ts)``.
+    """
     title = listing.get("title", "Unknown")
     company = listing.get("company", "Unknown")
     pr_verdict = auto_json.get("post_research_verdict", "MAYBE")
     pr_conf = auto_json.get("post_research_confidence", "?")
     card_blocks, thread_info = _build_slack_blocks(listing, auto_json, folder)
+    attachment = {
+        "color": (
+            "#2eb67d" if pr_verdict == "YES"
+            else "#36c5f0" if pr_verdict == "MAYBE"
+            else "#ddd"
+        ),
+        "blocks": card_blocks,
+    }
+    card_text = (
+        f":robot_face: Auto-evaluated: {title} at {company} — "
+        f"{pr_verdict} ({pr_conf}%)"
+    )
+    thread_text = f"Deep Evaluation: {title} at {company} — {pr_verdict} ({pr_conf}%)"
     try:
-        attachment = {
-            "color": (
-                "#2eb67d" if pr_verdict == "YES"
-                else "#36c5f0" if pr_verdict == "MAYBE"
-                else "#ddd"
-            ),
-            "blocks": card_blocks,
-        }
-        resp = app.client.chat_postMessage(
-            channel=channel,
-            text=(
-                f":robot_face: Auto-evaluated: {title} at {company} — "
-                f"{pr_verdict} ({pr_conf}%)"
-            ),
-            attachments=[attachment],
-            metadata=thread_info["metadata"],
-        )
-        ts = resp.get("ts")
+        if existing_ts:
+            app.client.chat_update(
+                channel=channel,
+                ts=existing_ts,
+                text=card_text,
+                attachments=[attachment],
+            )
+            ts = existing_ts
+        else:
+            resp = app.client.chat_postMessage(
+                channel=channel,
+                text=card_text,
+                attachments=[attachment],
+                metadata=thread_info["metadata"],
+            )
+            ts = resp.get("ts")
         if ts:
             app.client.chat_postMessage(
                 channel=channel,
                 thread_ts=ts,
-                text=f"Deep Evaluation: {title} at {company} — {pr_verdict} ({pr_conf}%)",
+                text=thread_text,
                 blocks=thread_info["thread_blocks"],
             )
-        return True
+        return True, ts
     except Exception:
         logger.error(
             "Failed to post autopilot result for %s",
             listing.get("id", "")[:8], exc_info=True,
         )
-        return False
+        return False, None
+
+
+def _replace_card_with_passed(app, channel: str, ts: str) -> None:
+    """Overwrite an existing card with the gray 'Passed' block (mirrors sweeper)."""
+    try:
+        app.client.chat_update(
+            channel=channel,
+            ts=ts,
+            text="Passed",
+            blocks=[{
+                "type": "section",
+                "text": {"type": "mrkdwn", "text": ":no_entry_sign: *Passed*"},
+            }],
+            attachments=[],
+        )
+    except Exception:
+        logger.error("Autopilot: failed to gray-pass card at ts=%s", ts, exc_info=True)
 
 
 def _build_prompt(
@@ -383,12 +542,23 @@ async def _process_one(
     async with semaphore:
         folder = _job_output_dir(job_id, listing)
 
+        # Persist the pre-research Stage 5 snapshot before any LLM work runs.
+        # Idempotent — never clobbers a prior tailor's snapshot.
+        triage_path = folder / "original_triage.json"
+        if not triage_path.exists():
+            try:
+                triage_path.write_text(_serialize_safe(listing), encoding="utf-8")
+            except OSError:
+                logger.warning("Autopilot: could not write original_triage for %s",
+                               short, exc_info=True)
+
         # 1) Re-check state at the moment of work — another runner may have claimed it
         with Database() as db:
             row = db.get_listing_by_id(job_id)
             if not row or row["pipeline_status"] != "auto_queued":
                 logger.info("Autopilot: %s no longer queued, skipping", short)
                 return "skipped"
+            existing_ts = db.get_slack_message_ts(job_id)
 
         # 2) Deep research (cached if present)
         job_desc = listing.get("job_summary", "") or listing.get("reason", "")
@@ -432,32 +602,44 @@ async def _process_one(
             auto_path.write_text(json.dumps(auto_json, indent=2), encoding="utf-8")
             _merge_assets_json(folder, auto_json, research_context)
 
-        # 4) Auto-pass on NO verdict, no Slack post
+        # 4) Auto-pass on NO verdict — gray out the existing card in place.
         pr_verdict = (auto_json.get("post_research_verdict") or "").upper()
         if pr_verdict == "NO":
+            if slack_ctx is not None and existing_ts:
+                app, channel = slack_ctx
+                await asyncio.to_thread(
+                    _replace_card_with_passed, app, channel, existing_ts,
+                )
             with Database() as db:
                 db.update_pipeline_status(job_id, "passed")
                 db.mark_slack_notified(job_id)
+                db.mark_autopilot_processed(job_id)
             logger.info(
                 "Autopilot: auto-passed %s ('%s' at '%s') on post-research NO",
                 short, title, company,
             )
             return "passed"
 
-        # 5) Post to Slack, then atomically promote state. Idempotent re-runs
-        # find pipeline_status != 'auto_queued' on the second pass and skip.
+        # 5) Edit the existing card (or post fresh if digest never ran) + threaded
+        # reply. Idempotent re-runs find pipeline_status != 'auto_queued' on the
+        # second pass and skip.
+        new_ts: str | None = None
         if slack_ctx is not None:
             app, channel = slack_ctx
-            posted = await asyncio.to_thread(
-                _post_results_to_slack, app, channel, listing, auto_json, folder,
+            posted, new_ts = await asyncio.to_thread(
+                _post_results_to_slack,
+                app, channel, listing, auto_json, folder, existing_ts,
             )
             if not posted:
                 logger.warning("Autopilot: leaving %s in auto_queued for retry", short)
                 return "retry"
 
         with Database() as db:
+            if new_ts and not existing_ts:
+                db.set_slack_message_ts(job_id, new_ts)
             db.update_pipeline_status(job_id, "auto")
             db.mark_slack_notified(job_id)
+            db.mark_autopilot_processed(job_id)
         logger.info(
             "Autopilot: %s ('%s' at '%s') → auto (post-research %s)",
             short, title, company, pr_verdict or "MAYBE",
@@ -529,20 +711,52 @@ def backfill(min_confidence: float | None = None) -> int:
 
 
 def run() -> int:
-    """Process all auto_queued listings. Returns the number of listings handled."""
+    """Process the autopilot queue under the daily top-N cap.
+
+    Returns the number of listings dispatched.
+    """
     if not _autopilot_enabled():
         logger.info("Autopilot disabled (AUTOPILOT_ENABLED=false); nothing to do")
         return 0
 
-    with Database() as db:
-        rows = [dict(r) for r in db.get_auto_queue()]
-
-    if not rows:
-        logger.info("Autopilot queue is empty")
+    top_n = _top_n()
+    if top_n <= 0:
+        logger.info("Autopilot: AUTOPILOT_TOP_N=%d; nothing to do", top_n)
         return 0
 
-    logger.info("Autopilot: processing %d queued listings (concurrency=%d)",
-                len(rows), _concurrency())
+    cutoff_pct = int(round(get_confidence_threshold() * 100))
+    with Database() as db:
+        processed_today = db.count_autopilot_processed_today()
+        remaining = max(0, top_n - processed_today)
+        if remaining == 0:
+            logger.info(
+                "Autopilot daily cap (%d) reached (%d processed today); skipping run",
+                top_n, processed_today,
+            )
+            return 0
+        # Fetch the full eligible pool (no SQL LIMIT) so Python-side banding +
+        # lazy-geo selection can pick the most worth-enriching listings. The
+        # geo lookup is gated to bands that actually contribute to the quota.
+        eligible = [
+            dict(r) for r in db.get_auto_queue(
+                top_n=None, min_confidence_pct=cutoff_pct,
+            )
+        ]
+        rows = _select_top_n(eligible, remaining, db)
+
+    if not rows:
+        logger.info(
+            "Autopilot queue empty after scoring (eligible=%d, cutoff=%d%%, remaining=%d)",
+            len(eligible), cutoff_pct, remaining,
+        )
+        return 0
+
+    logger.info(
+        "Autopilot: processing %d/%d eligible listings (concurrency=%d, "
+        "remaining today=%d/%d, cutoff=%d%%, top band=%d)",
+        len(rows), len(eligible), _concurrency(),
+        remaining, top_n, cutoff_pct, _band(rows[0].get("confidence", 0)),
+    )
     counts = asyncio.run(_run_async(rows))
     logger.info(
         "Autopilot run complete: auto=%d passed=%d failed=%d skipped=%d retry=%d error=%d",
