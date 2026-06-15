@@ -682,6 +682,10 @@ def _scan_chatops_commands(
                 break
 
             # --- On-demand asset commands ---
+            # These don't mutate current_status/row, so we `continue` to the
+            # next reply instead of `break`-ing. That lets a single sweep
+            # process multiple back-to-back commands in the same thread
+            # (e.g. !answer, !coverletter, !polish in one go).
             if text_lower == "!coverletter":
                 if _reply_is_processed(reply):
                     continue
@@ -689,7 +693,7 @@ def _scan_chatops_commands(
                 _append_human_label(job_id, "coverletter", row)
                 _mark_reply_done(app, channel, reply_ts)
                 processed += 1
-                break
+                continue
 
             if text_lower == "!prep":
                 if _reply_is_processed(reply):
@@ -698,7 +702,7 @@ def _scan_chatops_commands(
                 _append_human_label(job_id, "prep", row)
                 _mark_reply_done(app, channel, reply_ts)
                 processed += 1
-                break
+                continue
 
             if text_lower == "!polish":
                 if _reply_is_processed(reply):
@@ -713,12 +717,12 @@ def _scan_chatops_commands(
                     )
                     _mark_reply_done(app, channel, reply_ts)
                     processed += 1
-                    break
+                    continue
                 _handle_ondemand_asset(app, channel, ts, job_id, "polish")
                 _append_human_label(job_id, "polish", row)
                 _mark_reply_done(app, channel, reply_ts)
                 processed += 1
-                break
+                continue
 
             # --- !answer <text> (idempotency: white_check_mark reaction after processing) ---
             if text_lower.startswith("!answer"):
@@ -733,7 +737,7 @@ def _scan_chatops_commands(
                 _mark_reply_done(app, channel, reply_ts)
                 _append_human_label(job_id, "answer", row)
                 processed += 1
-                break
+                continue
 
     return processed
 
@@ -786,8 +790,24 @@ def _handle_ondemand_asset(
             ],
         )
         logger.info("On-demand %s generated for %s → %s", asset_type, job_id[:8], output_dir)
-    except Exception:
+    except Exception as exc:
         logger.error("On-demand %s failed for %s", asset_type, job_id[:8], exc_info=True)
+        from src.tailor import ResponseTruncatedError
+        if isinstance(exc, ResponseTruncatedError):
+            err_text = (
+                f":warning: `!{asset_type}` failed: model response was truncated "
+                f"(hit max_tokens). Try again — if it persists, the prompt may need "
+                f"to be shortened."
+            )
+        else:
+            err_text = (
+                f":warning: `!{asset_type}` failed: `{type(exc).__name__}: {exc}`. "
+                f"See logs for the full traceback."
+            )
+        try:
+            app.client.chat_postMessage(channel=channel, thread_ts=ts, text=err_text)
+        except Exception:
+            logger.exception("Could not post on-demand failure notice to Slack")
 
     try:
         app.client.reactions_remove(channel=channel, timestamp=ts, name="eyes")
