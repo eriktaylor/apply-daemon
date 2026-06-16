@@ -131,7 +131,7 @@ Pick at least one of Track A or Track B. `profile.md` is required for both.
 
 Edit `my_profile/profile.md` — write naturally about who you are, what you want, and what you don't want. The LLM reads it like a person would. Richer descriptions produce better matching. Drop your `base_resume` (and optional `cover_letter`) from step A into `my_profile/` alongside it.
 
-The **Pipeline Settings** table in `profile.md` (e.g. `max_listings_per_run`, `dedup_window_days`, `pass_window_days`, `batch_process_days`, `home_location`) controls runtime behaviour. See [`my_profile_example/profile.md`](my_profile_example/profile.md) for the full set of values and inline notes.
+The **Pipeline Settings** table in `profile.md` (e.g. `max_listings_per_run`, `dedup_window_days`, `pass_window_days`, `batch_process_days`, `home_location`, `max_listing_age_days`) controls runtime behaviour. See [`my_profile_example/profile.md`](my_profile_example/profile.md) for the full set of values and inline notes.
 
 Deep Research is always enabled and runs before every Tailor operation.
 
@@ -165,7 +165,7 @@ Activate the virtualenv first if it isn't already (`source .venv/bin/activate`),
 **Integration evaluation:**
 
 ```bash
-python -m src.integration_test   # or: apply-daemon-eval
+python -m src.integration_test
 ```
 
 Walks the checklist, reporting which components are configured and reachable. Indicates a go-ahead for Track A, Track B, or both.
@@ -191,11 +191,11 @@ python -m src.jobspy_ingest && python -m src.digest
 python -m src.pipeline && python -m src.digest
 
 # Sweep Slack reactions and ChatOps commands
-python -m src.sweeper            # or: apply-daemon-sweeper
+python -m src.sweeper
 python -m src.sweeper --deep 99  # Scan last 99 posts; default is 50
 
 # Batch tailor every saved listing (concurrent OpenRouter calls)
-python -m src.batch_process      # or: apply-daemon-batch
+python -m src.batch_process
 
 # Autopilot — Speculative Agent (requires AUTOPILOT_ENABLED=true in .env).
 # Runs Deep Research + a Claude match-analysis pass for every listing the

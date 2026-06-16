@@ -81,6 +81,8 @@ Description: {description}
 ## Instructions
 Evaluate how well this listing matches the candidate profile.
 
+Expired-listing check (do this FIRST): if the description contains language indicating the listing is closed, expired, or no longer accepting applications — e.g. "No longer accepting applications", "This position has been filled", "Job posting has expired", "This role has been closed" — set verdict=NO and start the `reasoning` field with the literal prefix "listing expired:". The pipeline routes those into pipeline_status='expired' instead of 'passed' so they don't resurface. This applies ONLY to language about the application or posting itself; statements about company milestones like "we recently closed our seed round" or "we just hit Series B" are NOT expiration signals.
+
 Scan the job description for required skills, domain expertise, or professional competencies.
 Set `skills_extracted` to false ONLY when the listing provides no specific requirements at all
 (e.g. a short recruiter ping with no job description). If the listing states ANY explicit
@@ -254,6 +256,11 @@ _AGGREGATOR_DOMAINS = frozenset({
     "indeed.com", "glassdoor.com", "ziprecruiter.com", "monster.com",
     "careerbuilder.com", "simplyhired.com", "jooble.org", "talent.com",
     "linkedin.com", "builtin.com", "adzuna.com",
+    # Added after observing the URL healer (Stage 3) accept these domains as
+    # canonical and surface unrelated postings in the digest. See
+    # plans/autopilot_updates.md Fix 2b for evidence.
+    "thehomebase.ai", "goremotejob.com", "careers4graduates.com",
+    "choppingblock.ai",
 })
 
 # Tracking/redirect domains that serve dead links — discard immediately, never save to DB
@@ -603,6 +610,7 @@ class ExtractedListing:
     links: list[str] = field(default_factory=list)
     recruiter_name: str | None = None
     recruiter_title: str | None = None
+    date_posted: str = ""  # ISO date when the role was posted, when known
 
 
 # ---------------------------------------------------------------------------
@@ -1105,6 +1113,13 @@ class TriageSession:
         if listing is None:
             return None
 
+        # Fix 4a — Stage 5 expired detection: return the listing so it persists
+        # with pipeline_status='expired'. This bypasses the standard NO rejection
+        # path so the smart-upsert pass_window_days cooldown can prevent the same
+        # dead row from being re-scored on every cycle.
+        if listing.final_status == "expired":
+            return listing
+
         # NO is always rejected — confidence is irrelevant. A NO at 95% is still a NO.
         # YES / MAYBE survive only when confidence meets the threshold.
         cutoff_pct = int(round(self.confidence_threshold * 100))
@@ -1206,6 +1221,22 @@ class TriageSession:
         if recruiter_override:
             reason += " [System Override: Upgraded to MAYBE due to direct recruiter outreach]"
 
+        # Fix 4a: when Stage 5 detects expired-listing language, route to
+        # pipeline_status='expired' so the row gets the long pass-cooldown
+        # instead of resurfacing as a regular NO.
+        final_status = "triaged"
+        if verdict == "NO" and reason.strip().lower().startswith("listing expired"):
+            final_status = "expired"
+            from src.audit_log import log_drop
+            log_drop(
+                listing_id="",  # set after upsert; row not yet inserted
+                source=source,
+                gate="stage5",
+                anchor_company=anchor.company,
+                url=(job_links[0] if job_links else ""),
+                reason="stage5: listing expired",
+            )
+
         single_eval = {
             "model": model,
             "verdict": verdict,
@@ -1243,6 +1274,8 @@ class TriageSession:
             missing_skills=json.dumps(evaluation["missing_skills"]) if evaluation["missing_skills"] else "",
             tokens_used=tokens,
             latency_ms=latency_ms,
+            date_posted=anchor.date_posted,
+            final_status=final_status,
         )
 
 # ---------------------------------------------------------------------------

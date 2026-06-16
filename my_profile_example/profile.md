@@ -104,6 +104,7 @@ Mildly interested in: Rust adoption in backend systems, machine learning infrast
 | pass_window_days | 180 | How long passed/expired listings stay blocked before resurfacing |
 | batch_process_days | 3 | Batch process only saved jobs from the past n days |
 | home_location | Oakland, CA | Base location for commute distance calculations |
+| max_listing_age_days | 60 | Drop YES/MAYBE listings whose date_posted is older than this many days. Listings with unknown date_posted always pass. Leave blank to disable filter (badge will still render). |
 
 ---
 

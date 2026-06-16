@@ -38,10 +38,13 @@ from dotenv import load_dotenv
 
 load_dotenv()
 
+from src.audit_log import log_drop
 from src.compile import _serialize_safe
 from src.db import Database
+from src.expired_probe import probe as expired_probe
 from src.file_utils import read_dropzone_file
 from src.geo import get_distance
+from src.mismatch_gate import check_mismatch
 from src.notifications import _get_slack_config, _import_slack_app
 from src.profile_loader import load_profile
 from src.research import run_deep_research
@@ -559,6 +562,76 @@ async def _process_one(
                 logger.info("Autopilot: %s no longer queued, skipping", short)
                 return "skipped"
             existing_ts = db.get_slack_message_ts(job_id)
+
+        # 1b) Fix 2a — mismatch gate. Stage 1 substring is free; Stage 2 LLM
+        # only fires on miss. A drop here saves a Deep-Research + Claude
+        # match-analysis pass on a misattributed row.
+        links_raw = listing.get("links", "")
+        first_link = ""
+        if links_raw:
+            try:
+                parsed_links = (
+                    json.loads(links_raw) if isinstance(links_raw, str) else links_raw
+                )
+                if parsed_links:
+                    first_link = parsed_links[0]
+            except (json.JSONDecodeError, TypeError):
+                first_link = ""
+        gate_client = openai.OpenAI(base_url=_OPENROUTER_BASE_URL, api_key=client.api_key)
+        gate_model = os.getenv("OPENROUTER_STAGE1_MODEL", "openai/gpt-5.4-nano")
+        drop, gate, observed = check_mismatch(
+            client=gate_client,
+            model=gate_model,
+            listing_id=job_id,
+            source=listing.get("source", ""),
+            anchor_company=company,
+            job_summary=listing.get("job_summary", "") or "",
+            url=first_link,
+        )
+        if drop:
+            log_drop(
+                listing_id=job_id,
+                source=listing.get("source", ""),
+                gate=gate,
+                anchor_company=company,
+                observed_company=observed,
+                url=first_link,
+                reason=f"{gate}: anchor company not present in body or url",
+            )
+            with Database() as db:
+                db.update_pipeline_status(job_id, "passed")
+            logger.info(
+                "Autopilot: %s dropped by mismatch gate (%s) — %s claimed vs observed '%s'",
+                short, gate, company, observed,
+            )
+            return "mismatch_dropped"
+
+        # 1c) Fix 4b — expired-listing probe. Stage 5 (Fix 4a) already caught
+        # rows whose body text contains expired-language. This probe catches
+        # the residual: 404s, LinkedIn auth-walls, soft-404 redirects, and
+        # Track A rows whose stored description is from a now-dead live page.
+        # Probe failures fail open (treat as "unknown, proceed") so a flaky
+        # probe never drops a good listing.
+        try:
+            is_expired, probe_reason = await asyncio.to_thread(
+                expired_probe, first_link,
+            )
+        except Exception:
+            logger.debug("Autopilot: %s probe raised, failing open", short, exc_info=True)
+            is_expired, probe_reason = False, ""
+        if is_expired:
+            log_drop(
+                listing_id=job_id,
+                source=listing.get("source", ""),
+                gate="probe",
+                anchor_company=company,
+                url=first_link,
+                reason=probe_reason or "probe: expired",
+            )
+            with Database() as db:
+                db.update_pipeline_status(job_id, "expired")
+            logger.info("Autopilot: %s expired by probe — %s", short, probe_reason)
+            return "expired_dropped"
 
         # 2) Deep research (cached if present)
         job_desc = listing.get("job_summary", "") or listing.get("reason", "")

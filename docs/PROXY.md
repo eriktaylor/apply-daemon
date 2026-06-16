@@ -32,7 +32,7 @@ When both credentials are set, every `scrape_jobs()` call configured in `my_prof
 **Verify the proxy is working — run this before firing the pipeline:**
 
 ```bash
-python -m src.proxy_test     # or: apply-daemon-test-proxy
+python -m src.proxy_test
 ```
 
 The smoke test runs five sequential checks against the live IPRoyal endpoint and exits non-zero on the first failure:
@@ -43,7 +43,7 @@ The smoke test runs five sequential checks against the live IPRoyal endpoint and
 4. Forced session rotation, exit IP fetched again — confirms the rotation path.
 5. The mocked unit suite (`tests/test_proxy_manager.py`, ~38 tests, no IPRoyal traffic) runs as a regression check.
 
-A successful run uses ≈200 bytes of IPRoyal data and leaves a sticky session warm in `.cache/iproyal_session.json`. The next `apply-daemon-ingest`, `apply-daemon`, or `!triage` reuses the **same** exit IP for the rest of the 30-minute lifetime — no second handshake, no second `session-{id}` allocation. If the lifetime has expired by the time you run them, a fresh session is opened automatically.
+A successful run uses ≈200 bytes of IPRoyal data and leaves a sticky session warm in `.cache/iproyal_session.json`. The next `python -m src.jobspy_ingest`, `python -m src.pipeline`, or `!triage` reuses the **same** exit IP for the rest of the 30-minute lifetime — no second handshake, no second `session-{id}` allocation. If the lifetime has expired by the time you run them, a fresh session is opened automatically.
 
 | Failure message | What to check |
 |---|---|

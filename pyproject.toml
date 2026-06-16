@@ -31,16 +31,6 @@ dev = [
     "beautifulsoup4>=4.12",
 ]
 
-[project.scripts]
-apply-daemon = "src.pipeline:main"
-apply-daemon-ingest = "src.jobspy_ingest:main"
-apply-daemon-digest = "src.digest:main"
-apply-daemon-tailor = "src.tailor:main"
-apply-daemon-sweeper = "src.sweeper:main"
-apply-daemon-batch = "src.batch_process:main"
-apply-daemon-test-proxy = "src.proxy_test:main"
-apply-daemon-eval = "src.integration_test:main"
-
 [tool.ruff]
 target-version = "py311"
 line-length = 100

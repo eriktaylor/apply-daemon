@@ -20,6 +20,7 @@ import logging
 import os
 import sys
 import time
+from datetime import date
 
 from dotenv import load_dotenv
 
@@ -28,9 +29,70 @@ load_dotenv()
 from src.db import Database
 from src.geo import get_distance
 from src.notifications import _get_slack_config, _import_slack_app
+from src.profile_loader import load_profile
 from src.triage import get_confidence_threshold
 
 logger = logging.getLogger(__name__)
+
+
+def _freshness_badge(date_posted: str) -> str:
+    """Render ":calendar: Posted Nd ago" with color cue, or "" if unknown.
+
+    - Empty / unparseable date → "" (silent, no badge).
+    - <=30 days → green calendar.
+    - 31–60 days → yellow calendar (warning).
+    - >60 days → red calendar (stale).
+    """
+    if not date_posted:
+        return ""
+    try:
+        posted = date.fromisoformat(date_posted[:10])
+    except ValueError:
+        return ""
+    age = (date.today() - posted).days
+    if age < 0:
+        return ""
+    if age <= 30:
+        return f":calendar: Posted {age}d ago"
+    if age <= 60:
+        return f":warning: Posted {age}d ago"
+    return f":rotating_light: Posted {age}d ago (stale)"
+
+
+def _max_listing_age_days() -> int | None:
+    """Read the optional `max_listing_age_days` knob from profile.md.
+
+    Returns the integer threshold, or None if the value is blank, missing,
+    or non-numeric. None disables the filter so the freshness badge alone
+    governs UX.
+    """
+    try:
+        profile = load_profile()
+    except FileNotFoundError:
+        return None
+    value = profile.get("settings", {}).get("max_listing_age_days")
+    if value in (None, "", 0):
+        return None
+    try:
+        n = int(value)
+    except (TypeError, ValueError):
+        return None
+    return n if n > 0 else None
+
+
+def _is_stale(date_posted: str, max_age_days: int) -> bool:
+    """Return True only when date_posted is a valid ISO date older than the cap.
+
+    Unknown date_posted (empty or unparseable) always passes — we never drop a
+    listing for missing freshness data.
+    """
+    if not date_posted:
+        return False
+    try:
+        posted = date.fromisoformat(date_posted[:10])
+    except ValueError:
+        return False
+    return (date.today() - posted).days > max_age_days
 
 
 def build_digest_blocks(listings: list[dict]) -> list[dict]:
@@ -124,6 +186,11 @@ def build_digest_listing_attachment(listing: dict, history: str = "") -> dict:
     ]
     if salary and salary != "not listed":
         detail_parts.append(f":moneybag: {salary}")
+
+    # Freshness badge — empty / unparseable date_posted falls through silently.
+    freshness = _freshness_badge(listing.get("date_posted") or "")
+    if freshness:
+        detail_parts.append(freshness)
 
     # Per-model scores
     model_scores_str = listing.get("model_scores", "")
@@ -246,6 +313,7 @@ def post_digest() -> bool:
     post_stage_5 = os.getenv("AUTOPILOT_POST_STAGE_5", "true").strip().lower() in (
         "1", "true", "yes",
     )
+    max_age_days = _max_listing_age_days()
     with Database() as db:
         rows = db.get_digest_listings(
             days=14,
@@ -258,6 +326,18 @@ def post_digest() -> bool:
             return True
 
         listings = [dict(r) for r in rows]
+        if max_age_days:
+            before = len(listings)
+            listings = [
+                listing for listing in listings
+                if not _is_stale(listing.get("date_posted") or "", max_age_days)
+            ]
+            dropped = before - len(listings)
+            if dropped:
+                logger.info(
+                    "Freshness filter dropped %d/%d listings older than %d days",
+                    dropped, before, max_age_days,
+                )
         logger.info("Building digest for %d listings", len(listings))
 
         try:

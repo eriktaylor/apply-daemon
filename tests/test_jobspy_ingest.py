@@ -147,6 +147,42 @@ class TestRowToExtractedListing:
         assert anchor.title == "ML Engineer"
         assert anchor.company == "Stripe"
 
+    def test_nan_company_yields_empty_string(self):
+        """Fix 1 — pandas NaN for company must not propagate as the literal 'nan'."""
+        import numpy as np
+        row = _make_row(company=np.nan)
+        anchor = _row_to_extracted_listing(row)
+        assert anchor.company == ""
+
+    def test_nan_title_yields_empty_string(self):
+        import numpy as np
+        row = _make_row(title=np.nan)
+        anchor = _row_to_extracted_listing(row)
+        assert anchor.title == ""
+
+    def test_literal_string_nan_yields_empty_string(self):
+        """Some scrapers return the literal string 'nan' — also normalize."""
+        row = _make_row(company="nan")
+        anchor = _row_to_extracted_listing(row)
+        assert anchor.company == ""
+
+    def test_date_posted_iso_passed_through(self):
+        """Fix 3 — JobSpy date_posted is preserved on the anchor when present."""
+        row = _make_row(date_posted="2026-02-27")
+        anchor = _row_to_extracted_listing(row)
+        assert anchor.date_posted == "2026-02-27"
+
+    def test_date_posted_missing_yields_empty(self):
+        row = _make_row()
+        anchor = _row_to_extracted_listing(row)
+        assert anchor.date_posted == ""
+
+    def test_date_posted_nan_yields_empty(self):
+        import numpy as np
+        row = _make_row(date_posted=np.nan)
+        anchor = _row_to_extracted_listing(row)
+        assert anchor.date_posted == ""
+
 
 # ---------------------------------------------------------------------------
 # _is_truncated()

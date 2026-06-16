@@ -12,7 +12,6 @@ Both tracks share the same database and Smart Upsert dedup logic.
 
 Usage:
     python -m src.jobspy_ingest           # run all configured searches
-    apply-daemon-ingest                    # same via CLI entry point
 """
 
 from __future__ import annotations
@@ -210,6 +209,22 @@ def _format_salary(row) -> str:
     return "not listed"
 
 
+def _clean_cell(value) -> str:
+    """Coerce a JobSpy DataFrame cell to a clean string.
+
+    pandas returns ``float('nan')`` for missing values, which is truthy, so the
+    older ``str(value or "")`` idiom let the literal ``"nan"`` flow downstream
+    as a company/title/location. Normalize NaN/None/whitespace/sentinels to ""
+    so the existing `if not anchor.company` guards actually drop the row.
+    """
+    if value is None:
+        return ""
+    s = str(value).strip()
+    if s.lower() in {"", "nan", "none", "null"}:
+        return ""
+    return s
+
+
 def _row_to_extracted_listing(row) -> ExtractedListing:
     """Stage 4 (Track A): map a JobSpy DataFrame row to ExtractedListing.
 
@@ -219,13 +234,13 @@ def _row_to_extracted_listing(row) -> ExtractedListing:
         min_amount, max_amount, interval, currency,
         description, job_url
     """
-    title = str(row.get("title") or "").strip()
-    company = str(row.get("company") or "").strip()
-    description = str(row.get("description") or "").strip()
-    job_url = str(row.get("job_url") or "").strip()
+    title = _clean_cell(row.get("title"))
+    company = _clean_cell(row.get("company"))
+    description = _clean_cell(row.get("description"))
+    job_url = _clean_cell(row.get("job_url"))
 
     # Location: use the string column, optionally append (Remote)
-    location = str(row.get("location") or "").strip()
+    location = _clean_cell(row.get("location"))
     is_remote = row.get("is_remote")
     if is_remote and location and "remote" not in location.lower():
         location = f"{location} (Remote)"
@@ -239,6 +254,10 @@ def _row_to_extracted_listing(row) -> ExtractedListing:
     # only used for the Slack digest card preview.
     job_summary = description[:300].strip() if description else ""
 
+    # JobSpy returns date_posted as a pandas Timestamp or string when present.
+    # Normalize to "YYYY-MM-DD" so we can compute freshness deterministically.
+    date_posted = _normalize_date_posted(row.get("date_posted"))
+
     return ExtractedListing(
         title=title,
         company=company,
@@ -247,7 +266,38 @@ def _row_to_extracted_listing(row) -> ExtractedListing:
         job_summary=job_summary,
         description=description[:2000],  # Stage 5 sees up to 2000 chars
         links=[job_url] if job_url else [],
+        date_posted=date_posted,
     )
+
+
+def _normalize_date_posted(value) -> str:
+    """Return an ISO date string (YYYY-MM-DD) or "" if the value is missing.
+
+    Accepts pandas Timestamp, datetime, date, or string. Returns "" for None,
+    NaN, "nan", or any value that fails to parse — callers treat "" as
+    "unknown date" rather than "fresh."
+    """
+    if value is None:
+        return ""
+    try:
+        import pandas as pd
+        if pd.isna(value):
+            return ""
+    except Exception:
+        pass
+    if hasattr(value, "isoformat"):
+        try:
+            return value.date().isoformat() if hasattr(value, "date") else value.isoformat()
+        except Exception:
+            return ""
+    s = str(value).strip()
+    if s.lower() in {"", "nan", "none", "null", "nat"}:
+        return ""
+    # Already-normalized "YYYY-MM-DD" passes through; otherwise let the digest
+    # treat anything non-ISO as unknown rather than guessing.
+    if re.match(r"^\d{4}-\d{2}-\d{2}$", s):
+        return s
+    return ""
 
 
 # ---------------------------------------------------------------------------

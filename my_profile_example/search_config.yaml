@@ -53,6 +53,6 @@ delays:
 #   - a downstream HTTP fetch returns 403 / 429 / 999 (DataDome, Cloudflare,
 #     LinkedIn auth wall).
 # No proxy config is needed in this file — it is purely env-driven.
-# Run `apply-daemon-test-proxy` after setting the env vars to verify the
+# Run `python -m src.proxy_test` after setting the env vars to verify the
 # stack end-to-end. Recommended for any tier with results_wanted>0 on
 # LinkedIn or Indeed.

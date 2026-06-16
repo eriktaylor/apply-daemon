@@ -38,4 +38,9 @@ class JobListing:
     date_ingested: str = field(
         default_factory=lambda: datetime.now(timezone.utc).isoformat()
     )
+    # When the role was posted (NOT when we ingested it). ISO date string
+    # ("2026-02-27") or empty when the source did not supply one. Used for
+    # freshness badging in the digest and an optional max-age filter
+    # (max_listing_age_days in profile.md Pipeline Settings).
+    date_posted: str = ""
     final_status: str = "triaged"  # triaged / saved / passed / tailored / applied

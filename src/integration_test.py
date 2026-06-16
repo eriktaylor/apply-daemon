@@ -7,11 +7,10 @@ minimum of paid credits — the only billable call is a single
 $0.0001 with the default ``google/gemini-3.1-flash-lite``).
 The Slack ``auth.test`` and Gmail IMAP ``LOGIN`` checks are free;
 the IPRoyal check verifies credentials are present without opening
-a session (use ``apply-daemon-test-proxy`` for the full smoke test).
+a session (use ``python -m src.proxy_test`` for the full smoke test).
 
 Usage:
     python -m src.integration_test
-    apply-daemon-eval
 
 Flags:
     --no-llm     skip the live OpenRouter call (no paid traffic)
@@ -344,7 +343,7 @@ def _check_gmail(do_network: bool) -> CheckResult:
 
 
 def _check_proxy() -> CheckResult:
-    """G. IPRoyal credentials present (full smoke test = apply-daemon-test-proxy)."""
+    """G. IPRoyal credentials present (full smoke test = `python -m src.proxy_test`)."""
     try:
         from src.proxy_manager import ProxyManager
     except ImportError as exc:
@@ -359,7 +358,7 @@ def _check_proxy() -> CheckResult:
     return CheckResult(
         "G. IPRoyal proxy",
         PASS,
-        f"{mgr.describe()} — run `apply-daemon-test-proxy` for live IP smoke test",
+        f"{mgr.describe()} — run `python -m src.proxy_test` for live IP smoke test",
     )
 
 
@@ -463,8 +462,8 @@ def main() -> int:
     if track_a == "GO" or track_b == "GO":
         ready = ", ".join(
             cmd for cmd, go in (
-                ("`apply-daemon-ingest` (Track A)", track_a == "GO"),
-                ("`apply-daemon` (Track B)", track_b == "GO"),
+                ("`python -m src.jobspy_ingest` (Track A)", track_a == "GO"),
+                ("`python -m src.pipeline` (Track B)", track_b == "GO"),
             ) if go
         )
         print(f"Setup looks good — run {ready}.")

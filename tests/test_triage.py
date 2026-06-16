@@ -887,6 +887,29 @@ class TestIsAggregatorUrl:
     def test_subdomain_aggregator_blocked(self):
         assert _is_aggregator_url("https://uk.indeed.com/viewjob?jk=abc") is True
 
+    def test_thehomebase_ai_blocked(self):
+        """Fix 2b — observed in prod swapping in OpenAI FDE content for a Handshake row."""
+        assert _is_aggregator_url(
+            "https://www.thehomebase.ai/jobs/manager-forward-deployed-engineer-fde-life-sciences-at-openai"
+        ) is True
+
+    def test_goremotejob_com_blocked(self):
+        """Fix 2b — observed in prod surfacing an expired aggregator copy."""
+        assert _is_aggregator_url(
+            "https://goremotejob.com/remote-jobs/forward-deployed-engineer-healthcare"
+        ) is True
+
+    def test_careers4graduates_com_blocked(self):
+        """Fix 2b — observed in prod with links landing on a 'Jobs by Company' index."""
+        assert _is_aggregator_url(
+            "https://www.careers4graduates.com/Jobs-By-Company/A/"
+        ) is True
+
+    def test_choppingblock_ai_blocked(self):
+        assert _is_aggregator_url(
+            "https://www.choppingblock.ai/jobs/some-role-at-some-company"
+        ) is True
+
 
 class TestValidateAndHealIntegration:
     """Integration tests for the Stage 3 Scrape + Heal loop.

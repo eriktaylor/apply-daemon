@@ -83,6 +83,10 @@ class Database:
                 "distance_bucket",
                 "ALTER TABLE listings ADD COLUMN distance_bucket INTEGER",
             ),
+            (
+                "date_posted",
+                "ALTER TABLE listings ADD COLUMN date_posted TEXT",
+            ),
         )
         for col, ddl in migrations:
             try:
@@ -115,8 +119,12 @@ class Database:
                 recruiter_name, recruiter_title, raw_email_text,
                 model_used, model_scores, skills_extracted, matching_skills,
                 missing_skills, tokens_used, latency_ms,
-                date_ingested, pipeline_status, slack_notified, updated_at
-            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                date_ingested, pipeline_status, slack_notified, updated_at,
+                date_posted
+            ) VALUES (
+                ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?,
+                ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?
+            )
             """,
             (
                 listing.id,
@@ -145,6 +153,7 @@ class Database:
                 listing.final_status,  # maps to pipeline_status column
                 0,  # slack_notified default
                 now,
+                listing.date_posted or None,
             ),
         )
         self.conn.commit()
@@ -226,7 +235,9 @@ class Database:
         links_json = json.dumps(listing.links) if listing.links else None
 
         if matched_id:
-            # UPDATE — overwrite data fields but preserve status and slack_notified
+            # UPDATE — overwrite data fields but preserve status and slack_notified.
+            # date_posted uses COALESCE so a row that previously had a posting
+            # date never loses it just because a later source dropped the field.
             self.conn.execute(
                 """
                 UPDATE listings SET
@@ -234,7 +245,8 @@ class Database:
                     job_summary = ?, verdict = ?, confidence = ?, reason = ?,
                     links = ?, raw_email_text = ?, model_used = ?, model_scores = ?,
                     skills_extracted = ?, matching_skills = ?, missing_skills = ?,
-                    tokens_used = ?, latency_ms = ?, updated_at = ?
+                    tokens_used = ?, latency_ms = ?, updated_at = ?,
+                    date_posted = COALESCE(?, date_posted)
                 WHERE id = ?
                 """,
                 (
@@ -244,7 +256,9 @@ class Database:
                     listing.model_used, listing.model_scores or None,
                     int(listing.skills_extracted), listing.matching_skills or None,
                     listing.missing_skills or None, listing.tokens_used,
-                    listing.latency_ms, now, matched_id,
+                    listing.latency_ms, now,
+                    listing.date_posted or None,
+                    matched_id,
                 ),
             )
             self.conn.commit()

@@ -1,9 +1,16 @@
 """Tests for the daily digest module."""
 
 import json
+from datetime import date, timedelta
 from unittest.mock import MagicMock, patch
 
-from src.digest import build_digest_blocks, build_digest_listing_attachment, post_digest
+from src.digest import (
+    _freshness_badge,
+    _is_stale,
+    build_digest_blocks,
+    build_digest_listing_attachment,
+    post_digest,
+)
 
 
 class TestBuildDigestBlocks:
@@ -72,6 +79,44 @@ class TestBuildDigestListingAttachment:
         att = build_digest_listing_attachment(self._listing())
         actions = [b for b in att["blocks"] if b["type"] == "actions"]
         assert len(actions) == 0
+
+    def test_freshness_badge_fresh(self):
+        recent = (date.today() - timedelta(days=5)).isoformat()
+        att = build_digest_listing_attachment(self._listing(date_posted=recent))
+        context_text = " ".join(
+            e["text"] for b in att["blocks"]
+            if b["type"] == "context" for e in b.get("elements", [])
+        )
+        assert ":calendar:" in context_text
+        assert "5d ago" in context_text
+
+    def test_freshness_badge_stale_warning(self):
+        old = (date.today() - timedelta(days=45)).isoformat()
+        att = build_digest_listing_attachment(self._listing(date_posted=old))
+        context_text = " ".join(
+            e["text"] for b in att["blocks"]
+            if b["type"] == "context" for e in b.get("elements", [])
+        )
+        assert ":warning:" in context_text
+
+    def test_freshness_badge_very_stale(self):
+        old = (date.today() - timedelta(days=100)).isoformat()
+        att = build_digest_listing_attachment(self._listing(date_posted=old))
+        context_text = " ".join(
+            e["text"] for b in att["blocks"]
+            if b["type"] == "context" for e in b.get("elements", [])
+        )
+        assert "stale" in context_text
+
+    def test_freshness_badge_absent_when_unknown(self):
+        att = build_digest_listing_attachment(self._listing(date_posted=""))
+        context_text = " ".join(
+            e["text"] for b in att["blocks"]
+            if b["type"] == "context" for e in b.get("elements", [])
+        )
+        assert ":calendar:" not in context_text
+        assert ":warning:" not in context_text
+
 
     def test_job_summary_shown(self):
         att = build_digest_listing_attachment(self._listing())
@@ -223,6 +268,31 @@ class TestBuildDigestListingAttachment:
         assert history_idx is not None
         assert legend_idx is not None
         assert history_idx < legend_idx
+
+
+class TestFreshnessHelpers:
+    def test_freshness_badge_unparseable_yields_empty(self):
+        assert _freshness_badge("not-a-date") == ""
+
+    def test_freshness_badge_empty_yields_empty(self):
+        assert _freshness_badge("") == ""
+
+    def test_freshness_badge_future_date_yields_empty(self):
+        future = (date.today() + timedelta(days=3)).isoformat()
+        assert _freshness_badge(future) == ""
+
+    def test_is_stale_unknown_passes(self):
+        """Unknown date_posted must never be flagged stale."""
+        assert _is_stale("", 60) is False
+        assert _is_stale("not-a-date", 60) is False
+
+    def test_is_stale_within_window(self):
+        recent = (date.today() - timedelta(days=10)).isoformat()
+        assert _is_stale(recent, 60) is False
+
+    def test_is_stale_past_window(self):
+        old = (date.today() - timedelta(days=100)).isoformat()
+        assert _is_stale(old, 60) is True
 
 
 class TestDigestGeoDistance:

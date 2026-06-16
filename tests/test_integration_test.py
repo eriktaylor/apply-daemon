@@ -252,5 +252,5 @@ class TestMain:
         captured = capsys.readouterr()
         assert rc == 0
         assert "🟢 GO" in captured.out
-        assert "apply-daemon-ingest" in captured.out
+        assert "python -m src.jobspy_ingest" in captured.out
         assert "Setup looks good" in captured.out

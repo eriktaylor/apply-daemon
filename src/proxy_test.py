@@ -13,12 +13,11 @@ Steps:
        data because the unit tests are fully mocked.
 
 The smoke test leaves a sticky session warm in
-``.cache/iproyal_session.json`` so a subsequent ``apply-daemon-ingest``
+``.cache/iproyal_session.json`` so a subsequent ``python -m src.jobspy_ingest``
 or ``!triage`` reuses the same exit IP within its 30-minute lifetime.
 
 Usage:
     python -m src.proxy_test
-    apply-daemon-test-proxy
 """
 
 from __future__ import annotations
@@ -220,7 +219,7 @@ def run_proxy_test() -> int:
 
     logger.info(
         "All checks passed. The pipeline is safe to run. "
-        "The sticky session is warm and will be reused by apply-daemon-ingest."
+        "The sticky session is warm and will be reused by `python -m src.jobspy_ingest`."
     )
     return EXIT_OK
 
