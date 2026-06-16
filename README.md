@@ -68,7 +68,7 @@ Supported formats are `.docx`, `.md`, and `.pdf`, resolved in that priority orde
 | File | Purpose |
 |---|---|
 | `base_resume` (.docx / .md / .pdf) | Required for resume tailoring. The LLM edits bullets against this document. |
-| `cover_letter` (.docx / .md / .pdf) | Optional style reference. The LLM matches your preferred tone and structure. |
+| `cover_letter` (.docx / .md / .pdf) | Optional style reference for the **bundled** cover-letter path (`cover_letter` in `GENERATE_ASSETS` or via ✏️). The LLM mimics this template's tone and structure, so it should be well-written — a thin or generic template produces a thin output. If you don't maintain one, use the **on-demand** path instead (Slack: `!coverletter`), which writes from the profile + base resume + cached research without needing a template. |
 
 ### B. Clone the repository
 

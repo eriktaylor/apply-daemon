@@ -602,8 +602,7 @@ to sharpen the angle and highlight the strongest alignment points.
 
 Respond with ONLY a valid JSON object:
 {{
-    "clean_cover_letter_text": "<full cover letter text>",
-    "cover_letter_diff_summary": "<bulleted list of what was tailored>"
+    "clean_cover_letter_text": "<full cover letter text>"
 }}
 """
 
@@ -725,7 +724,7 @@ def generate_cover_letter_only(job_id: str) -> tuple[Path, dict]:
     )
 
     logger.info("Calling OpenRouter API (cover letter only) for listing %s...", job_id[:8])
-    response_text = _call_openrouter(client, prompt, max_tokens=1024)
+    response_text = _call_openrouter(client, prompt, max_tokens=2048)
     cl_json = _parse_single_asset_response(response_text, "clean_cover_letter_text")
 
     # Compile cover letter .docx — versioned so repeat calls produce _v2, _v3, …
@@ -769,7 +768,7 @@ def generate_interview_prep_only(job_id: str) -> tuple[Path, dict]:
     )
 
     logger.info("Calling OpenRouter API (interview prep only) for listing %s...", job_id[:8])
-    response_text = _call_openrouter(client, prompt, max_tokens=1024)
+    response_text = _call_openrouter(client, prompt, max_tokens=2048)
     prep_json = _parse_single_asset_response(response_text, "interview_prep_guide")
 
     # Save interview prep as Markdown — versioned so repeat calls produce _v2, _v3, …
@@ -1082,6 +1081,13 @@ def retrieve_batch(batch_id: str) -> bool:
 # OpenRouter client helpers
 # ---------------------------------------------------------------------------
 
+class ResponseTruncatedError(RuntimeError):
+    """Raised when OpenRouter returns finish_reason='length' — the model ran
+    out of token budget mid-response, so the JSON envelope is invalid. The
+    caller should surface this to the user rather than retry blindly, since
+    a retry at the same budget will truncate again."""
+
+
 def _call_openrouter(
     client: openai.OpenAI,
     prompt: str,
@@ -1091,6 +1097,8 @@ def _call_openrouter(
 
     Uses json_object response format so the model returns valid JSON directly.
     Returns the raw text content of the response.
+
+    Raises ResponseTruncatedError if finish_reason='length' (token cap hit).
     """
     model = _get_tailor_model()
     resp = client.chat.completions.create(
@@ -1099,9 +1107,15 @@ def _call_openrouter(
         max_tokens=max_tokens,
         response_format={"type": "json_object"},
     )
-    content = resp.choices[0].message.content
+    choice = resp.choices[0]
+    content = choice.message.content
     if not content:
         raise RuntimeError("Empty response from OpenRouter API")
+    finish_reason = getattr(choice, "finish_reason", None)
+    if finish_reason == "length":
+        raise ResponseTruncatedError(
+            f"Model hit max_tokens={max_tokens} before completing the JSON response"
+        )
     return content
 
 

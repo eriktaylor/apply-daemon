@@ -371,6 +371,7 @@ class Database:
         self,
         days: int = 14,
         min_confidence_pct: int | None = None,
+        include_auto_queued: bool = True,
     ) -> list[sqlite3.Row]:
         """Get listings for the daily digest.
 
@@ -405,9 +406,11 @@ class Database:
             (datetime.now(timezone.utc).isoformat(),),
         )
         self.conn.commit()
+        statuses = ("'triaged', 'saved', 'auto_queued'"
+                    if include_auto_queued else "'triaged', 'saved'")
         sql = (
             "SELECT * FROM listings "
-            "WHERE pipeline_status IN ('triaged', 'saved', 'auto_queued') "
+            f"WHERE pipeline_status IN ({statuses}) "
             "AND slack_notified = 0 "
             "AND date_ingested >= datetime('now', ?)"
         )

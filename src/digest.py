@@ -17,6 +17,7 @@ from __future__ import annotations
 
 import json
 import logging
+import os
 import sys
 import time
 
@@ -242,8 +243,15 @@ def post_digest() -> bool:
     app.client.retry_handlers.append(rate_limit_handler)
 
     cutoff_pct = int(round(get_confidence_threshold() * 100))
+    post_stage_5 = os.getenv("AUTOPILOT_POST_STAGE_5", "true").strip().lower() in (
+        "1", "true", "yes",
+    )
     with Database() as db:
-        rows = db.get_digest_listings(days=14, min_confidence_pct=cutoff_pct)
+        rows = db.get_digest_listings(
+            days=14,
+            min_confidence_pct=cutoff_pct,
+            include_auto_queued=post_stage_5,
+        )
 
         if not rows:
             logger.info("No listings for digest — nothing to post")
