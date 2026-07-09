@@ -1,0 +1,71 @@
+# Track B (email) ingestion config — sender allowlist + runtime knobs
+#
+# This file is the human-readable answer to "what mail may the bot touch?"
+# It drives Track B (reactive email ingestion) in src/pipeline.py.
+# The pipeline reads from `my_profile/email_config.yaml` at runtime, so:
+#
+#   1. cp -r my_profile_example my_profile     (one-time setup)
+#   2. Edit my_profile/email_config.yaml       (your alert senders + knobs)
+#
+# my_profile/ is gitignored — your customizations stay local and never
+# conflict with `git pull` updates to this template.
+#
+# SAFETY CONTRACT: only emails from senders listed here may ever be treated
+# as job alerts (and therefore marked read / archived by later pipeline
+# stages). Everything else in the inbox is left untouched and unread.
+# If this file is missing, the pipeline falls back to the built-in default
+# allowlist (same content as this template). If it is present but malformed
+# or lists no senders, Track B refuses to run rather than guessing.
+
+# Alert senders grouped by source. `tier` mirrors search_config.yaml's
+# site_tiers and feeds the aggregator's ranking: candidates from `friendly`
+# senders outrank `ok`, which outrank `hostile`.
+alert_senders:
+  linkedin:
+    tier: friendly
+    addresses:
+      - jobs-noreply@linkedin.com
+      - jobs-listings@linkedin.com
+      - jobalerts-noreply@linkedin.com
+      - jobalerts@linkedin.com
+  indeed:
+    tier: friendly
+    addresses:
+      - alert@indeed.com
+      - jobalert@indeed.com
+      - donotreply@jobalert.indeed.com
+  glassdoor:
+    tier: ok
+    addresses:
+      - noreply@glassdoor.com
+  google_alerts:
+    tier: ok
+    addresses:
+      - googlealerts-noreply@google.com
+      - notify-noreply@google.com
+
+# Case-insensitive subject fragments that mark mail from an allowlisted
+# sender as a job alert, matched in addition to the classifier's built-in
+# regex heuristics. Plain substrings on purpose — you should be able to
+# read exactly what is being accepted, and add new fragments without code.
+subject_hints:
+  - "job alert"
+  - "job picks"
+  - "new jobs for you"
+  - "jobs that match"
+  - "matching jobs"
+  - "jobs you might"
+  - "recommended jobs"
+  - "jobs in your area"
+
+# Track B runtime knobs. Settings live in yaml; profile.md stays prose.
+settings:
+  # Max listing candidates sent to Stage 1 LLM triage per run.
+  # Blank = no cap (process everything).
+  top_n:
+  # How far back the IMAP fetch looks. The message-ID ledger prevents
+  # re-processing, so this is a vacation margin, not the dedup mechanism.
+  lookback_days: 14
+  # IMAP folder (Gmail label) processed alerts are moved into. Created on
+  # first run. Move-only — the pipeline never deletes mail.
+  archive_folder: "apply-daemon/archive"
