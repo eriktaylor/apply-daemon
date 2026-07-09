@@ -131,6 +131,50 @@ class TestProcessedEmails:
         assert len(texts) == 2
 
 
+class TestEmailLedger:
+    """Message-ID idempotency ledger on processed_emails."""
+
+    def test_unseen_message_id(self, db):
+        assert db.is_email_id_seen("<abc@mail.gmail.com>") is False
+
+    def test_seen_after_record(self, db):
+        db.record_processed_email(
+            "hash1", "preview",
+            gmail_message_id="<abc@mail.gmail.com>",
+            classification="JOB_DIGEST",
+        )
+        assert db.is_email_id_seen("<abc@mail.gmail.com>") is True
+        assert db.is_email_id_seen("<other@mail.gmail.com>") is False
+
+    def test_empty_message_id_never_seen(self, db):
+        assert db.is_email_id_seen("") is False
+
+    def test_backward_compatible_record_without_ledger_fields(self, db):
+        db.record_processed_email("hash2", "preview only")
+        texts = db.get_recent_email_texts(days=30)
+        assert len(texts) == 1
+
+    def test_skip_record_with_empty_preview_excluded_from_text_dedup(self, db):
+        db.record_processed_email(
+            "idhash", "", gmail_message_id="<skip@mail.gmail.com>", classification="SKIP"
+        )
+        assert db.is_email_id_seen("<skip@mail.gmail.com>") is True
+        # Empty previews must not pollute the text-dedup corpus
+        assert db.get_recent_email_texts(days=30) == []
+
+    def test_migration_is_idempotent(self, tmp_path):
+        path = tmp_path / "reopen.db"
+        first = Database(path)
+        first.record_processed_email(
+            "h", "p", gmail_message_id="<persist@x>", classification="SKIP"
+        )
+        first.close()
+        # Re-opening re-runs _init_schema; guarded ALTERs must not raise
+        second = Database(path)
+        assert second.is_email_id_seen("<persist@x>") is True
+        second.close()
+
+
 class TestPipelineStatus:
     def test_update_pipeline_status(self, db):
         db.insert_listing(_make_listing())

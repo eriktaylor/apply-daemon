@@ -87,6 +87,14 @@ class Database:
                 "date_posted",
                 "ALTER TABLE listings ADD COLUMN date_posted TEXT",
             ),
+            (
+                "gmail_message_id",
+                "ALTER TABLE processed_emails ADD COLUMN gmail_message_id TEXT",
+            ),
+            (
+                "classification",
+                "ALTER TABLE processed_emails ADD COLUMN classification TEXT",
+            ),
         )
         for col, ddl in migrations:
             try:
@@ -94,6 +102,11 @@ class Database:
             except sqlite3.OperationalError as exc:
                 if f"duplicate column name: {col}" not in str(exc):
                     raise
+        # After the guarded ALTERs so the column exists on fresh databases too.
+        self.conn.execute(
+            "CREATE INDEX IF NOT EXISTS idx_gmail_message_id "
+            "ON processed_emails(gmail_message_id)"
+        )
         self.conn.commit()
 
     def close(self) -> None:
@@ -298,6 +311,15 @@ class Database:
 
         return False
 
+    def get_recent_titles(self, days: int = 30) -> list[str]:
+        """Titles of recently ingested listings — novelty corpus for Track B
+        candidate scoring (email_aggregator)."""
+        rows = self.conn.execute(
+            "SELECT title FROM listings WHERE date_ingested >= datetime('now', ?)",
+            (f"-{days} days",),
+        ).fetchall()
+        return [row["title"] for row in rows if row["title"]]
+
     def get_recent_email_texts(self, days: int = 30) -> list[str]:
         """Get text previews of recently processed emails for dedup."""
         rows = self.conn.execute(
@@ -310,17 +332,42 @@ class Database:
         ).fetchall()
         return [row["text_preview"] for row in rows if row["text_preview"]]
 
-    def record_processed_email(self, text_hash: str, text_preview: str) -> None:
-        """Record that an email has been processed (for email-level dedup)."""
+    def record_processed_email(
+        self,
+        text_hash: str,
+        text_preview: str,
+        gmail_message_id: str | None = None,
+        classification: str | None = None,
+    ) -> None:
+        """Record that an email has been processed (for email-level dedup).
+
+        ``gmail_message_id`` (RFC 5322 Message-ID) keys the idempotency
+        ledger — emails already recorded are skipped before classification
+        on later runs. ``classification`` stores the outcome so untouched
+        (unread) mail is still never re-processed.
+        """
         now = datetime.now(timezone.utc).isoformat()
         self.conn.execute(
             """
-            INSERT INTO processed_emails (email_text_hash, text_preview, date_processed)
-            VALUES (?, ?, ?)
+            INSERT INTO processed_emails (
+                email_text_hash, text_preview, date_processed,
+                gmail_message_id, classification
+            )
+            VALUES (?, ?, ?, ?, ?)
             """,
-            (text_hash, text_preview[:500], now),
+            (text_hash, text_preview[:500], now, gmail_message_id or None, classification),
         )
         self.conn.commit()
+
+    def is_email_id_seen(self, gmail_message_id: str) -> bool:
+        """True if this Message-ID is already in the processed-emails ledger."""
+        if not gmail_message_id:
+            return False
+        row = self.conn.execute(
+            "SELECT 1 FROM processed_emails WHERE gmail_message_id = ? LIMIT 1",
+            (gmail_message_id,),
+        ).fetchone()
+        return row is not None
 
     def get_listings_by_verdict(self, verdict: str) -> list[sqlite3.Row]:
         """Get all listings with a given verdict."""

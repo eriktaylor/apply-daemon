@@ -1,7 +1,13 @@
 """Email classifier — categorizes inbox emails before parsing.
 
-Classifies each email into JOB_DIGEST, RECRUITER_OUTREACH, GOOGLE_ALERT, or SKIP
-using only Subject, From, and a quick body scan. No LLM calls — pure regex/heuristic.
+Classifies each email into JOB_DIGEST, RECRUITER_OUTREACH, GOOGLE_ALERT,
+SKIP_JUNK, or SKIP_UNCLASSIFIED using only Subject, From, and a quick body
+scan. No LLM calls — pure regex/heuristic.
+
+When an EmailConfig is passed, only allowlisted senders may classify as
+JOB_DIGEST / GOOGLE_ALERT — digest-shaped mail from unknown senders lands
+in SKIP_UNCLASSIFIED so the allowlist-mining report can surface it as a
+candidate addition instead of the pipeline silently processing it.
 
 All patterns are defined as constants at the top of this module for easy tuning.
 """
@@ -11,6 +17,10 @@ from __future__ import annotations
 import logging
 import re
 from email.message import Message
+from typing import TYPE_CHECKING
+
+if TYPE_CHECKING:
+    from src.email_config import EmailConfig
 
 logger = logging.getLogger(__name__)
 
@@ -22,7 +32,15 @@ logger = logging.getLogger(__name__)
 JOB_DIGEST = "JOB_DIGEST"
 RECRUITER_OUTREACH = "RECRUITER_OUTREACH"
 GOOGLE_ALERT = "GOOGLE_ALERT"
+# Confident junk (known noise senders, social notifications) — never revisited.
+SKIP_JUNK = "SKIP_JUNK"
+# Couldn't positively classify — eligible for re-classification after
+# ruleset/allowlist improvements, and mined by the E-1 report.
+SKIP_UNCLASSIFIED = "SKIP_UNCLASSIFIED"
+# Legacy alias retained for imports; classify_email no longer returns it.
 SKIP = "SKIP"
+
+SKIP_CLASSIFICATIONS = frozenset({SKIP, SKIP_JUNK, SKIP_UNCLASSIFIED})
 
 # ---------------------------------------------------------------------------
 # Sender patterns (lowercased for matching)
@@ -31,10 +49,12 @@ SKIP = "SKIP"
 # Job board digest senders
 JOB_DIGEST_SENDERS = [
     "jobs-noreply@linkedin.com",
+    "jobs-listings@linkedin.com",
     "jobalerts-noreply@linkedin.com",
     "jobalerts@linkedin.com",
     "alert@indeed.com",
     "jobalert@indeed.com",
+    "donotreply@jobalert.indeed.com",
     "jobalert.indeed.com",
     "noreply@glassdoor.com",
 ]
@@ -121,42 +141,60 @@ OUTREACH_BODY_PATTERNS = [
 # Main classifier
 # ---------------------------------------------------------------------------
 
-def classify_email(msg: Message) -> str:
-    """Classify an email into JOB_DIGEST, RECRUITER_OUTREACH, GOOGLE_ALERT, or SKIP.
+def classify_email(msg: Message, config: "EmailConfig | None" = None) -> str:
+    """Classify an email using Subject, From, and a quick body scan.
 
-    Uses Subject, From, and optionally the first ~500 chars of the body.
-    Defaults to SKIP if no confident match is found.
+    Returns JOB_DIGEST, GOOGLE_ALERT, RECRUITER_OUTREACH, SKIP_JUNK, or
+    SKIP_UNCLASSIFIED. With ``config``, alert classifications are restricted
+    to allowlisted senders; without it, the built-in constants apply.
     """
     sender = (msg.get("From", "") or "").lower()
     subject = msg.get("Subject", "") or ""
-    subject_lower = subject.lower()
+
+    google_senders, digest_senders = _effective_senders(config)
+    subject_hints = config.subject_hints if config is not None else []
+    allowlisted = config is None or config.source_for(sender) is not None
 
     # --- Google Alerts: specific sender check first ---
-    if any(s in sender for s in GOOGLE_ALERTS_SENDERS):
+    if any(s in sender for s in google_senders):
         logger.info("Classified as GOOGLE_ALERT: %s", _log_subject(subject))
         return GOOGLE_ALERT
 
-    # --- Always-SKIP senders ---
+    # --- Always-junk senders ---
     for skip_sender in SKIP_SENDERS:
         if skip_sender in sender:
-            logger.debug("Classified as SKIP (known skip sender): %s", _log_subject(subject))
-            return SKIP
+            logger.debug(
+                "Classified as SKIP_JUNK (known skip sender): %s", _log_subject(subject)
+            )
+            return SKIP_JUNK
 
     # --- LinkedIn emails need careful disambiguation ---
     if "linkedin.com" in sender:
-        return _classify_linkedin(msg, sender, subject, subject_lower)
+        return _classify_linkedin(
+            msg, sender, subject, digest_senders, subject_hints, allowlisted
+        )
 
     # --- Job board digest senders ---
-    for digest_sender in JOB_DIGEST_SENDERS:
+    for digest_sender in digest_senders:
         if digest_sender in sender:
             logger.info("Classified as JOB_DIGEST: %s", _log_subject(subject))
             return JOB_DIGEST
 
     # --- Subject-based digest detection (non-LinkedIn senders) ---
-    for pattern in JOB_DIGEST_SUBJECT_PATTERNS:
-        if pattern.search(subject):
-            logger.info("Classified as JOB_DIGEST (subject match): %s", _log_subject(subject))
+    if _digest_shaped_subject(subject, subject_hints):
+        if allowlisted:
+            logger.info(
+                "Classified as JOB_DIGEST (subject match): %s", _log_subject(subject)
+            )
             return JOB_DIGEST
+        # Digest-shaped mail from a non-allowlisted sender: surface as
+        # an allowlist candidate instead of processing it.
+        logger.info(
+            "Digest-shaped subject from non-allowlisted sender %s — "
+            "SKIP_UNCLASSIFIED (allowlist candidate): %s",
+            sender[:50], _log_subject(subject),
+        )
+        return SKIP_UNCLASSIFIED
 
     # --- Corporate domain outreach (not bulk senders) ---
     # If the sender is from a corporate domain and subject hints at outreach
@@ -169,40 +207,80 @@ def classify_email(msg: Message) -> str:
                 )
                 return RECRUITER_OUTREACH
 
-    # --- Unclassified — default to SKIP ---
+    # --- Unclassified ---
     logger.warning(
-        "Unclassified email, defaulting to SKIP: from=%s subject='%s'",
+        "Unclassified email — SKIP_UNCLASSIFIED: from=%s subject='%s'",
         sender[:50],
         _log_subject(subject),
     )
-    return SKIP
+    return SKIP_UNCLASSIFIED
 
 
-def _classify_linkedin(msg: Message, sender: str, subject: str, subject_lower: str) -> str:
+def _digest_shaped_subject(subject: str, subject_hints: list[str]) -> bool:
+    """True when the subject looks like a job-alert digest.
+
+    Built-in regex heuristics plus the human-editable plain-substring
+    subject_hints from email_config.yaml — new alert formats can be
+    covered by editing the yaml, no code change needed.
+    """
+    if any(pattern.search(subject) for pattern in JOB_DIGEST_SUBJECT_PATTERNS):
+        return True
+    subject_lower = subject.lower()
+    return any(hint.lower() in subject_lower for hint in subject_hints)
+
+
+def _effective_senders(config: "EmailConfig | None") -> tuple[list[str], list[str]]:
+    """(google_alert_senders, digest_senders) from config, or the constants."""
+    if config is None:
+        return GOOGLE_ALERTS_SENDERS, JOB_DIGEST_SENDERS
+    google: list[str] = []
+    digest: list[str] = []
+    for group in config.senders:
+        target = google if group.source == "google_alerts" else digest
+        target.extend(a.lower() for a in group.addresses)
+    return google, digest
+
+
+def _classify_linkedin(
+    msg: Message,
+    sender: str,
+    subject: str,
+    digest_senders: list[str],
+    subject_hints: list[str],
+    allowlisted: bool,
+) -> str:
     """Disambiguate LinkedIn email types.
 
     LinkedIn sends many email types from similar addresses. Subject line patterns
     are the most reliable differentiator.
     """
-    # Check SKIP patterns first — social/engagement notifications
+    # Check junk patterns first — social/engagement notifications
     for pattern in LINKEDIN_SKIP_SUBJECT_PATTERNS:
         if pattern.search(subject):
-            logger.debug("Classified as SKIP (LinkedIn social): %s", _log_subject(subject))
-            return SKIP
+            logger.debug(
+                "Classified as SKIP_JUNK (LinkedIn social): %s", _log_subject(subject)
+            )
+            return SKIP_JUNK
 
     # Job alert digest senders
-    for digest_sender in JOB_DIGEST_SENDERS:
+    for digest_sender in digest_senders:
         if digest_sender in sender:
             logger.info("Classified as JOB_DIGEST (LinkedIn jobs): %s", _log_subject(subject))
             return JOB_DIGEST
 
-    # Job digest by subject pattern
-    for pattern in JOB_DIGEST_SUBJECT_PATTERNS:
-        if pattern.search(subject):
+    # Job digest by subject shape — allowlist-gated when a config is active
+    if _digest_shaped_subject(subject, subject_hints):
+        if allowlisted:
             logger.info(
                 "Classified as JOB_DIGEST (LinkedIn subject): %s", _log_subject(subject)
             )
             return JOB_DIGEST
+        logger.info(
+            "Digest-shaped LinkedIn mail from non-allowlisted address %s — "
+            "SKIP_UNCLASSIFIED: %s",
+            sender[:50], _log_subject(subject),
+        )
+        return SKIP_UNCLASSIFIED
 
     # Recruiter outreach — InMail or message notification
     is_notification_sender = any(s in sender for s in LINKEDIN_NOTIFICATION_SENDERS)
@@ -227,11 +305,11 @@ def _classify_linkedin(msg: Message, sender: str, subject: str, subject_lower: s
 
     # LinkedIn email we can't confidently classify
     logger.warning(
-        "Unclassified LinkedIn email, defaulting to SKIP: from=%s subject='%s'",
+        "Unclassified LinkedIn email — SKIP_UNCLASSIFIED: from=%s subject='%s'",
         sender[:50],
         _log_subject(subject),
     )
-    return SKIP
+    return SKIP_UNCLASSIFIED
 
 
 def _is_corporate_sender(sender: str) -> bool:

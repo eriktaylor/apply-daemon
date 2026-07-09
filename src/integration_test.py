@@ -342,6 +342,34 @@ def _check_gmail(do_network: bool) -> CheckResult:
     )
 
 
+def _check_email_config() -> CheckResult:
+    """F4. Track B — my_profile/email_config.yaml parses (allowlist + knobs)."""
+    try:
+        from src.email_config import EmailConfigError, load_email_config
+        config = load_email_config()
+    except EmailConfigError as exc:
+        return CheckResult(
+            "F4. Track B (email yaml)",
+            FAIL,
+            f"email_config.yaml invalid — Track B will refuse to run: {exc}",
+        )
+    except Exception as exc:
+        return CheckResult("F4. Track B (email yaml)", FAIL, f"load error: {exc}")
+    detail = (
+        f"{len(config.all_addresses())} allowlisted senders, "
+        f"top_n={config.top_n}, lookback={config.lookback_days}d, "
+        f"archive → {config.archive_folder}"
+    )
+    if config.origin == "defaults":
+        return CheckResult(
+            "F4. Track B (email yaml)",
+            WARN,
+            "my_profile/email_config.yaml absent — built-in defaults in effect "
+            f"({detail})",
+        )
+    return CheckResult("F4. Track B (email yaml)", PASS, detail)
+
+
 def _check_proxy() -> CheckResult:
     """G. IPRoyal credentials present (full smoke test = `python -m src.proxy_test`)."""
     try:
@@ -372,6 +400,7 @@ def run_all(do_network: bool, do_llm: bool) -> list[CheckResult]:
         _check_profile(),
         _check_search_config(),
         _check_gmail(do_network),
+        _check_email_config(),
         _check_proxy(),
     ]
 
