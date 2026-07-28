@@ -8,6 +8,8 @@ actual SQLite state. Synthetic fixtures only.
 from __future__ import annotations
 
 import email.message
+import email.utils
+from datetime import datetime, timedelta, timezone
 from unittest.mock import MagicMock, patch
 
 import pytest
@@ -35,12 +37,28 @@ NO_LINKS_HTML = (
 )
 
 
+def _rfc2822(days_ago: float) -> str:
+    """RFC-2822 date ``days_ago`` days before now.
+
+    Fixture dates must be clock-relative: ``_config`` sets
+    ``lookback_days=14``, so a hardcoded date silently ages past the
+    freshness window and flips these tests to ARCHIVED_STALE.
+    """
+    return email.utils.format_datetime(
+        datetime.now(timezone.utc) - timedelta(days=days_ago)
+    )
+
+
+FRESH_DATE = _rfc2822(1)      # inside the 14-day lookback
+STALE_DATE = _rfc2822(45)     # well outside it
+
+
 def _email(
     sender: str,
     subject: str,
     message_id: str,
     html: str | None = DIGEST_HTML,
-    date: str = "Fri, 03 Jul 2026 10:00:00 +0000",
+    date: str = FRESH_DATE,
 ) -> email.message.EmailMessage:
     msg = email.message.EmailMessage()
     msg["From"] = sender
@@ -188,7 +206,7 @@ class TestStaleAlerts:
     def test_stale_alert_archived_without_triage(self, env):
         msg = _email(
             "jobs-noreply@linkedin.com", "your job alert", "<stale-1@x>",
-            date="Mon, 01 Jun 2026 10:00:00 +0000",  # >14d before 2026-07-04
+            date=STALE_DATE,  # outside the 14-day lookback
         )
         env["fetch_inbox"].return_value = [_fetched(msg, b"4")]
         run_pipeline()

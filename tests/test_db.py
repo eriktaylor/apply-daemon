@@ -4,7 +4,13 @@ from datetime import datetime, timedelta, timezone
 
 import pytest
 
-from src.db import Database, _format_history_timeline, is_duplicate_email
+from src.db import (
+    DEFAULT_DB_PATH,
+    Database,
+    _format_history_timeline,
+    is_duplicate_email,
+    resolve_db_path,
+)
 from src.models import JobListing
 
 
@@ -646,3 +652,45 @@ class TestStatusAwareDedup:
         row = db.get_listing_by_id(existing_id)
         assert row["pipeline_status"] == "saved"
         assert row["reason"] == "Updated"
+
+
+class TestResolveDbPath:
+    """Path resolution precedence: explicit arg → $APPLY_DAEMON_DB → default."""
+
+    def test_explicit_arg_wins(self, tmp_path, monkeypatch):
+        monkeypatch.setenv("APPLY_DAEMON_DB", str(tmp_path / "env.db"))
+        explicit = tmp_path / "explicit.db"
+        assert resolve_db_path(explicit) == explicit
+
+    def test_env_var_used_when_no_arg(self, tmp_path, monkeypatch):
+        target = tmp_path / "env.db"
+        monkeypatch.setenv("APPLY_DAEMON_DB", str(target))
+        assert resolve_db_path() == target
+
+    def test_falls_back_to_default(self, monkeypatch):
+        monkeypatch.delenv("APPLY_DAEMON_DB", raising=False)
+        assert resolve_db_path() == DEFAULT_DB_PATH
+
+    def test_blank_env_var_ignored(self, monkeypatch):
+        monkeypatch.setenv("APPLY_DAEMON_DB", "   ")
+        assert resolve_db_path() == DEFAULT_DB_PATH
+
+    def test_expands_user_home(self, monkeypatch):
+        monkeypatch.setenv("APPLY_DAEMON_DB", "~/apply.db")
+        assert "~" not in str(resolve_db_path())
+
+    def test_database_honours_env_var(self, tmp_path, monkeypatch):
+        target = tmp_path / "from_env.db"
+        monkeypatch.setenv("APPLY_DAEMON_DB", str(target))
+        database = Database()
+        try:
+            assert database.db_path == target
+            assert target.exists()
+        finally:
+            database.close()
+
+
+class TestBusyTimeout:
+    def test_busy_timeout_is_set(self, db):
+        (value,) = db.conn.execute("PRAGMA busy_timeout").fetchone()
+        assert value == 5000

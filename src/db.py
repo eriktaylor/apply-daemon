@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import json
+import os
 import sqlite3
 from datetime import datetime, timedelta, timezone
 from difflib import SequenceMatcher
@@ -13,6 +14,26 @@ from rapidfuzz.fuzz import token_set_ratio
 from src.models import JobListing
 
 DEFAULT_DB_PATH = Path("apply_daemon.db")
+
+# Milliseconds a writer waits on a locked DB before raising. WAL gives
+# concurrent readers, but writers still serialize; short-lived CLI processes
+# invoked back-to-back would otherwise fail with "database is locked".
+_BUSY_TIMEOUT_MS = 5000
+
+
+def resolve_db_path(db_path: Path | None = None) -> Path:
+    """Resolve the database path: explicit arg → $APPLY_DAEMON_DB → default.
+
+    The default is relative, so a process started outside the project root
+    would silently create an empty database in the wrong directory. Setting
+    APPLY_DAEMON_DB pins one store regardless of the working directory.
+    """
+    if db_path is not None:
+        return Path(db_path)
+    env_path = os.getenv("APPLY_DAEMON_DB", "").strip()
+    if env_path:
+        return Path(env_path).expanduser()
+    return DEFAULT_DB_PATH
 
 SCHEMA = """
 CREATE TABLE IF NOT EXISTS listings (
@@ -65,10 +86,11 @@ class Database:
     """SQLite access layer for the listings pipeline."""
 
     def __init__(self, db_path: Path | None = None):
-        self.db_path = db_path or DEFAULT_DB_PATH
+        self.db_path = resolve_db_path(db_path)
         self.conn = sqlite3.connect(str(self.db_path))
         self.conn.row_factory = sqlite3.Row
         self.conn.execute("PRAGMA journal_mode=WAL")
+        self.conn.execute(f"PRAGMA busy_timeout={_BUSY_TIMEOUT_MS}")
         self._init_schema()
 
     def _init_schema(self) -> None:
