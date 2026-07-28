@@ -28,7 +28,6 @@ import logging
 import re
 import sys
 import time
-from datetime import datetime, timezone
 from pathlib import Path
 
 from dotenv import load_dotenv
@@ -37,12 +36,10 @@ from slack_sdk.errors import SlackApiError
 load_dotenv()
 
 from src.db import Database
+from src.human_labels import SURFACE_SLACK, append_human_label
 from src.notifications import _get_slack_config, _import_slack_app
 
 logger = logging.getLogger(__name__)
-
-_LABELS_DIR = Path("data")
-_LABELS_PATH = _LABELS_DIR / "human_labels.jsonl"
 
 # Slack message metadata event_type values recognized as digest listings.
 # New cards are written with "apply_daemon_listing"; the legacy
@@ -52,26 +49,13 @@ _LISTING_EVENT_TYPES = frozenset({"apply_daemon_listing", "apply_pilot_listing"}
 
 
 def _append_human_label(job_id: str, action: str, listing: dict) -> None:
-    """Append a human feedback record to data/human_labels.jsonl."""
-    _LABELS_DIR.mkdir(parents=True, exist_ok=True)
+    """Append a Slack-surface human feedback record.
 
-    def _default(o: object) -> str:
-        if isinstance(o, (datetime,)):
-            return o.isoformat()
-        # sqlite3.Row or date-like objects
-        if hasattr(o, "isoformat"):
-            return o.isoformat()
-        raise TypeError(f"Object of type {type(o).__name__} is not JSON serializable")
-
-    record = {
-        "job_id": job_id,
-        "timestamp": datetime.now(timezone.utc).isoformat(),
-        "human_reaction": action,
-        "listing": dict(listing),
-    }
-    with open(_LABELS_PATH, "a", encoding="utf-8") as f:
-        f.write(json.dumps(record, default=_default) + "\n")
-    logger.debug("Appended human label: %s → %s", job_id[:8], action)
+    Thin seam over ``src.human_labels.append_human_label``: this module's
+    call sites are all Slack reactions or thread commands, so the surface is
+    pinned here in one place. See src/human_labels.py for the record schema.
+    """
+    append_human_label(job_id, action, listing, surface=SURFACE_SLACK)
 
 
 # Reaction name mappings — Slack normalizes these

@@ -15,6 +15,11 @@ from src.models import JobListing
 
 DEFAULT_DB_PATH = Path("apply_daemon.db")
 
+# Statuses eligible for the CLI review queue, in presentation order.
+# 'auto' first: those rows already have cached Deep Research in output/,
+# so deep-diving one costs no tokens.
+REVIEW_STATUSES = ("auto", "auto_queued", "triaged")
+
 # Milliseconds a writer waits on a locked DB before raising. WAL gives
 # concurrent readers, but writers still serialize; short-lived CLI processes
 # invoked back-to-back would otherwise fail with "database is locked".
@@ -108,6 +113,10 @@ class Database:
             (
                 "date_posted",
                 "ALTER TABLE listings ADD COLUMN date_posted TEXT",
+            ),
+            (
+                "presented_at",
+                "ALTER TABLE listings ADD COLUMN presented_at TEXT",
             ),
             (
                 "gmail_message_id",
@@ -814,6 +823,77 @@ class Database:
         if row["pipeline_status"] in self._AUTOPILOT_BLOCKED_STATUSES:
             return False
         return self.update_pipeline_status(listing_id, "auto_queued")
+
+    def get_review_queue(
+        self,
+        limit: int = 3,
+        *,
+        min_confidence_pct: int = 0,
+        session_window_minutes: int | None = None,
+    ) -> list[sqlite3.Row]:
+        """Return the next page of listings awaiting a human decision.
+
+        Backs the CLI review surface (`plans/cli_skill_interface.md` I-1).
+
+        **``presented_at`` is paging state, not an eligibility gate.**
+        Eligibility comes from ``pipeline_status`` alone — a listing is
+        undecided until a human acts on it. Unlike ``slack_notified`` (a
+        one-way gate, correct there because a posted card persists in the
+        channel), a CLI presentation persists nowhere: if it gated
+        eligibility, "show 3" followed by a dead session would strand those
+        three forever. ``session_window_minutes`` only skips rows shown that
+        recently, so ``next`` pages forward within a sitting and undecided
+        rows reappear later.
+
+        Ordering is tier, then ``confidence DESC, date_ingested DESC`` — all
+        in SQL. ``auto`` rows come first because their Deep Research is
+        already cached in ``output/``, making a deep-dive token-free.
+        ``process_queue._select_top_n`` is deliberately NOT reused: its
+        composite resolves geo per row via Nominatim, and an interactive
+        verb cannot block on network calls.
+        """
+        params: list = [min_confidence_pct]
+        cutoff_clause = ""
+        if session_window_minutes is not None:
+            cutoff = (
+                datetime.now(timezone.utc) - timedelta(minutes=session_window_minutes)
+            ).isoformat()
+            cutoff_clause = "AND (presented_at IS NULL OR presented_at < ?) "
+            params.append(cutoff)
+
+        placeholders = ", ".join("?" for _ in REVIEW_STATUSES)
+        sql = (
+            "SELECT *, CASE pipeline_status "
+            "  WHEN 'auto' THEN 0 WHEN 'auto_queued' THEN 1 ELSE 2 "
+            "END AS tier_rank "
+            "FROM listings "
+            f"WHERE pipeline_status IN ({placeholders}) "
+            "AND verdict IN ('YES', 'MAYBE') "
+            "AND confidence >= ? "
+            f"{cutoff_clause}"
+            "ORDER BY tier_rank, confidence DESC, date_ingested DESC "
+            "LIMIT ?"
+        )
+        # Status placeholders bind before min_confidence_pct in the SQL text.
+        params = [*REVIEW_STATUSES, *params, limit]
+        return self.conn.execute(sql, params).fetchall()
+
+    def mark_presented(self, listing_ids: list[str]) -> int:
+        """Stamp ``presented_at`` on listings just shown to the user.
+
+        Paging state only — see :meth:`get_review_queue`. Returns the number
+        of rows stamped.
+        """
+        if not listing_ids:
+            return 0
+        now = datetime.now(timezone.utc).isoformat()
+        placeholders = ", ".join("?" for _ in listing_ids)
+        cursor = self.conn.execute(
+            f"UPDATE listings SET presented_at = ? WHERE id IN ({placeholders})",
+            [now, *listing_ids],
+        )
+        self.conn.commit()
+        return cursor.rowcount
 
     def get_auto_queue(
         self,

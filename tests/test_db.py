@@ -694,3 +694,89 @@ class TestBusyTimeout:
     def test_busy_timeout_is_set(self, db):
         (value,) = db.conn.execute("PRAGMA busy_timeout").fetchone()
         assert value == 5000
+
+
+class TestReviewQueue:
+    """D-1 — CLI review queue. presented_at is paging state, not a gate."""
+
+    def _seed(self, db, **kw):
+        listing = _make_listing(**kw)
+        db.insert_listing(listing)
+        return listing.id
+
+    def test_returns_only_review_statuses(self, db):
+        keep = self._seed(db, title="Keep", company="A", confidence=80)
+        drop = self._seed(db, title="Drop", company="B", confidence=80)
+        db.update_pipeline_status(drop, "passed")
+        rows = db.get_review_queue(limit=10)
+        assert [r["id"] for r in rows] == [keep]
+
+    def test_auto_tier_ranks_before_auto_queued(self, db):
+        queued = self._seed(db, title="Queued", company="A", confidence=95)
+        auto = self._seed(db, title="Auto", company="B", confidence=60)
+        db.update_pipeline_status(queued, "auto_queued")
+        db.update_pipeline_status(auto, "auto")
+        rows = db.get_review_queue(limit=10)
+        # 'auto' wins despite lower confidence — its research is cached.
+        assert [r["id"] for r in rows] == [auto, queued]
+
+    def test_orders_by_confidence_within_tier(self, db):
+        low = self._seed(db, title="Low", company="A", confidence=60)
+        high = self._seed(db, title="High", company="B", confidence=95)
+        for job_id in (low, high):
+            db.update_pipeline_status(job_id, "auto_queued")
+        rows = db.get_review_queue(limit=10)
+        assert [r["id"] for r in rows] == [high, low]
+
+    def test_respects_limit(self, db):
+        for i in range(5):
+            self._seed(db, title=f"Role {i}", company=f"Co {i}", confidence=80)
+        assert len(db.get_review_queue(limit=3)) == 3
+
+    def test_filters_by_confidence(self, db):
+        self._seed(db, title="Weak", company="A", confidence=30)
+        strong = self._seed(db, title="Strong", company="B", confidence=90)
+        rows = db.get_review_queue(limit=10, min_confidence_pct=50)
+        assert [r["id"] for r in rows] == [strong]
+
+    def test_excludes_no_verdicts(self, db):
+        self._seed(db, title="Nope", company="A", verdict="NO", confidence=90)
+        assert db.get_review_queue(limit=10) == []
+
+    def test_presented_rows_still_eligible_without_session_window(self, db):
+        """The core F2 guarantee: presenting does NOT remove a listing."""
+        job_id = self._seed(db, title="Shown", company="A", confidence=80)
+        db.mark_presented([job_id])
+        rows = db.get_review_queue(limit=10)
+        assert [r["id"] for r in rows] == [job_id]
+
+    def test_session_window_pages_forward(self, db):
+        first = self._seed(db, title="First", company="A", confidence=90)
+        second = self._seed(db, title="Second", company="B", confidence=80)
+        db.mark_presented([first])
+        rows = db.get_review_queue(limit=10, session_window_minutes=60)
+        assert [r["id"] for r in rows] == [second]
+
+    def test_stale_presentation_reappears(self, db):
+        job_id = self._seed(db, title="Stale", company="A", confidence=80)
+        old = (datetime.now(timezone.utc) - timedelta(hours=5)).isoformat()
+        db.conn.execute(
+            "UPDATE listings SET presented_at = ? WHERE id = ?", (old, job_id)
+        )
+        db.conn.commit()
+        rows = db.get_review_queue(limit=10, session_window_minutes=60)
+        assert [r["id"] for r in rows] == [job_id]
+
+    def test_mark_presented_counts_rows(self, db):
+        a = self._seed(db, title="A", company="A")
+        b = self._seed(db, title="B", company="B")
+        assert db.mark_presented([a, b]) == 2
+
+    def test_mark_presented_empty_is_noop(self, db):
+        assert db.mark_presented([]) == 0
+
+    def test_tier_rank_exposed_to_caller(self, db):
+        job_id = self._seed(db, title="Auto", company="A", confidence=80)
+        db.update_pipeline_status(job_id, "auto")
+        # The CLI surfaces the tier so the skill knows a deep-dive is free.
+        assert db.get_review_queue(limit=1)[0]["tier_rank"] == 0

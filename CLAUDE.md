@@ -79,6 +79,8 @@ apply-daemon/
 │   ├── pipeline.py              # Track B — silent worker (fetch, triage, store)
 │   ├── digest.py                # Slack digest (posts listings for reactions)
 │   ├── sweeper.py               # Reaction sweeper + ChatOps parser. Priority: pass > tailor > save. Idempotent.
+│   │                            # THREAD COMMANDS ARE FROZEN — see Conventions.
+│   ├── human_labels.py          # Shared human-feedback ledger writer (data/human_labels.jsonl)
 │   ├── tailor.py                # Cloud LLM escalation engine (multi-line prompts; E501 ignored)
 │   ├── compile.py               # .docx generation from tailored bullets
 │   ├── research.py              # Deep Research agent (semantic scraping; runs before every tailor)
@@ -129,3 +131,5 @@ apply-daemon/
 - Multi-line LLM prompt templates in `triage.py` / `tailor.py` are deliberately one prose sentence per line so the wire-format is preserved — do not reflow them; ruff E501 is already ignored for these files.
 - Several entry points need `load_dotenv()` before importing modules that read env at import time → E402 is ignored for those (`pipeline.py`, `digest.py`, `batch_process.py`, `jobspy_ingest.py`, `process_queue.py`, `proxy_test.py`, `sweeper.py`, `tailor.py`).
 - Squash on merge; commit messages on `main` read like changelog entries.
+- **Slack thread commands (`!applied`, `!triage`, `!trend`, …) are frozen** — they still work, but new post-triage functionality belongs in the CLI review surface, not `sweeper.py`. Slack *reactions* (👍 👎 ✏️ ❓) are unaffected. See `docs/CHATOPS.md`.
+- **Every human decision must append to `data/human_labels.jsonl`** via `src/human_labels.py::append_human_label` (pass `surface=`). That ledger is the only input to the preference-pair extractor behind the ranking evals — a surface that skips it is invisible to that work, silently.
