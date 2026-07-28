@@ -26,6 +26,7 @@ from __future__ import annotations
 
 import json
 import logging
+import os
 from datetime import datetime, timezone
 from pathlib import Path
 
@@ -33,6 +34,18 @@ logger = logging.getLogger(__name__)
 
 LABELS_DIR = Path("data")
 LABELS_PATH = LABELS_DIR / "human_labels.jsonl"
+
+
+def resolve_labels_path() -> Path:
+    """Ledger path: ``$HUMAN_LABELS_PATH`` → the default under ``data/``.
+
+    The override exists so a smoke test or a throwaway run against a copied
+    database cannot append phantom decisions to the real ledger — those rows
+    look exactly like genuine human judgments to the preference-pair
+    extractor, and they are tedious to find later.
+    """
+    override = os.getenv("HUMAN_LABELS_PATH", "").strip()
+    return Path(override).expanduser() if override else LABELS_PATH
 
 SURFACE_SLACK = "slack"
 SURFACE_CLI = "cli"
@@ -66,7 +79,7 @@ def append_human_label(
     if surface not in VALID_SURFACES:
         logger.warning("Unknown label surface %r; recording anyway", surface)
 
-    target = path or LABELS_PATH
+    target = path or resolve_labels_path()
     target.parent.mkdir(parents=True, exist_ok=True)
 
     record = {

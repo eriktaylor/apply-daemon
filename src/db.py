@@ -878,6 +878,36 @@ class Database:
         params = [*REVIEW_STATUSES, *params, limit]
         return self.conn.execute(sql, params).fetchall()
 
+    def get_presented_page(self, within_minutes: int) -> list[sqlite3.Row]:
+        """Return the most recently presented page of undecided listings.
+
+        Defines "the current page" for bulk actions in a world of ephemeral
+        CLI processes: there is no session object, so the page is the set of
+        rows sharing the latest ``presented_at`` stamp — :meth:`mark_presented`
+        writes one timestamp per page, which makes that set exact.
+
+        Deliberately NOT "everything presented in the last N minutes": a user
+        who viewed three pages and typed `pass --all` means the three rows on
+        screen, not all nine. ``within_minutes`` only bounds staleness, so a
+        page from yesterday is never the target.
+        """
+        cutoff = (
+            datetime.now(timezone.utc) - timedelta(minutes=within_minutes)
+        ).isoformat()
+        placeholders = ", ".join("?" for _ in REVIEW_STATUSES)
+        return self.conn.execute(
+            "SELECT * FROM listings "
+            f"WHERE pipeline_status IN ({placeholders}) "
+            "AND presented_at IS NOT NULL AND presented_at >= ? "
+            "AND presented_at = ("
+            "  SELECT MAX(presented_at) FROM listings "
+            f"  WHERE pipeline_status IN ({placeholders}) "
+            "  AND presented_at IS NOT NULL AND presented_at >= ?"
+            ") "
+            "ORDER BY confidence DESC",
+            [*REVIEW_STATUSES, cutoff, *REVIEW_STATUSES, cutoff],
+        ).fetchall()
+
     def mark_presented(self, listing_ids: list[str]) -> int:
         """Stamp ``presented_at`` on listings just shown to the user.
 

@@ -80,6 +80,34 @@ class TestRecordSchema:
         assert _rows(target)[0]["surface"] == "carrier-pigeon"
 
 
+class TestPathResolution:
+    """The override exists so throwaway runs can't append phantom decisions
+    to the real ledger — they are indistinguishable from genuine ones."""
+
+    def test_defaults_to_data_dir(self, monkeypatch):
+        from src.human_labels import LABELS_PATH, resolve_labels_path
+        monkeypatch.delenv("HUMAN_LABELS_PATH", raising=False)
+        assert resolve_labels_path() == LABELS_PATH
+
+    def test_env_override(self, tmp_path, monkeypatch):
+        from src.human_labels import resolve_labels_path
+        target = tmp_path / "elsewhere.jsonl"
+        monkeypatch.setenv("HUMAN_LABELS_PATH", str(target))
+        assert resolve_labels_path() == target
+
+    def test_blank_override_ignored(self, monkeypatch):
+        from src.human_labels import LABELS_PATH, resolve_labels_path
+        monkeypatch.setenv("HUMAN_LABELS_PATH", "  ")
+        assert resolve_labels_path() == LABELS_PATH
+
+    def test_append_honours_override(self, tmp_path, monkeypatch):
+        target = tmp_path / "override.jsonl"
+        monkeypatch.setenv("HUMAN_LABELS_PATH", str(target))
+        append_human_label("job-1", "save", {})
+        assert target.exists()
+        assert _rows(target)[0]["job_id"] == "job-1"
+
+
 class TestSurfaceParity:
     """A CLI decision and the equivalent Slack reaction must differ only in
     `surface` — otherwise S-2's per-surface analysis compares apples to
