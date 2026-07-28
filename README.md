@@ -24,6 +24,8 @@ Work through these once during onboarding, in order. Each item maps to a section
 
 ## How it works
 
+### Ingestion & scoring — two tracks, one store
+
 ```
 Track A (Proactive)                      Track B (Reactive)
 ─────────────────────────────            ──────────────────────────────────
@@ -56,6 +58,51 @@ Stage 4b: Lazy-load full description     Stage 2: Field validation
 7. **Geo distance** — Calculates commute distance from your `home_location` to each job using OpenStreetMap Nominatim geocoding with LRU caching.
 8. **Historical context** — Detects reposted listings via fuzzy matching and surfaces a timeline of prior encounters in the digest.
 9. **Storage + notification** — Results saved to SQLite. Daily Slack digest with Block Kit formatting, skills match percentages, geo distance, and history context. Rate-limited with retry handlers and inter-message pacing.
+
+### Review & apply — one store, two surfaces
+
+Everything above converges on SQLite. Everything below fans back out of it:
+
+```
+                     db.upsert_listing()
+                              │
+                Autopilot (process_queue.py)
+                top-N Deep Research + re-score → status 'auto';
+                research dossier cached in output/…
+                              │
+        ┌─────────────────────┴─────────────────────────┐
+        │                                               │
+Slack — ambient surface                  CLI + Claude skill — work surface
+───────────────────────────              ──────────────────────────────────
+digest.py → Block Kit card               python -m src.cli <verb> --json
+reactions: 👍 save · 👎 pass               next       → top 3 (auto tier
+           ✏️ tailor · ❓ route                          first: deep-dive
+sweeper.py polls + backstops                           is token-free)
+thread ChatOps: frozen                   deep-dive  → Stage 5 vs post-
+        │                                             research verdict,
+        │                                             delta, dossier
+        │                                save / pass / pass --all
+        │                                next       → 3 more…
+        │                                       │
+        └─────────────────────┬─────────────────┘
+                              │
+              SQLite — single source of truth
+              pipeline_status + presented_at  ← paging state, not a
+                              │                 gate: undecided rows
+                              │                 reappear next session
+              data/human_labels.jsonl  ← every decision, both surfaces
+                                         → preference pairs → ranking evals
+```
+
+**Slack** is the ambient surface — the daily digest and four reactions, triageable from a phone. **The CLI** is the work surface: a Claude Code skill drives it conversationally — show the top 3, deep-dive one, pass the rest, pull 3 more. **Both** write the same two records (`pipeline_status` and a labeled decision in `human_labels.jsonl`), so the surfaces can't drift and every decision becomes ranking training data.
+
+Autopilot sits above the fork because its enrichment serves both surfaces — and it's why deep-diving an `auto`-tier listing costs no tokens: the research is already on disk. The CLI's `deep-dive` shows the Stage 5 score *and* the post-research re-score side by side; they routinely disagree, and that gap is the most decision-relevant thing about a listing.
+
+```bash
+python -m src.cli next --top 3        # what's new
+python -m src.cli deep-dive <id>      # why it scored that way
+python -m src.cli save <id>           # or: pass <id>, pass --all
+```
 
 ## Setup
 
@@ -213,7 +260,14 @@ python -m src.process_queue --backfill-only   # backfill, exit
 # Funnel report
 python -m src.report             # All-time reference
 python -m src.report --days 7    # Last 7 days reference
+
+# CLI review surface — triage without Slack. Add --json for scripting.
+python -m src.cli next --top 3   # Next page of candidates
+python -m src.cli deep-dive <id> # Stage 5 vs post-research verdict + dossier
+python -m src.cli save <id>      # or: pass <id> / pass --all
 ```
+
+The CLI reads `$APPLY_DAEMON_DB` (falling back to `./apply_daemon.db`), so it works from any directory. Showing a listing never consumes it — undecided listings return to the queue after a two-hour window.
 
 **How reactions work:**
 
@@ -232,7 +286,11 @@ Reaction priority is `pass` > `tailor` > `save`, and a sweeper-level idempotency
 
 ## ChatOps & Commands
 
-The post-triage workflow runs entirely on Slack reactions and thread commands, processed each time you run `python -m src.sweeper`. State-tracking commands (`!applied`, `!pass`, `!interview`, `!rejected`), on-demand asset generation (`!coverletter`, `!prep`, `!polish`), regeneration (`!regenerate`), the Smart Router (`❓` / `!answer`), manual ingestion (`!triage <URL>`) with its threaded scrape-failure recovery (`!update`), and the labor-market intelligence command (`!trend`) are all documented in [`docs/CHATOPS.md`](docs/CHATOPS.md).
+Post-triage work happens on two surfaces.
+
+**The CLI review surface** (`python -m src.cli`) is where new work goes. Five verbs — `next`, `show`, `deep-dive`, `save`, `pass` — each with `--json`. A bundled Claude Code skill (`.claude/skills/apply-daemon/`) drives them conversationally: ask Claude "what's new?" and it walks you through the top 3, deep-dives whichever you pick, and records your decisions. Every verb is a local DB read/write — no LLM calls, no network — so the loop is instant.
+
+**Slack** remains the ambient surface: the daily digest plus the four reactions, processed each time you run `python -m src.sweeper`. State-tracking commands (`!applied`, `!pass`, `!interview`, `!rejected`), on-demand asset generation (`!coverletter`, `!prep`, `!polish`), regeneration (`!regenerate`), the Smart Router (`❓` / `!answer`), manual ingestion (`!triage <URL>`) with its threaded scrape-failure recovery (`!update`), and the labor-market intelligence command (`!trend`) are all documented in [`docs/CHATOPS.md`](docs/CHATOPS.md) — these thread commands are **frozen**: they keep working, but new verbs land in the CLI instead.
 
 ## Model selection & confidence threshold
 
