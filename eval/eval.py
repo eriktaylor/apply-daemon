@@ -14,13 +14,23 @@ import os
 import statistics
 import sys
 from dataclasses import dataclass
+from datetime import datetime, timezone
 from pathlib import Path
 
 # Allow running from project root
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 
+from eval.model_pricing import (
+    LAST_UPDATED as PRICING_LAST_UPDATED,
+)
+from eval.model_pricing import (
+    PRICING_VERIFIED,
+    cost_per_1k_listings,
+)
 from src.profile_loader import load_profile
 from src.triage import TriageSession
+
+RUNS_CSV_PATH = Path("eval/runs.csv")
 
 
 @dataclass
@@ -96,8 +106,12 @@ def run_eval(
     eval_data: list[EvalRow],
     model: str | None,
     runs_per_email: int = 1,
+    stage1_model: str | None = None,
 ) -> tuple[list[EvalResult], int]:
     """Run each email through the unified triage and collect results.
+
+    ``model`` overrides the Stage 5 scoring slot; ``stage1_model`` overrides
+    the Stage 1 extraction slot (both default to their .env slots when None).
 
     Returns (results, first_call_latency_ms).
     """
@@ -106,7 +120,9 @@ def run_eval(
     results = []
     first_call_ms = 0
 
-    with TriageSession(profile["llm_context"], model=model) as session:
+    with TriageSession(
+        profile["llm_context"], model=model, stage1_model=stage1_model,
+    ) as session:
         for i, row in enumerate(eval_data):
             print(f"  [{i + 1}/{len(eval_data)}] Evaluating email...", flush=True)
             all_extracted = []
@@ -208,6 +224,7 @@ def print_report(
     results: list[EvalResult],
     model: str,
     first_call_ms: int = 0,
+    stage1_model: str | None = None,
 ) -> None:
     """Print a summary report to stdout."""
     total = len(results)
@@ -218,8 +235,15 @@ def print_report(
 
     metrics = compute_advanced_metrics(results)
 
+    # Cost is priced against the Stage 5 scoring slug (the model under test);
+    # None when the slug isn't in the pricing table.
+    cost_1k = cost_per_1k_listings(model, avg_tokens)
+    verified_note = "" if PRICING_VERIFIED else "  (UNVERIFIED)"
+
     print(f"\n{'=' * 60}")
-    print(f"  Eval Report — model: {model}")
+    print(f"  Eval Report — stage5: {model}")
+    if stage1_model:
+        print(f"                stage1: {stage1_model}")
     print(f"{'=' * 60}")
     print(f"  Emails evaluated:      {total}")
     print(f"  Extraction accuracy:   {avg_extraction:.1%}")
@@ -229,6 +253,12 @@ def print_report(
     print(f"  Avg latency:           {avg_latency:.0f}ms")
     print(f"  Avg tokens:            {avg_tokens:.0f}")
     print(f"  Throughput:            {metrics['throughput_tok_per_sec']:.0f} tok/s")
+    if cost_1k is not None:
+        print(f"  Est. $/1k listings:    ${cost_1k:.2f}{verified_note}")
+    else:
+        print(f"  Est. $/1k listings:    n/a (no pricing for {model})")
+    print(f"  Pricing table dated:   {PRICING_LAST_UPDATED}"
+          f"{'' if PRICING_VERIFIED else ' — placeholders, verify before trusting'}")
     print(f"{'─' * 60}")
     print(f"  False Positive Rate:   {metrics['false_positive_rate']:.1%}"
           f"  ({metrics['false_positives']} YES when expected NO)")
@@ -274,12 +304,65 @@ def save_results(results: list[EvalResult], output_path: Path, model: str) -> No
     print(f"\nDetailed results saved to {output_path}")
 
 
+def append_run_summary(
+    results: list[EvalResult],
+    stage5_model: str,
+    stage1_model: str,
+    dataset: str,
+    runs_per_email: int,
+    path: Path = RUNS_CSV_PATH,
+) -> None:
+    """Append a one-row-per-run summary to eval/runs.csv (E-2 reads this).
+
+    Both model slugs are recorded so Stage 1 and Stage 5 comparisons are
+    each attributable, not conflated under the Stage 5 slug alone. The header
+    is written once when the file is created.
+    """
+    total = len(results)
+    avg_extraction = statistics.mean(r.extraction_accuracy for r in results) if results else 0
+    avg_verdict = statistics.mean(r.verdict_accuracy for r in results) if results else 0
+    avg_tokens = statistics.mean(r.avg_tokens for r in results) if results else 0
+    cost_1k = cost_per_1k_listings(stage5_model, avg_tokens)
+
+    header = [
+        "timestamp", "dataset", "stage1_model", "stage5_model",
+        "n_emails", "runs_per_email", "extraction_accuracy", "verdict_accuracy",
+        "avg_tokens", "cost_per_1k_listings", "pricing_verified", "pricing_last_updated",
+    ]
+    new_file = not path.exists()
+    path.parent.mkdir(parents=True, exist_ok=True)
+    with open(path, "a", newline="", encoding="utf-8") as f:
+        writer = csv.writer(f)
+        if new_file:
+            writer.writerow(header)
+        writer.writerow([
+            datetime.now(timezone.utc).isoformat(),
+            dataset,
+            stage1_model,
+            stage5_model,
+            total,
+            runs_per_email,
+            f"{avg_extraction:.3f}",
+            f"{avg_verdict:.3f}",
+            f"{avg_tokens:.0f}",
+            f"{cost_1k:.4f}" if cost_1k is not None else "",
+            PRICING_VERIFIED,
+            PRICING_LAST_UPDATED,
+        ])
+    print(f"Run summary appended to {path}")
+
+
 def main():
     parser = argparse.ArgumentParser(description="Eval harness for unified LLM pipeline")
     parser.add_argument("--input", required=True, help="Path to eval CSV file")
     parser.add_argument(
         "--model", default=None,
-        help="OpenRouter model override (e.g. openai/gpt-4o-mini)",
+        help="OpenRouter Stage 5 (scoring) model override (e.g. openai/gpt-4o-mini)",
+    )
+    parser.add_argument(
+        "--stage1-model", default=None, dest="stage1_model",
+        help="OpenRouter Stage 1 (extraction) model override; defaults to "
+             "OPENROUTER_STAGE1_MODEL. Lets a nano-vs-flash-lite Stage 1 run be isolated.",
     )
     parser.add_argument("--runs", type=int, default=1, help="Runs per email")
     parser.add_argument("--output", default=None, help="Output CSV path")
@@ -294,13 +377,27 @@ def main():
         if model
         else os.getenv("OPENROUTER_MODEL", "google/gemini-3.1-flash-lite")
     )
-    print(f"Running eval with model={display_model}, runs_per_email={args.runs}")
+    display_stage1 = (
+        args.stage1_model
+        if args.stage1_model
+        else os.getenv("OPENROUTER_STAGE1_MODEL", "openai/gpt-5.4-nano")
+    )
+    print(
+        f"Running eval with stage5={display_model}, stage1={display_stage1}, "
+        f"runs_per_email={args.runs}"
+    )
 
-    results, _ = run_eval(eval_data, model=model, runs_per_email=args.runs)
-    print_report(results, display_model)
+    results, _ = run_eval(
+        eval_data, model=model, runs_per_email=args.runs,
+        stage1_model=args.stage1_model,
+    )
+    print_report(results, display_model, stage1_model=display_stage1)
 
     output_path = Path(args.output) if args.output else Path(f"eval/results_{display_model}.csv")
     save_results(results, output_path, display_model)
+    append_run_summary(
+        results, display_model, display_stage1, args.input, args.runs,
+    )
 
 
 if __name__ == "__main__":

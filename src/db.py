@@ -376,6 +376,18 @@ class Database:
             (verdict,),
         ).fetchall()
 
+    def get_listing_signals(self) -> list[sqlite3.Row]:
+        """Return (id, verdict, confidence, date_ingested) for every listing.
+
+        Read-only support for eval preference-pair mining (ranking_upgrade.md
+        E-3): lets the miner find un-reacted listings in the same ingestion
+        batch without loading full rows or raw content.
+        """
+        return self.conn.execute(
+            "SELECT id, verdict, confidence, date_ingested "
+            "FROM listings ORDER BY date_ingested"
+        ).fetchall()
+
     def get_recent_listings(self, hours: int = 1) -> list[sqlite3.Row]:
         """Get listings ingested within the last N hours."""
         return self.conn.execute(
@@ -585,6 +597,41 @@ class Database:
                 "GROUP BY pipeline_status",
             ).fetchall()
         return {row["pipeline_status"]: row["cnt"] for row in rows}
+
+    def get_model_breakdown(self, max_age_days: int | None = None) -> dict[str, dict]:
+        """Per-model outcome breakdown for the live model report (O-2).
+
+        Same spirit as :meth:`get_funnel_counts` but grouped by ``model_used``
+        instead of a single funnel. One query; aggregated in Python so the
+        report layer can derive save-rate, interviews/YES, and confidence
+        calibration without extra round-trips.
+
+        Returns ``model_used → {"statuses": {status: n},
+        "verdicts": {VERDICT: n}, "confidences": [(confidence, status), ...]}``.
+        Rows with a NULL/empty ``model_used`` bucket under ``"(unknown)"``.
+        """
+        where, params = "", []
+        if max_age_days is not None:
+            cutoff = (datetime.now(timezone.utc) - timedelta(days=max_age_days)).isoformat()
+            where = "WHERE date_ingested >= ?"
+            params = [cutoff]
+        rows = self.conn.execute(
+            f"SELECT model_used, pipeline_status, verdict, confidence FROM listings {where}",
+            params,
+        ).fetchall()
+
+        out: dict[str, dict] = {}
+        for r in rows:
+            model = (r["model_used"] or "").strip() or "(unknown)"
+            entry = out.setdefault(
+                model, {"statuses": {}, "verdicts": {}, "confidences": []}
+            )
+            status = r["pipeline_status"] or "(none)"
+            entry["statuses"][status] = entry["statuses"].get(status, 0) + 1
+            verdict = (r["verdict"] or "").upper() or "(none)"
+            entry["verdicts"][verdict] = entry["verdicts"].get(verdict, 0) + 1
+            entry["confidences"].append((r["confidence"] or 0, status))
+        return out
 
     def get_listing_history(
         self, title: str, company: str, current_job_id: str, threshold: float = 85.0

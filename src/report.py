@@ -12,11 +12,29 @@ from __future__ import annotations
 
 import argparse
 import logging
+import os
+from pathlib import Path
 
 from src.db import Database
 from src.profile_loader import load_profile
 
 logger = logging.getLogger(__name__)
+
+# Statuses that count as "advanced past triage" for the model save-rate view.
+# Mirrors _print_conversions' `reviewed` set plus autopilot-finalized `auto`.
+_ADVANCED_STATUSES = frozenset({"saved", "tailored", "applied", "interviewing", "auto"})
+
+# Coarse confidence calibration bands (single-user volume won't support fine
+# curves) — (inclusive low, inclusive high, label).
+_CALIBRATION_BANDS = [
+    (0, 59, " 0-59"),
+    (60, 74, "60-74"),
+    (75, 89, "75-89"),
+    (90, 100, "90-100"),
+]
+
+# O-1's model-usage telemetry sink (see src/model_usage.py).
+_MODEL_USAGE_LOG = Path(os.getenv("MODEL_USAGE_LOG_PATH", "logs/model_usage.log"))
 
 # Ordered funnel stages for display — mirrors the user journey
 _FUNNEL_ORDER = [
@@ -128,6 +146,144 @@ def _print_conversions(counts: dict[str, int]) -> None:
         )
 
 
+def _print_model_breakdown(breakdown: dict[str, dict]) -> None:
+    """Per-model outcome table: save-rate, interviews/YES, calibration."""
+    print("\n  Per-Model Outcomes")
+    print("  ------------------")
+    if not breakdown:
+        print("  (no listings with a recorded model_used in this window)")
+        return
+
+    # Order models by total volume, biggest first.
+    def _total(entry: dict) -> int:
+        return sum(entry["statuses"].values())
+
+    for model, entry in sorted(breakdown.items(), key=lambda kv: -_total(kv[1])):
+        total = _total(entry)
+        advanced = sum(n for s, n in entry["statuses"].items() if s in _ADVANCED_STATUSES)
+        yes = entry["verdicts"].get("YES", 0)
+        interviewing = entry["statuses"].get("interviewing", 0)
+        ivs_per_100_yes = f"{interviewing / yes * 100:.0f}" if yes else "-"
+
+        print(f"\n  {model}  ({total} listings)")
+        print(f"    Save rate:          {_pct(advanced, total)}  ({advanced}/{total} advanced)")
+        print(f"    Interviews/100 YES: {ivs_per_100_yes:>4}  ({interviewing} iv / {yes} YES)")
+
+        # Calibration: bucket surfaced listings by confidence, show save-rate
+        # per band — a well-calibrated model's save-rate rises with confidence.
+        print(f"    {'Confidence':<10} {'N':>4} {'SaveRate':>9}  Bar")
+        band_maxes = [
+            sum(1 for c, _ in entry["confidences"] if lo <= c <= hi)
+            for lo, hi, _ in _CALIBRATION_BANDS
+        ]
+        max_n = max(band_maxes) if band_maxes else 0
+        for (lo, hi, label), n_in_band in zip(_CALIBRATION_BANDS, band_maxes):
+            if n_in_band == 0:
+                continue
+            saved_in_band = sum(
+                1 for c, s in entry["confidences"]
+                if lo <= c <= hi and s in _ADVANCED_STATUSES
+            )
+            bar = _bar(n_in_band, max_n, width=12)
+            print(f"    {label:<10} {n_in_band:>4} {_pct(saved_in_band, n_in_band):>9}  {bar}")
+
+
+def _parse_usage_log(path: Path = _MODEL_USAGE_LOG) -> dict[tuple[str, str], dict]:
+    """Aggregate O-1's usage log into {(model, stage): {calls, tokens}}.
+
+    Log schema (pipe-delimited): timestamp|stage|model|tokens. Malformed lines
+    are skipped. Returns {} if the sink doesn't exist yet.
+    """
+    agg: dict[tuple[str, str], dict] = {}
+    if not path.exists():
+        return agg
+    for line in path.read_text(encoding="utf-8").splitlines():
+        parts = line.strip().split("|")
+        if len(parts) != 4:
+            continue
+        _ts, stage, model, tokens = parts
+        try:
+            tok = int(tokens)
+        except ValueError:
+            continue
+        entry = agg.setdefault((model, stage), {"calls": 0, "tokens": 0})
+        entry["calls"] += 1
+        entry["tokens"] += tok
+    return agg
+
+
+def _print_model_costs(path: Path = _MODEL_USAGE_LOG) -> None:
+    """Live cost view from O-1's token log, priced via eval/model_pricing."""
+    agg = _parse_usage_log(path)
+    print("\n  Live Model Cost (from logs/model_usage.log)")
+    print("  -------------------------------------------")
+    if not agg:
+        print(f"  No usage log yet at {path} — costs appear after LLM calls run.")
+        return
+    try:
+        from eval.model_pricing import PRICING_VERIFIED, cost_for_tokens
+    except ImportError:
+        cost_for_tokens = None
+        PRICING_VERIFIED = False
+
+    print(f"  {'Model':<32} {'Stage':<16} {'Calls':>6} {'Tokens':>10} {'Est $':>9}")
+    print(f"  {'-' * 32} {'-' * 16} {'-' * 6} {'-' * 10} {'-' * 9}")
+    total_cost = 0.0
+    any_priced = False
+    for (model, stage), e in sorted(agg.items(), key=lambda kv: -kv[1]["tokens"]):
+        cost = cost_for_tokens(model, e["tokens"]) if cost_for_tokens else None
+        if cost is not None:
+            total_cost += cost
+            any_priced = True
+        cost_str = f"${cost:.4f}" if cost is not None else "n/a"
+        print(f"  {model:<32} {stage:<16} {e['calls']:>6} {e['tokens']:>10,} {cost_str:>9}")
+    if any_priced:
+        note = "" if PRICING_VERIFIED else "  (UNVERIFIED pricing)"
+        print(f"  {'-' * 32}")
+        print(f"  Total est. spend logged: ${total_cost:.4f}{note}")
+
+
+def _print_cascade_summary(output_root: str = "output") -> None:
+    """Footer: O-3 cascade agreement rate (small Stage 5 vs. large post-research)."""
+    try:
+        from eval.cascade_agreement import summarize, walk
+    except ImportError:
+        return
+    try:
+        summary = summarize(walk(Path(output_root)))
+    except Exception:
+        return
+    if summary.get("n", 0) == 0:
+        return
+    stage5 = os.getenv("OPENROUTER_MODEL", "google/gemini-3.1-flash-lite")
+    print("\n  Cascade Agreement (O-3, autopilot rows only)")
+    print("  --------------------------------------------")
+    print(f"  Stage 5 slug:        {stage5}")
+    print(f"  Pairs analyzed:      {summary['n']}")
+    print(f"  Verdict agreement:   {summary['verdict_agreement_rate']:.1%}")
+    gap = summary.get("mean_confidence_gap")
+    if gap is not None:
+        print(f"  Mean confidence gap: {gap:+.1f}  (large − small; blind to false negatives)")
+
+
+def models_report(days: int | None = None) -> None:
+    """Print the per-model report: outcomes, calibration, live cost, cascade."""
+    with Database() as db:
+        breakdown = db.get_model_breakdown(max_age_days=days)
+
+    print()
+    print("  " + "═" * 56)
+    print("    APPLY-DAEMON MODEL REPORT")
+    label = f"Last {days} days" if days else "All-Time"
+    print(f"    ({label})")
+    print("  " + "═" * 56)
+
+    _print_model_breakdown(breakdown)
+    _print_model_costs()
+    _print_cascade_summary()
+    print()
+
+
 def report(days: int | None = None) -> None:
     """Generate and print the funnel report."""
     batch_days = _get_batch_days()
@@ -180,8 +336,17 @@ def main() -> None:
         default=None,
         help="Reference period in days (default: all-time)",
     )
+    parser.add_argument(
+        "--models",
+        action="store_true",
+        help="Show the per-model report (outcomes, calibration, cost, cascade) "
+             "instead of the funnel",
+    )
     args = parser.parse_args()
-    report(days=args.days)
+    if args.models:
+        models_report(days=args.days)
+    else:
+        report(days=args.days)
 
 
 if __name__ == "__main__":

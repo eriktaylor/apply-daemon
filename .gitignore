@@ -17,6 +17,7 @@ build/
 debug/
 output/
 data/
+logs/
 plans/
 .cache/
 .venv/
