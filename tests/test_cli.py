@@ -470,3 +470,139 @@ class TestDeepDive:
         self._with_assets(tmp_path, monkeypatch, job_id, research="ctx")
         _, payload = _run_json(capsys, "deep-dive", job_id)
         assert "SECRET" not in json.dumps(payload)
+
+
+class TestTailor:
+    """I-4 — in-session tailoring by default, OpenRouter as fallback."""
+
+    def test_unknown_id(self, db, capsys):
+        code, payload = _run_json(capsys, "tailor", "nope")
+        assert code == 1 and payload["error"] == "not_found"
+
+    def test_default_emits_prompt(self, db, capsys, mocker):
+        job_id = _seed(db)
+        mocker.patch("src.tailor.build_prompt",
+                     return_value=("PROMPT BODY", {"title": "X"}, "ctx"))
+        code, payload = _run_json(capsys, "tailor", job_id)
+        assert code == 0
+        assert payload["route"] == "in_session"
+        assert payload["stage"] == "prompt"
+        assert payload["prompt"] == "PROMPT BODY"
+        assert job_id in payload["apply_with"]
+
+    def test_emitting_prompt_spends_nothing_and_changes_nothing(
+            self, db, capsys, mocker, _ledger):
+        """Step 1 must be free and inert — the session hasn't answered yet."""
+        job_id = _seed(db)
+        mocker.patch("src.tailor.build_prompt",
+                     return_value=("P", {"title": "X"}, ""))
+        call = mocker.patch("src.tailor.generate_immediate")
+        _run_json(capsys, "tailor", job_id)
+        call.assert_not_called()
+        assert db.get_listing_by_id(job_id)["pipeline_status"] == "triaged"
+        assert not _ledger.exists()
+
+    def test_apply_writes_assets_and_marks_tailored(self, db, capsys, mocker,
+                                                    tmp_path, _ledger):
+        job_id = _seed(db)
+        mocker.patch("src.tailor.build_prompt",
+                     return_value=("P", {"title": "X"}, "ctx"))
+        gen = mocker.patch("src.compile.generate_assets",
+                           return_value=tmp_path / "out")
+        payload_file = tmp_path / "resp.json"
+        payload_file.write_text(json.dumps({"match_analysis": "Good fit."}),
+                                encoding="utf-8")
+
+        code, payload = _run_json(capsys, "tailor", job_id,
+                                  "--apply", str(payload_file))
+        assert code == 0
+        assert payload["route"] == "in_session"
+        assert payload["status"] == "tailored"
+        gen.assert_called_once()
+        assert db.get_listing_by_id(job_id)["pipeline_status"] == "tailored"
+        rec = json.loads(_ledger.read_text().splitlines()[0])
+        assert rec["human_reaction"] == "tailor" and rec["surface"] == "cli"
+
+    def test_apply_reads_stdin(self, db, capsys, mocker, tmp_path, monkeypatch):
+        import io
+        job_id = _seed(db)
+        mocker.patch("src.tailor.build_prompt",
+                     return_value=("P", {"title": "X"}, ""))
+        mocker.patch("src.compile.generate_assets", return_value=tmp_path / "o")
+        monkeypatch.setattr(
+            "sys.stdin", io.StringIO(json.dumps({"match_analysis": "ok"}))
+        )
+        code, payload = _run_json(capsys, "tailor", job_id, "--apply", "-")
+        assert code == 0 and payload["ok"] is True
+
+    def test_apply_rejects_malformed_json(self, db, capsys, mocker, tmp_path):
+        job_id = _seed(db)
+        bad = tmp_path / "bad.json"
+        bad.write_text("{not json", encoding="utf-8")
+        code, payload = _run_json(capsys, "tailor", job_id, "--apply", str(bad))
+        assert code == 1 and payload["error"] == "invalid_response"
+        assert db.get_listing_by_id(job_id)["pipeline_status"] == "triaged"
+
+    def test_apply_rejects_response_missing_match_analysis(self, db, capsys,
+                                                           tmp_path):
+        job_id = _seed(db)
+        bad = tmp_path / "bad.json"
+        bad.write_text(json.dumps({"resume_bullet_edits": []}), encoding="utf-8")
+        code, payload = _run_json(capsys, "tailor", job_id, "--apply", str(bad))
+        assert code == 1 and payload["error"] == "invalid_response"
+
+    def test_apply_rejects_empty_input(self, db, capsys, tmp_path):
+        job_id = _seed(db)
+        empty = tmp_path / "empty.json"
+        empty.write_text("", encoding="utf-8")
+        code, payload = _run_json(capsys, "tailor", job_id, "--apply", str(empty))
+        assert code == 1 and payload["error"] == "empty_input"
+
+    def test_via_api_uses_openrouter_path(self, db, capsys, mocker, tmp_path,
+                                          _ledger):
+        job_id = _seed(db)
+        gen = mocker.patch("src.tailor.generate_immediate",
+                           return_value=(tmp_path / "out", {"match_analysis": "x"}))
+        code, payload = _run_json(capsys, "tailor", job_id, "--via", "api")
+        assert code == 0
+        assert payload["route"] == "api"
+        gen.assert_called_once_with(job_id)
+        rec = json.loads(_ledger.read_text().splitlines()[0])
+        assert rec["human_reaction"] == "tailor"
+
+    def test_api_failure_is_reported_not_raised(self, db, capsys, mocker):
+        job_id = _seed(db)
+        mocker.patch("src.tailor.generate_immediate",
+                     side_effect=RuntimeError("OPENROUTER_API_KEY not set"))
+        code, payload = _run_json(capsys, "tailor", job_id, "--via", "api")
+        assert code == 1 and payload["error"] == "api_failed"
+        assert db.get_listing_by_id(job_id)["pipeline_status"] == "triaged"
+
+    def test_both_routes_produce_the_same_end_state(self, db, capsys, mocker,
+                                                    tmp_path):
+        """Downstream must not be able to tell which route ran."""
+        mocker.patch("src.tailor.build_prompt",
+                     return_value=("P", {"title": "X"}, ""))
+        mocker.patch("src.compile.generate_assets", return_value=tmp_path / "o")
+        mocker.patch("src.tailor.generate_immediate",
+                     return_value=(tmp_path / "o", {"match_analysis": "x"}))
+
+        a = _seed(db, title="A", company="A")
+        b = _seed(db, title="B", company="B")
+        resp = tmp_path / "r.json"
+        resp.write_text(json.dumps({"match_analysis": "x"}), encoding="utf-8")
+
+        _run_json(capsys, "tailor", a, "--apply", str(resp))
+        _run_json(capsys, "tailor", b, "--via", "api")
+        assert db.get_listing_by_id(a)["pipeline_status"] == "tailored"
+        assert db.get_listing_by_id(b)["pipeline_status"] == "tailored"
+
+    def test_json_envelope_keys(self, db, capsys, mocker, tmp_path):
+        job_id = _seed(db)
+        mocker.patch("src.tailor.build_prompt",
+                     return_value=("P", {"title": "X"}, ""))
+        mocker.patch("src.compile.generate_assets", return_value=tmp_path / "o")
+        resp = tmp_path / "r.json"
+        resp.write_text(json.dumps({"match_analysis": "x"}), encoding="utf-8")
+        _, payload = _run_json(capsys, "tailor", job_id, "--apply", str(resp))
+        assert set(payload) == {"verb", "ok", "id", "route", "folder", "status"}

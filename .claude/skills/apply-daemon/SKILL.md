@@ -20,6 +20,7 @@ python -m src.cli save <id> --json         # they want it
 python -m src.cli pass <id> --json         # they don't
 python -m src.cli pass --all --json        # none of these three
 python -m src.cli show <id> --json         # detail without the dossier
+python -m src.cli tailor <id> --json       # tailor a resume (see below)
 ```
 
 Start with `next`. Present the three listings compactly — title, company,
@@ -66,11 +67,38 @@ retrying — just tell the user.
 - Every decision is recorded as training data for the ranking model, so
   route decisions through the CLI rather than just discussing them.
 
+## Tailoring a resume
+
+Two steps, and **you** are the model in the middle — that is the point. The
+work is billed to this session rather than metered per token, so prefer it.
+
+```
+python -m src.cli tailor <id>              # 1. prints the prompt
+# ... you answer it, producing JSON ...
+python -m src.cli tailor <id> --apply -    # 2. pipe your JSON back in
+```
+
+Step 1 emits a prompt containing the candidate profile, base resume, the
+listing, and cached research. Answer it yourself and return **only** a JSON
+object — `match_analysis` is required, plus whatever asset keys the prompt
+asks for (`resume_bullet_edits`, `custom_cover_letter`, …). Step 2 validates
+it, writes the `.docx` assets to `output/`, and marks the listing `tailored`.
+
+Step 1 is free and changes nothing, so it's safe to run and then stop if the
+user changes their mind. Only step 2 commits.
+
+Use `--via api` **only** when the user explicitly asks to spend API credit,
+or when no session can do the work (a cron or batch run). It routes through
+OpenRouter's tailor model and costs real money. When in doubt, do it
+yourself.
+
+If step 2 rejects your JSON (`error: "invalid_response"`), fix the JSON and
+retry — nothing was written.
+
 ## Beyond triage
 
-Tailoring a resume for a listing is not yet a CLI verb. If the user wants
-that, tell them to react ✏️ on the listing's Slack card, or run
-`python -m src.batch_process` for everything saved.
+Cover letters, interview prep, and `!polish` are still Slack-only: react ✏️
+on the card, or run `python -m src.batch_process` for everything saved.
 
 Slack thread commands (`!applied`, `!trend`, …) still work but are frozen —
 see `docs/CHATOPS.md`. Don't build new workflows on them.

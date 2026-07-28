@@ -9,6 +9,9 @@ are testable in-process:
     python -m src.cli save <id>           # → saved
     python -m src.cli pass <id>           # → passed
     python -m src.cli pass --all          # pass the whole current page
+    python -m src.cli tailor <id>         # emit prompt for in-session tailoring
+    python -m src.cli tailor <id> --apply -   # write assets from model JSON
+    python -m src.cli tailor <id> --via api   # fall back to OpenRouter
 
 Every verb accepts ``--json``. The skill parses that; prose output is for
 humans only, so changing wording never breaks the interface. The JSON schema
@@ -340,6 +343,96 @@ def cmd_deep_dive(db: Database, job_id: str, as_json: bool) -> int:
     return 0
 
 
+def cmd_tailor(db: Database, job_id: str, *, apply_from: str | None,
+               via_api: bool, as_json: bool) -> int:
+    """Tailor a resume — in-session by default, via OpenRouter on request.
+
+    Tailoring is one big prompt and one big completion. `tailor.py` already
+    separates the three stages (build_prompt → LLM → generate_assets), so the
+    middle stage can be served by whoever is cheapest:
+
+    - **default (in-session):** emit the prompt, let the calling Claude
+      session answer it, then `--apply` the JSON back. Subscription-billed,
+      so the marginal token cost is zero.
+    - **``--via api``:** the original path through OPENROUTER_TAILOR_MODEL.
+      Metered, but works headless — cron, batch, no session attached.
+
+    Assets land in ``output/`` and the listing reaches ``tailored`` on either
+    route, so downstream (batch_process, the eval harness, Slack) can't tell
+    which was used.
+    """
+    # Imported lazily: tailor pulls openai + dotenv at import time, and the
+    # read verbs must stay instant.
+    from src.tailor import (
+        _parse_tailor_response,
+        build_prompt,
+        generate_immediate,
+    )
+
+    row = db.get_listing_by_id(job_id)
+    if row is None:
+        _emit({"verb": "tailor", "ok": False, "error": "not_found", "id": job_id},
+              as_json, f"No listing with id {job_id}")
+        return 1
+
+    if via_api:
+        try:
+            folder, parsed = generate_immediate(job_id)
+        except Exception as exc:
+            logger.error("Tailor via API failed for %s: %s", job_id[:8], exc)
+            _emit({"verb": "tailor", "ok": False, "error": "api_failed",
+                   "id": job_id, "detail": str(exc)},
+                  as_json, f"Tailoring failed: {exc}")
+            return 1
+        # generate_immediate already sets this on its own connection; repeating
+        # it here is idempotent and keeps the verb's contract self-contained —
+        # "ok means tailored" shouldn't depend on a callee's side effect.
+        db.update_pipeline_status(job_id, "tailored")
+        append_human_label(job_id, "tailor", dict(row), surface=SURFACE_CLI)
+        _emit({"verb": "tailor", "ok": True, "id": job_id, "route": "api",
+               "folder": str(folder), "status": "tailored"},
+              as_json, f"Tailored via OpenRouter → {folder}")
+        return 0
+
+    if apply_from is not None:
+        raw = sys.stdin.read() if apply_from == "-" else _read_text(Path(apply_from))
+        if not raw:
+            _emit({"verb": "tailor", "ok": False, "error": "empty_input",
+                   "id": job_id},
+                  as_json, "No JSON received to apply.")
+            return 1
+        try:
+            parsed = _parse_tailor_response(raw)
+        except RuntimeError as exc:
+            _emit({"verb": "tailor", "ok": False, "error": "invalid_response",
+                   "id": job_id, "detail": str(exc)},
+                  as_json, f"Could not apply: {exc}")
+            return 1
+
+        from src.compile import generate_assets
+        _, listing, research_context = build_prompt(job_id)
+        folder = generate_assets(job_id, parsed, listing,
+                                 research_context=research_context)
+        db.update_pipeline_status(job_id, "tailored")
+        append_human_label(job_id, "tailor", dict(row), surface=SURFACE_CLI)
+        _emit({"verb": "tailor", "ok": True, "id": job_id, "route": "in_session",
+               "folder": str(folder), "status": "tailored"},
+              as_json, f"Tailored in-session → {folder}")
+        return 0
+
+    # Default: emit the prompt for the session to answer.
+    prompt, listing, _ = build_prompt(job_id)
+    _emit(
+        {"verb": "tailor", "ok": True, "id": job_id, "route": "in_session",
+         "stage": "prompt", "prompt": prompt,
+         "apply_with": f"python -m src.cli tailor {job_id} --apply -"},
+        as_json,
+        f"{prompt}\n\n---\nAnswer the above as JSON, then pipe it to:\n"
+        f"  python -m src.cli tailor {job_id} --apply -",
+    )
+    return 0
+
+
 def _decide(db: Database, row: sqlite3.Row, verb: str, *, bulk: bool) -> bool:
     """Apply one decision: pipeline_status + ledger. True if the status moved.
 
@@ -438,6 +531,17 @@ def build_parser() -> argparse.ArgumentParser:
                             help="Full detail: post-research verdict + dossier")
     p_dive.add_argument("id")
 
+    p_tailor = sub.add_parser(
+        "tailor", parents=[common],
+        help="Tailor a resume (in-session by default; --via api to spend tokens)")
+    p_tailor.add_argument("id")
+    p_tailor.add_argument(
+        "--apply", dest="apply_from", metavar="PATH",
+        help="Apply model JSON from PATH ('-' for stdin) and write assets")
+    p_tailor.add_argument(
+        "--via", choices=("session", "api"), default="session",
+        help="session (default, subscription-billed) or api (OpenRouter)")
+
     for verb, helptext in (("save", "Mark a listing saved"),
                            ("pass", "Mark a listing passed")):
         p = sub.add_parser(verb, parents=[common], help=helptext)
@@ -466,6 +570,9 @@ def main(argv: list[str] | None = None) -> int:
             return cmd_show(db, args.id, args.json)
         if args.verb == "deep-dive":
             return cmd_deep_dive(db, args.id, args.json)
+        if args.verb == "tailor":
+            return cmd_tailor(db, args.id, apply_from=args.apply_from,
+                              via_api=args.via == "api", as_json=args.json)
         return cmd_decide(db, args.verb, args.id, args.all, args.json)
     finally:
         db.close()
