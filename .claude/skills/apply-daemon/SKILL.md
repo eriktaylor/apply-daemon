@@ -87,6 +87,11 @@ it, writes the `.docx` assets to `output/`, and marks the listing `tailored`.
 Step 1 is free and changes nothing, so it's safe to run and then stop if the
 user changes their mind. Only step 2 commits.
 
+Research in the prompt comes from the cached dossier only
+(`research_cached` in the JSON says which). If the prompt says none is
+available, that is not an error — tailor from the job description, or use
+`--via api` if the user explicitly wants live research (metered).
+
 Use `--via api` **only** when the user explicitly asks to spend API credit,
 or when no session can do the work (a cron or batch run). It routes through
 OpenRouter's tailor model and costs real money. When in doubt, do it

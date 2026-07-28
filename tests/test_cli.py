@@ -606,3 +606,61 @@ class TestTailor:
         resp.write_text(json.dumps({"match_analysis": "x"}), encoding="utf-8")
         _, payload = _run_json(capsys, "tailor", job_id, "--apply", str(resp))
         assert set(payload) == {"verb", "ok", "id", "route", "folder", "status"}
+
+
+class TestTailorNeverSpendsInSession:
+    """Regression: build_prompt runs LIVE Deep Research (network + tokens)
+    whenever research_context_override is empty (tailor.py:255). The
+    in-session route must always pass a non-empty override — cached dossier
+    or placeholder — on BOTH steps. Found by audit, hidden by earlier tests
+    that mocked build_prompt without asserting its arguments."""
+
+    def _cache(self, tmp_path, job_id, text="CACHED DOSSIER"):
+        folder = tmp_path / "output" / f"Acme_Role_{job_id[:8]}"
+        folder.mkdir(parents=True)
+        (folder / "deep_research_context.txt").write_text(text, encoding="utf-8")
+
+    def test_prompt_step_passes_nonempty_override(self, db, capsys, mocker):
+        job_id = _seed(db)  # no cache on disk
+        bp = mocker.patch("src.tailor.build_prompt",
+                          return_value=("P", {"title": "X"}, ""))
+        _, payload = _run_json(capsys, "tailor", job_id)
+        override = bp.call_args.kwargs["research_context_override"]
+        assert override  # non-empty → tailor skips run_deep_research
+        assert payload["research_cached"] is False
+
+    def test_prompt_step_uses_cached_dossier(self, db, capsys, mocker, tmp_path):
+        job_id = _seed(db)
+        self._cache(tmp_path, job_id)
+        bp = mocker.patch("src.tailor.build_prompt",
+                          return_value=("P", {"title": "X"}, ""))
+        _, payload = _run_json(capsys, "tailor", job_id)
+        assert bp.call_args.kwargs["research_context_override"] == "CACHED DOSSIER"
+        assert payload["research_cached"] is True
+
+    def test_apply_step_passes_nonempty_override(self, db, capsys, mocker,
+                                                 tmp_path):
+        job_id = _seed(db)  # no cache
+        bp = mocker.patch("src.tailor.build_prompt",
+                          return_value=("P", {"title": "X"}, ""))
+        gen = mocker.patch("src.compile.generate_assets",
+                           return_value=tmp_path / "o")
+        resp = tmp_path / "r.json"
+        resp.write_text(json.dumps({"match_analysis": "x"}), encoding="utf-8")
+        _run_json(capsys, "tailor", job_id, "--apply", str(resp))
+        assert bp.call_args.kwargs["research_context_override"]
+        # Training dump gets the real cache ("" here), never the placeholder.
+        assert gen.call_args.kwargs["research_context"] == ""
+
+    def test_apply_step_dumps_real_cache_to_training_data(self, db, capsys,
+                                                          mocker, tmp_path):
+        job_id = _seed(db)
+        self._cache(tmp_path, job_id, "REAL RESEARCH")
+        mocker.patch("src.tailor.build_prompt",
+                     return_value=("P", {"title": "X"}, ""))
+        gen = mocker.patch("src.compile.generate_assets",
+                           return_value=tmp_path / "o")
+        resp = tmp_path / "r.json"
+        resp.write_text(json.dumps({"match_analysis": "x"}), encoding="utf-8")
+        _run_json(capsys, "tailor", job_id, "--apply", str(resp))
+        assert gen.call_args.kwargs["research_context"] == "REAL RESEARCH"

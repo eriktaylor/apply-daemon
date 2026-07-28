@@ -111,6 +111,24 @@ def _research_cached(job_id: str) -> bool:
     return bool(folder and (folder / RESEARCH_FILE).exists())
 
 
+def _cached_research(job_id: str) -> str:
+    """Return the cached Deep Research dossier, or "" when none exists."""
+    folder = _output_folder(job_id)
+    if folder:
+        return _read_text(folder / RESEARCH_FILE) or ""
+    return ""
+
+
+# Passed to build_prompt when no dossier is cached. Must be NON-EMPTY:
+# build_prompt treats an empty research_context_override as "run Deep
+# Research live" (tailor.py:255), which is a token-spending network call —
+# exactly what the in-session route promises not to make.
+_NO_RESEARCH_PLACEHOLDER = (
+    "(No cached company research is available for this listing. "
+    "Ground the analysis in the job description alone.)"
+)
+
+
 def _read_text(path: Path) -> str | None:
     try:
         return path.read_text(encoding="utf-8", errors="replace").strip()
@@ -353,9 +371,11 @@ def cmd_tailor(db: Database, job_id: str, *, apply_from: str | None,
 
     - **default (in-session):** emit the prompt, let the calling Claude
       session answer it, then `--apply` the JSON back. Subscription-billed,
-      so the marginal token cost is zero.
-    - **``--via api``:** the original path through OPENROUTER_TAILOR_MODEL.
-      Metered, but works headless — cron, batch, no session attached.
+      zero metered cost — which is why research is read from the cache only
+      and NEVER run live on this route (see _NO_RESEARCH_PLACEHOLDER).
+    - **``--via api``:** the original path through OPENROUTER_TAILOR_MODEL,
+      including live Deep Research when uncached. Metered, but works
+      headless — cron, batch, no session attached.
 
     Assets land in ``output/`` and the listing reaches ``tailored`` on either
     route, so downstream (batch_process, the eval harness, Slack) can't tell
@@ -410,9 +430,13 @@ def cmd_tailor(db: Database, job_id: str, *, apply_from: str | None,
             return 1
 
         from src.compile import generate_assets
-        _, listing, research_context = build_prompt(job_id)
+        research = _cached_research(job_id)
+        _, listing, _ = build_prompt(
+            job_id,
+            research_context_override=research or _NO_RESEARCH_PLACEHOLDER,
+        )
         folder = generate_assets(job_id, parsed, listing,
-                                 research_context=research_context)
+                                 research_context=research)
         db.update_pipeline_status(job_id, "tailored")
         append_human_label(job_id, "tailor", dict(row), surface=SURFACE_CLI)
         _emit({"verb": "tailor", "ok": True, "id": job_id, "route": "in_session",
@@ -420,11 +444,18 @@ def cmd_tailor(db: Database, job_id: str, *, apply_from: str | None,
               as_json, f"Tailored in-session → {folder}")
         return 0
 
-    # Default: emit the prompt for the session to answer.
-    prompt, listing, _ = build_prompt(job_id)
+    # Default: emit the prompt for the session to answer. Research comes
+    # from the cache only — the in-session route never spends tokens, so a
+    # missing dossier is reported, not repaired (--via api runs it live).
+    research = _cached_research(job_id)
+    prompt, listing, _ = build_prompt(
+        job_id,
+        research_context_override=research or _NO_RESEARCH_PLACEHOLDER,
+    )
     _emit(
         {"verb": "tailor", "ok": True, "id": job_id, "route": "in_session",
          "stage": "prompt", "prompt": prompt,
+         "research_cached": bool(research),
          "apply_with": f"python -m src.cli tailor {job_id} --apply -"},
         as_json,
         f"{prompt}\n\n---\nAnswer the above as JSON, then pipe it to:\n"
