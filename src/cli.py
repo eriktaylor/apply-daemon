@@ -5,6 +5,7 @@ are testable in-process:
 
     python -m src.cli next [--top 3]      # next page of candidates
     python -m src.cli show <id>           # one listing in full
+    python -m src.cli deep-dive <id>      # + post-research verdict, dossier
     python -m src.cli save <id>           # → saved
     python -m src.cli pass <id>           # → passed
     python -m src.cli pass --all          # pass the whole current page
@@ -43,6 +44,8 @@ from src.human_labels import SURFACE_CLI, append_human_label
 logger = logging.getLogger(__name__)
 
 OUTPUT_DIR = Path("output")
+RESEARCH_FILE = "deep_research_context.txt"
+AUTO_ASSETS_FILE = "auto_assets.json"
 
 # Minutes a presented page stays "current". Long enough that `next` pages
 # forward across a working sitting; short enough that a listing skipped this
@@ -84,19 +87,89 @@ def _json_list(raw: object) -> list:
     return parsed if isinstance(parsed, list) else []
 
 
-def _research_cached(job_id: str) -> bool:
-    """True when a Deep Research dossier already exists for this job.
+def _output_folder(job_id: str) -> Path | None:
+    """Locate this job's asset folder.
 
     Mirrors tailor._find_existing_output's ``job_id[:8]`` folder convention,
     reimplemented here so the CLI doesn't import tailor (which pulls openai
     and dotenv at import time and would slow every invocation).
     """
     if not OUTPUT_DIR.exists():
-        return False
+        return None
     for folder in OUTPUT_DIR.iterdir():
         if folder.is_dir() and job_id[:8] in folder.name:
-            return (folder / "deep_research_context.txt").exists()
-    return False
+            return folder
+    return None
+
+
+def _research_cached(job_id: str) -> bool:
+    """True when a Deep Research dossier already exists for this job."""
+    folder = _output_folder(job_id)
+    return bool(folder and (folder / RESEARCH_FILE).exists())
+
+
+def _read_text(path: Path) -> str | None:
+    try:
+        return path.read_text(encoding="utf-8", errors="replace").strip()
+    except OSError:
+        return None
+
+
+def _skill_list(raw: object) -> list:
+    """Parse a skills value that may be a list, a JSON string, or junk.
+
+    ``updated_skills_match`` values arrive as either shape depending on which
+    model wrote them, so both are accepted.
+    """
+    if isinstance(raw, list):
+        return [str(s) for s in raw]
+    if isinstance(raw, str):
+        return _json_list(raw)
+    return []
+
+
+def _post_research(folder: Path, triage_confidence: int | None) -> dict | None:
+    """Read autopilot's post-research re-score, if autopilot has run.
+
+    This is the large model's verdict after reading the research dossier, and
+    it frequently disagrees with the Stage 5 score shown in `next` — that
+    disagreement is the main thing a deep-dive exists to surface, so the
+    delta is computed rather than left for the reader to eyeball.
+    """
+    raw = _read_text(folder / AUTO_ASSETS_FILE)
+    if not raw:
+        return None
+    try:
+        data = json.loads(raw)
+    except json.JSONDecodeError:
+        logger.warning("Malformed %s in %s", AUTO_ASSETS_FILE, folder.name)
+        return None
+    if not isinstance(data, dict):
+        return None
+
+    skills = data.get("updated_skills_match") or {}
+    if not isinstance(skills, dict):
+        skills = {}
+
+    verdict = data.get("post_research_verdict")
+    confidence = data.get("post_research_confidence")
+    try:
+        confidence = int(confidence) if confidence is not None else None
+    except (TypeError, ValueError):
+        confidence = None
+
+    delta = None
+    if confidence is not None and triage_confidence is not None:
+        delta = confidence - triage_confidence
+
+    return {
+        "verdict": verdict,
+        "confidence": confidence,
+        "confidence_delta": delta,
+        "match_analysis": data.get("match_analysis"),
+        "matching_skills": _skill_list(skills.get("matching")),
+        "missing_skills": _skill_list(skills.get("missing")),
+    }
 
 
 def _tier_of(row: sqlite3.Row) -> str:
@@ -202,6 +275,71 @@ def cmd_show(db: Database, job_id: str, as_json: bool) -> int:
     return 0
 
 
+def cmd_deep_dive(db: Database, job_id: str, as_json: bool) -> int:
+    """Everything known about one listing, from local cache only.
+
+    Never runs Deep Research on a miss: that is a multi-second, token-spending
+    network call, and this verb sits inside a conversational loop. A miss is
+    reported so the user can choose.
+    """
+    row = db.get_listing_by_id(job_id)
+    if row is None:
+        _emit(
+            {"verb": "deep-dive", "ok": False, "error": "not_found", "id": job_id},
+            as_json,
+            f"No listing with id {job_id}",
+        )
+        return 1
+
+    card = _card(row, detail=True)
+    folder = _output_folder(row["id"])
+    context = _read_text(folder / RESEARCH_FILE) if folder else None
+    post = _post_research(folder, row["confidence"]) if folder else None
+
+    payload = {
+        "verb": "deep-dive",
+        "ok": True,
+        "listing": card,
+        "research": {
+            "cached": context is not None,
+            "folder": str(folder) if folder else None,
+            "context": context,
+        },
+        "post_research": post,
+    }
+
+    human = [_fmt_card(card)]
+    if card.get("job_summary"):
+        human.append(card["job_summary"])
+    if card.get("reason"):
+        human.append(f"Stage 5 ({card['confidence']}%): {card['reason']}")
+
+    if post:
+        delta = post["confidence_delta"]
+        arrow = ""
+        if delta is not None:
+            arrow = f" ({delta:+d} vs Stage 5)"
+        human.append(
+            f"Post-research: {post['verdict']} {post['confidence']}%{arrow}"
+        )
+        if post["match_analysis"]:
+            human.append(post["match_analysis"])
+        if post["matching_skills"]:
+            human.append("Matching: " + ", ".join(post["matching_skills"]))
+        if post["missing_skills"]:
+            human.append("Missing:  " + ", ".join(post["missing_skills"]))
+    if context:
+        human.append(f"--- Research dossier ({folder.name}) ---\n{context}")
+    else:
+        human.append(
+            "No research cached for this listing — autopilot hasn't reached it. "
+            "Ask if you want it researched."
+        )
+
+    _emit(payload, as_json, "\n\n".join(human))
+    return 0
+
+
 def _decide(db: Database, row: sqlite3.Row, verb: str, *, bulk: bool) -> bool:
     """Apply one decision: pipeline_status + ledger. True if the status moved.
 
@@ -296,6 +434,10 @@ def build_parser() -> argparse.ArgumentParser:
                             help="Show one listing in full")
     p_show.add_argument("id")
 
+    p_dive = sub.add_parser("deep-dive", parents=[common],
+                            help="Full detail: post-research verdict + dossier")
+    p_dive.add_argument("id")
+
     for verb, helptext in (("save", "Mark a listing saved"),
                            ("pass", "Mark a listing passed")):
         p = sub.add_parser(verb, parents=[common], help=helptext)
@@ -322,6 +464,8 @@ def main(argv: list[str] | None = None) -> int:
             return cmd_next(db, args.top, args.json)
         if args.verb == "show":
             return cmd_show(db, args.id, args.json)
+        if args.verb == "deep-dive":
+            return cmd_deep_dive(db, args.id, args.json)
         return cmd_decide(db, args.verb, args.id, args.all, args.json)
     finally:
         db.close()

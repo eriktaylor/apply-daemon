@@ -326,3 +326,147 @@ class TestSessionWindow:
         db.conn.commit()
         # Not stranded: an undecided listing comes back around.
         assert _run_json(capsys, "next")[1]["count"] == 1
+
+
+class TestDeepDive:
+    """I-2 — full detail from local cache only; never spends tokens."""
+
+    def _with_assets(self, tmp_path, monkeypatch, job_id, *, research=None,
+                     auto=None):
+        import src.cli as cli
+        out = tmp_path / "output"
+        folder = out / f"Acme_Role_{job_id[:8]}"
+        folder.mkdir(parents=True)
+        if research is not None:
+            (folder / "deep_research_context.txt").write_text(research,
+                                                              encoding="utf-8")
+        if auto is not None:
+            (folder / "auto_assets.json").write_text(json.dumps(auto),
+                                                     encoding="utf-8")
+        monkeypatch.setattr(cli, "OUTPUT_DIR", out)
+        return folder
+
+    def test_unknown_id(self, db, capsys):
+        code, payload = _run_json(capsys, "deep-dive", "nope")
+        assert code == 1 and payload["error"] == "not_found"
+
+    def test_cache_miss_is_not_an_error(self, db, capsys):
+        job_id = _seed(db)
+        code, payload = _run_json(capsys, "deep-dive", job_id)
+        assert code == 0 and payload["ok"] is True
+        assert payload["research"] == {"cached": False, "folder": None,
+                                       "context": None}
+        assert payload["post_research"] is None
+
+    def test_cache_miss_human_output_offers(self, db, capsys):
+        job_id = _seed(db)
+        _, out = _run(capsys, "deep-dive", job_id)
+        assert "No research cached" in out
+
+    def test_returns_cached_dossier(self, db, capsys, tmp_path, monkeypatch):
+        job_id = _seed(db)
+        self._with_assets(tmp_path, monkeypatch, job_id,
+                          research="Acme builds synthetic widgets.")
+        _, payload = _run_json(capsys, "deep-dive", job_id)
+        assert payload["research"]["cached"] is True
+        assert "synthetic widgets" in payload["research"]["context"]
+
+    def test_surfaces_post_research_verdict(self, db, capsys, tmp_path,
+                                            monkeypatch):
+        job_id = _seed(db, confidence=95)
+        self._with_assets(tmp_path, monkeypatch, job_id, research="ctx", auto={
+            "post_research_verdict": "MAYBE",
+            "post_research_confidence": 22,
+            "match_analysis": "Weaker than the listing implies.",
+            "updated_skills_match": {"matching": ["Python"], "missing": ["Rust"]},
+        })
+        _, payload = _run_json(capsys, "deep-dive", job_id)
+        post = payload["post_research"]
+        assert post["verdict"] == "MAYBE"
+        assert post["confidence"] == 22
+        assert post["matching_skills"] == ["Python"]
+        assert post["missing_skills"] == ["Rust"]
+
+    def test_computes_confidence_delta(self, db, capsys, tmp_path, monkeypatch):
+        """The disagreement is the point of the verb — don't make the reader
+        subtract two numbers in their head."""
+        job_id = _seed(db, confidence=95)
+        self._with_assets(tmp_path, monkeypatch, job_id, research="ctx", auto={
+            "post_research_verdict": "MAYBE", "post_research_confidence": 22,
+        })
+        _, payload = _run_json(capsys, "deep-dive", job_id)
+        assert payload["post_research"]["confidence_delta"] == -73
+
+    def test_delta_shown_in_human_output(self, db, capsys, tmp_path, monkeypatch):
+        job_id = _seed(db, confidence=90)
+        self._with_assets(tmp_path, monkeypatch, job_id, research="ctx", auto={
+            "post_research_verdict": "YES", "post_research_confidence": 80,
+        })
+        _, out = _run(capsys, "deep-dive", job_id)
+        assert "-10 vs Stage 5" in out
+
+    def test_skills_as_json_string_shape(self, db, capsys, tmp_path, monkeypatch):
+        """updated_skills_match values arrive as a list or a JSON string
+        depending on which model wrote them."""
+        job_id = _seed(db)
+        self._with_assets(tmp_path, monkeypatch, job_id, research="ctx", auto={
+            "updated_skills_match": {"matching": json.dumps(["Python", "ML"])},
+        })
+        _, payload = _run_json(capsys, "deep-dive", job_id)
+        assert payload["post_research"]["matching_skills"] == ["Python", "ML"]
+
+    def test_malformed_auto_assets_degrades(self, db, capsys, tmp_path,
+                                            monkeypatch):
+        job_id = _seed(db)
+        folder = self._with_assets(tmp_path, monkeypatch, job_id, research="ctx")
+        (folder / "auto_assets.json").write_text("{not json", encoding="utf-8")
+        code, payload = _run_json(capsys, "deep-dive", job_id)
+        assert code == 0
+        assert payload["post_research"] is None
+        assert payload["research"]["cached"] is True  # dossier still usable
+
+    def test_research_without_autopilot_assets(self, db, capsys, tmp_path,
+                                               monkeypatch):
+        job_id = _seed(db)
+        self._with_assets(tmp_path, monkeypatch, job_id, research="ctx only")
+        _, payload = _run_json(capsys, "deep-dive", job_id)
+        assert payload["research"]["cached"] is True
+        assert payload["post_research"] is None
+
+    def test_does_not_mark_presented(self, db, capsys):
+        """deep-dive is a detail view, not a page — it must not consume the
+        listing from the review queue."""
+        job_id = _seed(db)
+        _run_json(capsys, "deep-dive", job_id)
+        assert db.get_listing_by_id(job_id)["presented_at"] is None
+
+    def test_no_state_change(self, db, capsys, _ledger):
+        job_id = _seed(db)
+        _run_json(capsys, "deep-dive", job_id)
+        assert db.get_listing_by_id(job_id)["pipeline_status"] == "triaged"
+        assert not _ledger.exists()  # read-only: no ledger row
+
+    def test_json_envelope_keys(self, db, capsys):
+        job_id = _seed(db)
+        _, payload = _run_json(capsys, "deep-dive", job_id)
+        assert set(payload) == {"verb", "ok", "listing", "research",
+                                "post_research"}
+        assert set(payload["research"]) == {"cached", "folder", "context"}
+
+    def test_post_research_keys(self, db, capsys, tmp_path, monkeypatch):
+        job_id = _seed(db)
+        self._with_assets(tmp_path, monkeypatch, job_id, research="c", auto={
+            "post_research_verdict": "YES", "post_research_confidence": 70,
+        })
+        _, payload = _run_json(capsys, "deep-dive", job_id)
+        assert set(payload["post_research"]) == {
+            "verdict", "confidence", "confidence_delta", "match_analysis",
+            "matching_skills", "missing_skills",
+        }
+
+    def test_raw_email_text_never_emitted(self, db, capsys, tmp_path,
+                                          monkeypatch):
+        job_id = _seed(db, raw_email_text="SECRET body")
+        self._with_assets(tmp_path, monkeypatch, job_id, research="ctx")
+        _, payload = _run_json(capsys, "deep-dive", job_id)
+        assert "SECRET" not in json.dumps(payload)
