@@ -6,7 +6,7 @@
 # Personal/user-installed Claude Code skills stay local. The apply-daemon
 # skill is shipped product (it drives src/cli.py) — same negation idiom as
 # my_profile_example below.
-.claude/skills/
+.claude/skills/*
 !.claude/skills/apply-daemon/
 my_profile/
 /my_profile_*

@@ -864,3 +864,150 @@ class TestLocationOrdering:
         self._bucket(db, queued, 0)
         _, payload = _run_json(capsys, "next")
         assert payload["listings"][0]["id"] == auto
+
+
+class TestRefreshVerb:
+    """C-2 — the only money-spending verb. Every test mocks subprocess; none
+    of these may actually launch a pipeline stage."""
+
+    @pytest.fixture(autouse=True)
+    def _budget_env(self, tmp_path, monkeypatch):
+        monkeypatch.setenv("RUN_LOG_PATH", str(tmp_path / "run_log"))
+        monkeypatch.setenv("MODEL_USAGE_LOG_PATH", str(tmp_path / "usage.log"))
+        for k in ("DAILY_USD_BUDGET", "MIN_RUN_INTERVAL_MINUTES",
+                  "RUN_USD_ESTIMATE", "BUDGET_ALLOW_UNPRICED"):
+            monkeypatch.delenv(k, raising=False)
+
+    def _ok(self, mocker):
+        import subprocess
+        return mocker.patch("subprocess.run", return_value=subprocess.CompletedProcess(
+            args=[], returncode=0, stdout="", stderr=""))
+
+    def test_runs_every_stage_in_order(self, db, capsys, mocker):
+        from src.cli import REFRESH_STAGES
+        run = self._ok(mocker)
+        code, payload = _run_json(capsys, "refresh")
+        assert code == 0 and payload["ok"] is True
+        assert [s["module"] for s in payload["stages"]] == [m for _, m in REFRESH_STAGES]
+        assert run.call_count == len(REFRESH_STAGES)
+
+    def test_records_the_run_before_stages(self, db, capsys, mocker):
+        """Cooldown must apply to an attempt, not only a success — otherwise a
+        crashing run can be retried without limit."""
+        from src.budget import last_run_at
+        self._ok(mocker)
+        assert last_run_at() is None
+        _run_json(capsys, "refresh")
+        assert last_run_at() is not None
+
+    def test_blocked_by_cooldown(self, db, capsys, mocker, monkeypatch):
+        from src.budget import record_run
+        monkeypatch.setenv("MIN_RUN_INTERVAL_MINUTES", "60")
+        record_run("prior")
+        run = self._ok(mocker)
+        code, payload = _run_json(capsys, "refresh")
+        assert code == 1 and payload["error"] == "budget_blocked"
+        assert "Cooldown" in payload["reason"]
+        run.assert_not_called()          # nothing spent
+
+    def test_force_overrides_the_block(self, db, capsys, mocker, monkeypatch):
+        from src.budget import record_run
+        monkeypatch.setenv("MIN_RUN_INTERVAL_MINUTES", "60")
+        record_run("prior")
+        run = self._ok(mocker)
+        code, payload = _run_json(capsys, "refresh", "--force")
+        assert code == 0 and payload["ok"] is True
+        assert run.call_count > 0
+
+    def test_dry_run_spends_nothing_and_records_nothing(self, db, capsys, mocker):
+        from src.budget import last_run_at
+        run = self._ok(mocker)
+        code, payload = _run_json(capsys, "refresh", "--dry-run")
+        assert code == 0 and payload["dry_run"] is True
+        assert payload["would_run"]
+        run.assert_not_called()
+        assert last_run_at() is None
+
+    def test_dry_run_reports_a_block_without_failing(self, db, capsys, mocker,
+                                                     monkeypatch):
+        from src.budget import record_run
+        monkeypatch.setenv("MIN_RUN_INTERVAL_MINUTES", "60")
+        record_run("prior")
+        self._ok(mocker)
+        code, payload = _run_json(capsys, "refresh", "--dry-run")
+        assert code == 0
+        assert payload["allowed"] is False
+
+    def test_stops_at_first_failing_stage(self, db, capsys, mocker):
+        import subprocess
+        outcomes = [
+            subprocess.CompletedProcess(args=[], returncode=0, stdout="", stderr=""),
+            subprocess.CompletedProcess(args=[], returncode=1, stdout="", stderr="boom"),
+        ]
+        run = mocker.patch("subprocess.run", side_effect=outcomes)
+        code, payload = _run_json(capsys, "refresh")
+        assert code == 1 and payload["ok"] is False
+        assert payload["failed_stage"] == payload["stages"][-1]["stage"]
+        assert run.call_count == 2       # later stages skipped
+
+    def test_top_n_overrides_env_for_this_run_only(self, db, capsys, mocker,
+                                                   monkeypatch):
+        import os
+        monkeypatch.setenv("AUTOPILOT_TOP_N", "10")
+        run = self._ok(mocker)
+        _run_json(capsys, "refresh", "--top-n", "3")
+        assert run.call_args.kwargs["env"]["AUTOPILOT_TOP_N"] == "3"
+        assert os.environ["AUTOPILOT_TOP_N"] == "10"   # process env untouched
+
+    def test_reports_incremental_cost(self, db, capsys, mocker, tmp_path):
+        """The run's own cost, not the day's total."""
+        import subprocess
+        log = tmp_path / "usage.log"
+        from datetime import datetime, timezone
+        now = datetime.now(timezone.utc).isoformat()
+        log.write_text(f"{now}|stage5|google/gemini-3.1-flash-lite|1000\n",
+                       encoding="utf-8")
+
+        def _spend(*a, **k):
+            with open(log, "a", encoding="utf-8") as f:
+                f.write(f"{now}|stage5|google/gemini-3.1-flash-lite|1000\n")
+            return subprocess.CompletedProcess(args=[], returncode=0,
+                                               stdout="", stderr="")
+        mocker.patch("subprocess.run", side_effect=_spend)
+        _, payload = _run_json(capsys, "refresh")
+        assert payload["spent_usd_this_run"] > 0
+        assert payload["spent_usd_today"] > payload["spent_usd_this_run"]
+
+    def test_json_envelope_keys(self, db, capsys, mocker):
+        self._ok(mocker)
+        _, payload = _run_json(capsys, "refresh")
+        assert set(payload) == {"verb", "ok", "stages", "failed_stage",
+                                "spent_usd_this_run", "spent_usd_today"}
+
+    def test_human_output_suggests_next(self, db, capsys, mocker):
+        self._ok(mocker)
+        _, out = _run(capsys, "refresh")
+        assert "next" in out
+
+
+class TestScriptShIsAWrapper:
+    """R-1 applied to C-2: the stage sequence must exist in exactly one
+    place, so script.sh delegates rather than repeating the chain."""
+
+    def _script(self):
+        from pathlib import Path
+        return (Path(__file__).resolve().parent.parent / "script.sh").read_text()
+
+    def test_delegates_to_the_refresh_verb(self):
+        assert "src.cli refresh" in self._script()
+
+    def test_does_not_repeat_the_stage_chain(self):
+        body = self._script()
+        for module in ("src.jobspy_ingest", "src.pipeline", "src.process_queue"):
+            assert module not in body, (
+                f"script.sh invokes {module} directly — the sequence belongs to "
+                "cli.REFRESH_STAGES only."
+            )
+
+    def test_forwards_arguments(self):
+        assert '"$@"' in self._script()

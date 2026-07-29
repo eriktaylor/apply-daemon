@@ -1,6 +1,6 @@
 ---
 name: apply-daemon
-description: Review and triage job listings that the apply-daemon pipeline has already scraped, scored, and researched. Use when the user wants to see what jobs came in, review or triage matches, decide on listings (save/pass), dig into why something scored the way it did, or asks "what's new" / "show me the top matches" in a job-search context. Not for running the ingestion pipeline itself.
+description: Drive the apply-daemon job-search pipeline — fetch fresh listings, then review and triage them. Use when the user wants to see what jobs came in, get new listings, review or triage matches, decide on listings (save/pass), tailor a resume for one, dig into why something scored the way it did, or asks "what's new" / "anything good today?" / "show me the top matches" in a job-search context.
 ---
 
 # Apply Daemon — review surface
@@ -11,10 +11,14 @@ scored. The loop is: **show three → they pick → repeat.**
 All work goes through `python -m src.cli`. Every verb takes `--json`; parse
 that, never the prose output. Run from the repo root.
 
+Reviewing is free. **`refresh` is the one verb that spends metered money** —
+check `status` first and say what it will cost.
+
 ## The loop
 
 ```
 python -m src.cli status --json            # worth running? can it afford to?
+python -m src.cli refresh --json          # get fresh listings (spends money)
 python -m src.cli next --top 3 --json      # a page of candidates
 python -m src.cli deep-dive <id> --json    # why it scored that way + research
 python -m src.cli save <id> --json         # they want it
@@ -62,6 +66,17 @@ work or a refresh is the right move.
   `next --max-age 0`.
 - `count: 0` with `hidden_stale > 0` means the queue is stale, not empty —
   say a refresh would bring new listings rather than "nothing to review".
+
+**`refresh`** runs the pipeline — **the only verb that spends metered money.**
+
+- Check `status` first: if `queue.fresh` is healthy, reviewing beats refreshing.
+- `--dry-run` shows the stages and the budget verdict without spending; use it
+  when the user asks "what would that cost?".
+- `ok: false` with `error: "budget_blocked"` means a cap or the cooldown
+  refused it. Report `reason` verbatim. **Do not pass `--force`** unless the
+  user explicitly asks — it exists for them, not for you.
+- `spent_usd_this_run` is what the run actually cost. Report it.
+- On success, follow with `next`.
 
 **`deep-dive`** returns `{verb, ok, listing, research, post_research}`.
 

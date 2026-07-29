@@ -4,6 +4,7 @@ Replaces Slack thread commands (frozen; see docs/CHATOPS.md) with verbs that
 are testable in-process:
 
     python -m src.cli status              # queue freshness + spend vs budget
+    python -m src.cli refresh             # run the pipeline (budget-gated)
     python -m src.cli next [--top 3]      # next page of candidates
     python -m src.cli show <id>           # one listing in full
     python -m src.cli deep-dive <id>      # + post-research verdict, dossier
@@ -38,6 +39,7 @@ import json
 import logging
 import os
 import sqlite3
+import subprocess
 import sys
 from datetime import datetime, timezone
 from pathlib import Path
@@ -82,6 +84,18 @@ _PAST_TENSE = {"save": "Saved", "pass": "Passed"}
 # Verbs that accept `--all` (act on the whole presented page). An
 # argument-parsing concern, deliberately not derived from DECISIONS.
 _BULK_CAPABLE_VERBS = ("save", "pass")
+
+# The ingestion sequence, in order. THE definition — script.sh wraps this
+# verb rather than repeating the chain (R-1). digest runs twice on purpose:
+# once after each track, so Slack sees Track A's listings without waiting on
+# IMAP. It no-ops harmlessly when Slack isn't configured.
+REFRESH_STAGES: tuple[tuple[str, str], ...] = (
+    ("track A scrape", "src.jobspy_ingest"),
+    ("digest (A)", "src.digest"),
+    ("track B email", "src.pipeline"),
+    ("digest (B)", "src.digest"),
+    ("autopilot", "src.process_queue"),
+)
 
 
 def _json_list(raw: object) -> list:
@@ -446,6 +460,98 @@ def cmd_status(db: Database, as_json: bool) -> int:
     return 0
 
 
+def cmd_refresh(db: Database, *, top_n: int | None, force: bool,
+                dry_run: bool, as_json: bool) -> int:
+    """Fire the ingestion pipeline, budget permitting.
+
+    **Owns the stage sequence.** ``script.sh`` is a thin wrapper over this verb
+    so the sequence exists once (R-1): duplicating it in shell would put the
+    budget gate on only one of two paths.
+
+    Orchestrates, never reimplements — each stage runs as its own subprocess
+    exactly as ``script.sh`` used to invoke it, so a stage's behavior is
+    unchanged and a crash is attributable to one module.
+    """
+    from src.budget import check_run_allowed, record_run
+
+    decision = check_run_allowed()
+    stages = list(REFRESH_STAGES)
+
+    if dry_run:
+        _emit(
+            {"verb": "refresh", "ok": True, "dry_run": True,
+             "would_run": [s[0] for s in stages],
+             "allowed": decision.allowed, "reason": decision.reason,
+             "spent_usd_today": decision.spent_usd,
+             "budget_usd": decision.budget_usd},
+            as_json,
+            f"Would run: {' → '.join(s[0] for s in stages)}\n"
+            f"Budget: {decision.reason}\n"
+            + ("Allowed." if decision.allowed else "BLOCKED — would refuse."),
+        )
+        return 0
+
+    if not decision.allowed and not force:
+        _emit(
+            {"verb": "refresh", "ok": False, "error": "budget_blocked",
+             "reason": decision.reason,
+             "spent_usd_today": decision.spent_usd,
+             "budget_usd": decision.budget_usd},
+            as_json,
+            f"Refused — {decision.reason}\n"
+            "Override with --force if you mean it.",
+        )
+        return 1
+
+    env = dict(os.environ)
+    if top_n is not None:
+        # Per-run enrichment budget without editing .env.
+        env["AUTOPILOT_TOP_N"] = str(top_n)
+
+    # Recorded BEFORE the stages run: the cooldown must apply to an attempt,
+    # not only a success, or a crashing run could be retried without limit.
+    record_run("cli")
+
+    results = []
+    failed = None
+    for name, module in stages:
+        proc = subprocess.run(
+            [sys.executable, "-m", module],
+            env=env, capture_output=True, text=True,
+        )
+        results.append({"stage": name, "module": module,
+                        "returncode": proc.returncode})
+        if proc.returncode != 0:
+            failed = name
+            logger.error("Stage %s failed (rc=%d): %s", name, proc.returncode,
+                         (proc.stderr or "")[-400:])
+            break
+
+    after = check_run_allowed()
+    spent = None
+    if after.spent_usd is not None and decision.spent_usd is not None:
+        spent = round(after.spent_usd - decision.spent_usd, 4)
+
+    payload = {"verb": "refresh", "ok": failed is None, "stages": results,
+               "failed_stage": failed, "spent_usd_this_run": spent,
+               "spent_usd_today": after.spent_usd}
+
+    human = "\n".join(
+        f"  {'ok ' if r['returncode'] == 0 else 'FAIL'}  {r['stage']}"
+        for r in results
+    )
+    if spent is not None:
+        human += f"\n\nThis run cost ~${spent:.4f}"
+        if after.budget_usd > 0 and after.spent_usd is not None:
+            human += f" (${after.spent_usd:.2f} of ${after.budget_usd:.2f} today)"
+    if failed:
+        human += f"\n\nStopped at {failed} — see logs. Later stages did not run."
+    else:
+        human += "\n\nRun `next` to review what came in."
+    _emit(payload, as_json, human)
+    return 0 if failed is None else 1
+
+
 def cmd_deep_dive(db: Database, job_id: str, as_json: bool) -> int:
     """Everything known about one listing, from local cache only.
 
@@ -691,6 +797,17 @@ def build_parser() -> argparse.ArgumentParser:
     sub.add_parser("status", parents=[common],
                    help="Queue freshness and today's spend against budget")
 
+    p_refresh = sub.add_parser(
+        "refresh", parents=[common],
+        help="Run the ingestion pipeline (budget-gated) and report what it cost")
+    p_refresh.add_argument("--top-n", type=int, default=None, dest="top_n",
+                           metavar="N",
+                           help="Autopilot enrichment budget for this run only")
+    p_refresh.add_argument("--force", action="store_true",
+                           help="Run even if the budget check refuses")
+    p_refresh.add_argument("--dry-run", action="store_true", dest="dry_run",
+                           help="Show the stages and budget verdict, run nothing")
+
     p_show = sub.add_parser("show", parents=[common],
                             help="Show one listing in full")
     p_show.add_argument("id")
@@ -737,6 +854,9 @@ def main(argv: list[str] | None = None) -> int:
     try:
         if args.verb == "status":
             return cmd_status(db, args.json)
+        if args.verb == "refresh":
+            return cmd_refresh(db, top_n=args.top_n, force=args.force,
+                               dry_run=args.dry_run, as_json=args.json)
         if args.verb == "next":
             return cmd_next(db, args.top, args.json, args.max_age)
         if args.verb == "show":
