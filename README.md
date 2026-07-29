@@ -1,13 +1,21 @@
 # apply-daemon
 
-**Stop scrolling job boards. Triage your job hunt from Slack.**
+**Stop scrolling job boards. Triage your job hunt from chat.**
 
-**apply-daemon** is an open-source pipeline that automates the job search marathon. Built on an agentic architecture to monitor target roles, evade scraper blocks, and evaluate opportunities using cascading LLMs. Surface curated matches to your `profile.md` and resume to Slack, where a single click triggers deep-research resume synthesis and bespoke interview artifacts.
+**apply-daemon** is an open-source pipeline that automates the job search marathon: it monitors target roles, evades scraper blocks, scores every listing against your `profile.md` with cascading LLMs, and pre-researches the best matches — so reviewing your day's candidates takes minutes, and tailoring a resume takes one command.
+
+Two tracks feed it; three ways to drive it:
 
 - **Track A** — JobSpy automates LinkedIn and Indeed search.
-- **Track B** — Triage from email: Google job alerts, job board updates, and recruiter emails.
+- **Track B** — email ingestion: job alerts, board digests, Google Alerts.
 
-**Tech stack:** Python · OpenRouter · Slack · JobSpy · Gmail · IPRoyal
+| Entry point | What it's for |
+|---|---|
+| `./script.sh` | The daily batch — scrape, score, enrich. Run it when you want fresh listings. |
+| `python -m src.cli` | Review and decide. A bundled Claude Code skill drives it conversationally; resume tailoring runs in-session at zero API cost. |
+| Slack | Ambient: daily digest cards, triageable from your phone with four reactions. Optional. |
+
+**Tech stack:** Python · OpenRouter · Claude Code · Slack · JobSpy · Gmail · IPRoyal
 
 ## Setup checklist
 
@@ -16,7 +24,7 @@ Work through these once during onboarding, in order. Each item maps to a section
 - [ ] **A. Update your resume** (e.g. polish bullets with [claude.ai](https://claude.ai))
 - [ ] **B. Clone the repository**
 - [ ] **C. Install dependencies**
-- [ ] **D. Set up the Slack channel and Slack bot**
+- [ ] **D. Set up the Slack channel and bot** *(optional — skip for CLI-only use)*
 - [ ] **E. Configure OpenRouter (required) and your `.env`**
 - [ ] **F. Configure `profile.md` (required), `search_config.yaml` (Track A), and/or email alerts (Track B)**
 - [ ] **G. Configure an IPRoyal residential proxy for heavy scraping (optional)**
@@ -49,15 +57,13 @@ Stage 4b: Lazy-load full description     Stage 2: Field validation
 
 **Track A** polls job boards directly via JobSpy and injects structured listings without any LLM extraction. **Track B** is the reactive pipeline — email alerts, Google Alerts, and Slack `!triage` commands — which uses LLM anchor extraction for emails that only contain free-form text. Both tracks share Stage 5 scoring and the same SQLite database; the Smart Upsert ensures no duplicates regardless of which track found the listing first.
 
-1. **Track A — Proactive polling** (`src/jobspy_ingest.py`) — Reads `my_profile/search_config.yaml`, calls `scrape_jobs()` across Indeed and LinkedIn (configurable per site tier) for each search × tier pair. Returns a pandas DataFrame with structured fields (title, company, location, salary, full description, URL). No LLM extraction needed — maps directly to Stage 5 scoring. **Stage 4b** lazy-loads the full job description from the ATS or Indeed detail page whenever the scraped preview is under 300 words or ends with a truncation marker.
-2. **Track B — Reactive email pipeline** — Connects to a dedicated Gmail inbox via IMAP and pulls unread job alert emails from LinkedIn, Google Alerts, and other sources.
-3. **Email classification** — Fast regex-based classification (JOB_DIGEST / RECRUITER_OUTREACH / GOOGLE_ALERT / SKIP) using headers only. No LLM cost.
-4. **Text extraction** — Generic, template-agnostic HTML-to-text conversion via BeautifulSoup. Works on any email from any platform — no platform-specific parsers.
-5. **Dedup** — Fuzzy dedup using `rapidfuzz` token-set-ratio (85% threshold) at the email level and again per-anchor **before Stage 5 LLM scoring**. Listings already in the database are skipped immediately — no OpenRouter API calls are made for known jobs. A final Smart Upsert after scoring handles any races between tracks.
-6. **LLM triage** — Single-model scoring against your candidate profile with a configurable confidence threshold. `OPENROUTER_MODEL` returns a verdict (YES / MAYBE / NO) and a 0–100 confidence. NO verdicts are always dropped; YES / MAYBE are kept only when confidence meets `CONFIDENCE_THRESHOLD`. Returns structured data: title, company, location, salary, verdict, confidence, skills match, and reasoning.
-7. **Geo distance** — Calculates commute distance from your `home_location` to each job using OpenStreetMap Nominatim geocoding with LRU caching.
-8. **Historical context** — Detects reposted listings via fuzzy matching and surfaces a timeline of prior encounters in the digest.
-9. **Storage + notification** — Results saved to SQLite. Daily Slack digest with Block Kit formatting, skills match percentages, geo distance, and history context. Rate-limited with retry handlers and inter-message pacing.
+Details the diagram doesn't show:
+
+- **Track A** (`jobspy_ingest.py`) reads `my_profile/search_config.yaml` and scrapes each search × site-tier pair; **Stage 4b** fetches the full description whenever a preview is under 300 words or truncated.
+- **Track B** classifies email by headers alone (JOB_DIGEST / RECRUITER_OUTREACH / GOOGLE_ALERT / SKIP — no LLM cost) and extracts text generically, with no per-platform parsers.
+- **Dedup is fuzzy and pre-LLM** (`rapidfuzz` token-set, 85%): known listings are skipped before any API call; a Smart Upsert after scoring handles races between tracks.
+- **Stage 5 triage** returns YES / MAYBE / NO with 0–100 confidence; NO always drops, YES/MAYBE survive above `CONFIDENCE_THRESHOLD`, with skills match and reasoning attached.
+- **Enrichment**: Nominatim commute distance from `home_location`, plus a repost timeline when a listing has been seen before.
 
 ### Review & apply — one store, two surfaces
 
@@ -115,7 +121,7 @@ Supported formats are `.docx`, `.md`, and `.pdf`, resolved in that priority orde
 | File | Purpose |
 |---|---|
 | `base_resume` (.docx / .md / .pdf) | Required for resume tailoring. The LLM edits bullets against this document. |
-| `cover_letter` (.docx / .md / .pdf) | Optional style reference for the **bundled** cover-letter path (`cover_letter` in `GENERATE_ASSETS` or via ✏️). The LLM mimics this template's tone and structure, so it should be well-written — a thin or generic template produces a thin output. If you don't maintain one, use the **on-demand** path instead (Slack: `!coverletter`), which writes from the profile + base resume + cached research without needing a template. |
+| `cover_letter` (.docx / .md / .pdf) | Optional style reference — the LLM mimics its tone, so it should be well-written. No template? Use on-demand generation (`!coverletter`) instead, which writes from profile + resume + research. |
 
 ### B. Clone the repository
 
@@ -139,31 +145,20 @@ uv sync && source .venv/bin/activate
 python -m venv .venv && source .venv/bin/activate && pip install -e ".[dev]"
 ```
 
-> **Upgrading from an earlier version?** Re-run `uv sync` (or `pip install -e ".[dev]"`) to pick up the two newer dependencies: `python-jobspy` and `pyyaml`.
+### D. Slack channel and bot (optional)
 
-### D. Slack channel and Slack bot
+Powers the digest cards and reaction triage. **Skip it for CLI-only use** — ingestion and the review CLI run fine without it (the digest step just logs a warning).
 
-The digest, sweeper, and reaction workflow all run through Slack. Set this up before running the pipeline.
-
-1. **Create a Slack app** at [api.slack.com/apps](https://api.slack.com/apps) → "Create New App" → "From scratch".
-2. **Add bot token scopes** — Go to "OAuth & Permissions" → "Bot Token Scopes" → Add: `chat:write`, `channels:history`, `reactions:read`, `reactions:write`.
-3. **Install the app** to your workspace — Click "Install to Workspace" and authorize.
-4. **Copy the Bot Token** — After install, copy the `xoxb-...` token from "OAuth & Permissions".
-5. **Get the channel ID** — In Slack, right-click your target channel → "View channel details" → copy the Channel ID (starts with `C`).
-6. **Invite the bot to the channel** — In the Slack channel, type: `/invite @YourBotName`
-7. **Save the bot token and channel ID** — you'll paste them into `.env` in step E:
-   ```
-   SLACK_BOT_TOKEN=xoxb-your-bot-token
-   SLACK_CHANNEL_ID=C0123456789
-   ```
-
-> **Common error:** If you see `not_in_channel`, the bot hasn't been invited. Run `/invite @YourBotName` in the channel.
+1. Create an app at [api.slack.com/apps](https://api.slack.com/apps) → "From scratch"; add Bot Token Scopes `chat:write`, `channels:history`, `reactions:read`, `reactions:write`; install to your workspace.
+2. Copy the `xoxb-...` Bot Token, and the Channel ID (`C...`) from your target channel's details.
+3. Invite the bot: `/invite @YourBotName` in the channel (skipping this causes the common `not_in_channel` error).
+4. Paste both into `.env` in step E: `SLACK_BOT_TOKEN=...`, `SLACK_CHANNEL_ID=...`
 
 ### E. OpenRouter and `.env`
 
 Fill in your `.env` — every variable is documented inline in [`.env.example`](.env.example). The non-obvious ones:
 
-- **OPENROUTER_API_KEY** *(required)* — Powers all LLM calls. Get your key at [openrouter.ai/keys](https://openrouter.ai/keys). All LLM calls route through OpenRouter; three independent model slots (`OPENROUTER_STAGE1_MODEL`, `OPENROUTER_MODEL`, `OPENROUTER_TAILOR_MODEL`, plus an optional `OPENROUTER_TREND_MODEL`) let you optimise cost and quality per pipeline stage. See [`docs/MODELS.md`](docs/MODELS.md) for per-slot defaults and BYOK setup.
+- **OPENROUTER_API_KEY** *(required)* — powers the pipeline's LLM calls. Get a key at [openrouter.ai/keys](https://openrouter.ai/keys). Per-stage model slots, defaults, and BYOK setup: [`docs/MODELS.md`](docs/MODELS.md).
 - **SLACK_BOT_TOKEN** / **SLACK_CHANNEL_ID** — From step D.
 - **GMAIL_ADDRESS** / **GMAIL_APP_PASSWORD** — Required only if you plan to use Track B email ingestion (step F). Create a dedicated Gmail account for job alerts, enable 2FA, and generate an [App Password](https://support.google.com/accounts/answer/185833).
 - **CONFIDENCE_THRESHOLD** — minimum Stage 5 confidence to keep a listing. Bands and migration notes: [`docs/MODELS.md`](docs/MODELS.md).
@@ -180,7 +175,7 @@ Edit `my_profile/profile.md` — write naturally about who you are, what you wan
 
 The **Pipeline Settings** table in `profile.md` (e.g. `max_listings_per_run`, `dedup_window_days`, `pass_window_days`, `batch_process_days`, `home_location`, `max_listing_age_days`) controls runtime behaviour. See [`my_profile_example/profile.md`](my_profile_example/profile.md) for the full set of values and inline notes.
 
-Deep Research is always enabled and runs before every Tailor operation.
+Deep Research runs automatically before autopilot re-scores and ✏️/`--via api` tailoring; in-session tailoring reuses the cached dossier instead of spending.
 
 #### `search_config.yaml` — Track A (JobSpy proactive search)
 
@@ -244,18 +239,10 @@ python -m src.sweeper --deep 99  # Scan last 99 posts; default is 50
 # Batch tailor every saved listing (concurrent OpenRouter calls)
 python -m src.batch_process
 
-# Autopilot — Speculative Agent (requires AUTOPILOT_ENABLED=true in .env).
-# Runs Deep Research + a Claude match-analysis pass for every listing the
-# pipeline flagged as auto_queued, posts the enriched card to Slack, and
-# auto-passes any post-research NO verdict. Resume tailoring still happens
-# on the manual ✏️ reaction and reuses the cached research.
+# Autopilot (needs AUTOPILOT_ENABLED=true): Deep Research + re-score for the
+# top-N queued listings; caches the dossier so later deep-dives/tailors are free
 python -m src.process_queue
-
-# Enabling autopilot AFTER a batch is already ingested? Promote existing
-# triaged/saved YES/MAYBE listings (confidence >= CONFIDENCE_THRESHOLD)
-# into the queue first:
-python -m src.process_queue --backfill        # backfill, then process
-python -m src.process_queue --backfill-only   # backfill, exit
+python -m src.process_queue --backfill   # first enable? promote existing YES/MAYBE
 
 # Funnel report
 python -m src.report             # All-time reference
@@ -274,39 +261,22 @@ python -m src.geo_backfill --dry-run
 
 The CLI reads `$APPLY_DAEMON_DB` (falling back to `./apply_daemon.db`), so it works from any directory. Showing a listing never consumes it — undecided listings return to the queue after a two-hour window.
 
-**How reactions work:**
+**Slack reactions:** 👍 save · 👎 pass · ✏️ tailor · ❓ smart-route, directly on a digest card. Priority, idempotency, and every thread command are documented in [`docs/CHATOPS.md`](docs/CHATOPS.md).
 
-Each digest message includes a reaction legend. React directly on a card to drive its state — no buttons or Socket Mode required.
-
-| Reaction | Action | Result |
-|----------|--------|--------|
-| :thumbsup: | **Save** | Status → `saved`, bot adds :white_check_mark: receipt |
-| :thumbsdown: | **Pass** | Status → `passed`, message replaced with gray "Passed" |
-| :pencil2: | **Tailor** | Runs Deep Research + LLM, generates targeted resume + match analysis |
-| :grey_question: | **Smart Router** | Routes to tailor or custom-answer fast-path depending on context |
-
-Reaction priority is `pass` > `tailor` > `save`, and a sweeper-level idempotency layer prevents duplicate firing. For the full reaction priority semantics, ChatOps thread commands (`!applied`, `!coverletter`, `!regenerate`, `!triage`, `!update`, `!trend`, etc.), the Smart Router routes, and the threaded scrape-failure recovery workflow, see [`docs/CHATOPS.md`](docs/CHATOPS.md).
-
-> **Output directory:** Tailored assets (targeted resume, match analysis, and on-demand cover letter/interview prep) are saved locally to `output/<Company>_<Title>_<ID>/`. Each job gets its own directory with ready-to-send `.docx` files and a JSON dump of the full LLM response.
+> **Output:** tailored assets land in `output/<Company>_<Title>_<ID>/` — ready-to-send `.docx` files plus a JSON dump of the LLM response.
 
 ## ChatOps & Commands
 
 Post-triage work happens on two surfaces.
 
-**The CLI review surface** (`python -m src.cli`) is where new work goes. Five verbs — `next`, `show`, `deep-dive`, `save`, `pass` — each with `--json`. A bundled Claude Code skill (`.claude/skills/apply-daemon/`) drives them conversationally: ask Claude "what's new?" and it walks you through the top 3, deep-dives whichever you pick, and records your decisions. Every verb is a local DB read/write — no LLM calls, no network — so the loop is instant.
+**The CLI** (`python -m src.cli`, command list in step H) is where new work goes. A bundled Claude Code skill (`.claude/skills/apply-daemon/`) drives it conversationally: ask Claude "what's new?" and it walks you through the top matches, deep-dives whichever you pick, and records your decisions. Reviewing never spends tokens — enrichment is pre-cached by autopilot, and in-session tailoring is billed to your Claude session, not an API.
 
-**Slack** remains the ambient surface: the daily digest plus the four reactions, processed each time you run `python -m src.sweeper`. State-tracking commands (`!applied`, `!pass`, `!interview`, `!rejected`), on-demand asset generation (`!coverletter`, `!prep`, `!polish`), regeneration (`!regenerate`), the Smart Router (`❓` / `!answer`), manual ingestion (`!triage <URL>`) with its threaded scrape-failure recovery (`!update`), and the labor-market intelligence command (`!trend`) are all documented in [`docs/CHATOPS.md`](docs/CHATOPS.md) — these thread commands are **frozen**: they keep working, but new verbs land in the CLI instead.
-
-## Model selection & confidence threshold
-
-All LLM calls route through [OpenRouter](https://openrouter.ai). Three independent model slots (`OPENROUTER_STAGE1_MODEL`, `OPENROUTER_MODEL`, `OPENROUTER_TAILOR_MODEL`, plus an optional `OPENROUTER_TREND_MODEL`) let you optimise cost and quality per pipeline stage, and `CONFIDENCE_THRESHOLD` (0.0–1.0) sets the minimum LLM confidence required to keep a listing in Stage 5.
-
-See [`docs/MODELS.md`](docs/MODELS.md) for the full per-slot defaults, Anthropic BYOK setup, the confidence-threshold bands (50 / 55–75 / 80%), and how the eval scripts interact with each.
+**Slack** is the ambient surface: the digest plus four reactions, processed by `python -m src.sweeper`. Thread commands (`!applied`, `!coverletter`, `!trend`, …) still work but are **frozen** — new verbs land in the CLI. Full reference: [`docs/CHATOPS.md`](docs/CHATOPS.md).
 
 ## Running tests
 
 ```bash
-pytest
+ruff check . && pytest    # exactly what CI runs
 ```
 
 ## Eval harness
@@ -336,7 +306,7 @@ Shipped features are catalogued in [`CHANGELOG.md`](CHANGELOG.md).
 
 ### Up Next
 
-- [ ] **The Command Center GUI (Next.js)** — A lightweight local web dashboard that connects to the SQLite DB to visualize the full application funnel (ingested → triaged → saved → tailored → applied). Provides an interface to review and curate the `human_labels.jsonl` dataset for future model fine-tuning. Triage stays in Slack; management and analytics move to this GUI.
+- [ ] **The Command Center GUI (Next.js)** — A lightweight local web dashboard that connects to the SQLite DB to visualize the full application funnel (ingested → triaged → saved → tailored → applied). Provides an interface to review and curate the `human_labels.jsonl` dataset for future model fine-tuning. Triage stays in chat/Slack; management and analytics move to this GUI.
 - [ ] **The Dynamic RAG "Brag Document"** — Shift from editing a single `base_resume.docx` to dynamic assembly. A massive `master_brag_document.md` stores every bullet, project, and achievement. The pipeline semantically searches this document against the job description, pulling only the top most relevant bullets for the LLM. Eliminates hallucinations and produces hyper-targeted resumes.
 - [ ] **The "Warm Intro" API (Cold Outreach Copilot)** — Repurpose cold outreach into a bridge feature. Uses Deep Research context to autonomously draft a highly targeted, 3-sentence DM. Exposed via a central API endpoint so it can be routed to the user's Slack for manual LinkedIn messaging, or eventually piped into a partner ATS/recruiter dashboard.
 
