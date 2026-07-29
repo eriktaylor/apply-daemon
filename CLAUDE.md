@@ -142,9 +142,34 @@ When editing:
   the pointers still read true.
 - **Prefer deleting to duplicating.** Moving a section is better than
   summarizing it in a second place.
-- Same rule in code: shared logic gets one implementation
-  (`human_labels.py`, `model_usage.py`, `ranking.py` all exist for this
-  reason), and one constant has one definition.
+### Anti-drift in code
+
+The same rule, and it fails the same way: a behavior implemented twice
+diverges, and nothing signals which copy is right. `human_labels.py`,
+`model_usage.py`, and `ranking.py` exist because two surfaces needed the
+same logic — that is the shape to reach for.
+
+- **Grep the behavior, not the name, before writing a helper.** Names don't
+  match across authors: `_output_folder` would never have found the existing
+  `_find_existing_output`. Grep what it *does* — `job_id[:8]`, `split("|")`,
+  the column being written.
+- **One constant, one definition.** A comment reading "matches
+  `other._THING`" is drift documented as drift; import it instead.
+- **Two callers means extract, not copy.** When a second surface needs
+  existing logic, move it somewhere both can import — even if that means a
+  new small module. A justification for copying ("avoids a heavy import")
+  usually means the code is in the wrong place, not that it should exist
+  twice.
+- **Adapters, never parallel implementations.** Slack, the CLI, and
+  `script.sh` are entry points over shared logic. An entry point that
+  reimplements a transition is a defect, however well it works.
+- **Check for duplication as part of every audit** — it is a named step, not
+  something to notice. Ask: what did this change add that already existed
+  somewhere?
+- **Register what you extract.** A source-level test asserting one concept →
+  one implementation site is the only layer that survives forgetting; see
+  `TestMeteringCoverage` in `tests/test_model_usage.py` for the pattern.
+  Add the entry when you extract, while the decision is fresh.
 
 ### Writing for each audience
 
@@ -158,6 +183,19 @@ When editing:
 - **Interfaces are one surface.** A verb that is correct alone but tells a
   different story than its neighbors is a defect. Render every affected
   command on real data before calling interface work done.
+
+### Audit checklist
+
+When auditing your own or prior work, these are steps rather than instincts:
+
+1. **Duplication** — what did this add that already existed? Grep the
+   behavior, not the name.
+2. **Coherence** — render every affected command on real data; do the
+   surfaces tell one story?
+3. **Drift** — grep every doc mentioning the changed behavior; fix the
+   owner, verify pointers still read true.
+4. **Claims** — re-check assertions against the code, including ones made
+   earlier in the same session.
 
 ## Conventions
 
