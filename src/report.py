@@ -34,9 +34,6 @@ _CALIBRATION_BANDS = [
     (90, 100, "90-100"),
 ]
 
-# O-1's model-usage telemetry sink (see src/model_usage.py).
-_MODEL_USAGE_LOG = Path(os.getenv("MODEL_USAGE_LOG_PATH", "logs/model_usage.log"))
-
 # Ordered funnel stages for display — mirrors the user journey
 _FUNNEL_ORDER = [
     "triaged",
@@ -189,31 +186,24 @@ def _print_model_breakdown(breakdown: dict[str, dict]) -> None:
             print(f"    {label:<10} {n_in_band:>4} {_pct(saved_in_band, n_in_band):>9}  {bar}")
 
 
-def _parse_usage_log(path: Path = _MODEL_USAGE_LOG) -> dict[tuple[str, str], dict]:
-    """Aggregate O-1's usage log into {(model, stage): {calls, tokens}}.
+def _parse_usage_log(path: Path | None = None) -> dict[tuple[str, str], dict]:
+    """Aggregate the usage log into {(model, stage): {calls, tokens}}.
 
-    Log schema (pipe-delimited): timestamp|stage|model|tokens. Malformed lines
-    are skipped. Returns {} if the sink doesn't exist yet.
+    Parsing (and the log's schema) belongs to src/model_usage.py — this only
+    reshapes it for the per-model view. R-1: there was a second parser here,
+    with its own copy of the malformed-line handling.
     """
+    from src.model_usage import iter_usage
+
     agg: dict[tuple[str, str], dict] = {}
-    if not path.exists():
-        return agg
-    for line in path.read_text(encoding="utf-8").splitlines():
-        parts = line.strip().split("|")
-        if len(parts) != 4:
-            continue
-        _ts, stage, model, tokens = parts
-        try:
-            tok = int(tokens)
-        except ValueError:
-            continue
+    for _day, stage, model, tokens in iter_usage(path):
         entry = agg.setdefault((model, stage), {"calls": 0, "tokens": 0})
         entry["calls"] += 1
-        entry["tokens"] += tok
+        entry["tokens"] += tokens
     return agg
 
 
-def _print_model_costs(path: Path = _MODEL_USAGE_LOG) -> None:
+def _print_model_costs(path: Path | None = None) -> None:
     """Live cost view from O-1's token log, priced via eval/model_pricing."""
     agg = _parse_usage_log(path)
     print("\n  Live Model Cost (from logs/model_usage.log)")

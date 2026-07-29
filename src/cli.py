@@ -45,6 +45,9 @@ from pathlib import Path
 from dotenv import load_dotenv
 
 from src.db import Database
+from src.decisions import DECISIONS, target_status
+from src.decisions import apply as apply_decision
+from src.file_utils import find_output_folder
 from src.human_labels import SURFACE_CLI, append_human_label
 
 logger = logging.getLogger(__name__)
@@ -72,22 +75,13 @@ _TIER_LABELS = {0: "auto", 1: "auto_queued", 2: "triaged"}
 # the queue order — an invisible sort key reads as a broken sort.
 _DISTANCE_LABELS = {0: "Remote", 1: "Local", 2: "Commute", 3: "Far"}
 
-# Verb → (pipeline_status, ledger action). Ledger actions must match the
-# vocabulary eval/preference_pairs.py scores (save → positive, pass →
-# negative), or CLI decisions land in the ledger as neutral and vanish from
-# the preference pairs.
-_DECISIONS = {
-    "save": ("saved", "save"),
-    "pass": ("passed", "pass"),
-}
-
-# Past-tense forms for human output ("Saveed" otherwise).
+# Past-tense forms for human output ("Saveed" otherwise). Presentation only —
+# the decision policy itself lives in src/decisions.py.
 _PAST_TENSE = {"save": "Saved", "pass": "Passed"}
 
-# Statuses a listing cannot be saved back out of. Mirrors the documented
-# Slack rule that 👎 is terminal (docs/CHATOPS.md) — reviving a passed
-# listing goes through re-triage, not a save.
-_TERMINAL_STATUSES = frozenset({"passed", "expired"})
+# Verbs that accept `--all` (act on the whole presented page). An
+# argument-parsing concern, deliberately not derived from DECISIONS.
+_BULK_CAPABLE_VERBS = ("save", "pass")
 
 
 def _json_list(raw: object) -> list:
@@ -104,18 +98,13 @@ def _json_list(raw: object) -> list:
 
 
 def _output_folder(job_id: str) -> Path | None:
-    """Locate this job's asset folder.
+    """Locate this job's asset folder (see file_utils.find_output_folder).
 
-    Mirrors tailor._find_existing_output's ``job_id[:8]`` folder convention,
-    reimplemented here so the CLI doesn't import tailor (which pulls openai
-    and dotenv at import time and would slow every invocation).
+    Wrapper rather than a direct call so this module's ``OUTPUT_DIR`` stays
+    monkeypatchable. file_utils is import-light, so the CLI still avoids
+    pulling openai via tailor.
     """
-    if not OUTPUT_DIR.exists():
-        return None
-    for folder in OUTPUT_DIR.iterdir():
-        if folder.is_dir() and job_id[:8] in folder.name:
-            return folder
-    return None
+    return find_output_folder(job_id, OUTPUT_DIR)
 
 
 def _research_cached(job_id: str) -> bool:
@@ -568,7 +557,7 @@ def cmd_tailor(db: Database, job_id: str, *, apply_from: str | None,
         # generate_immediate already sets this on its own connection; repeating
         # it here is idempotent and keeps the verb's contract self-contained —
         # "ok means tailored" shouldn't depend on a callee's side effect.
-        db.update_pipeline_status(job_id, "tailored")
+        db.update_pipeline_status(job_id, target_status("tailor"))
         append_human_label(job_id, "tailor", dict(row), surface=SURFACE_CLI)
         _emit({"verb": "tailor", "ok": True, "id": job_id, "route": "api",
                "folder": str(folder), "status": "tailored"},
@@ -598,7 +587,7 @@ def cmd_tailor(db: Database, job_id: str, *, apply_from: str | None,
         )
         folder = generate_assets(job_id, parsed, listing,
                                  research_context=research)
-        db.update_pipeline_status(job_id, "tailored")
+        db.update_pipeline_status(job_id, target_status("tailor"))
         append_human_label(job_id, "tailor", dict(row), surface=SURFACE_CLI)
         _emit({"verb": "tailor", "ok": True, "id": job_id, "route": "in_session",
                "folder": str(folder), "status": "tailored"},
@@ -626,28 +615,8 @@ def cmd_tailor(db: Database, job_id: str, *, apply_from: str | None,
 
 
 def _decide(db: Database, row: sqlite3.Row, verb: str, *, bulk: bool) -> bool:
-    """Apply one decision: pipeline_status + ledger. True if the status moved.
-
-    ``db.update_pipeline_status`` is an unconditional UPDATE — it happily
-    re-applies a status a row already has, and would let a save undo a pass.
-    The guard therefore lives here: no-op when the row is already at the
-    target status, and never save a listing back out of a terminal one.
-    Without it a repeated `pass` would append a duplicate ledger row every
-    time, inflating the preference-pair corpus with phantom decisions.
-    """
-    status, action = _DECISIONS[verb]
-    current = row["pipeline_status"]
-    if current == status:
-        return False
-    if verb == "save" and current in _TERMINAL_STATUSES:
-        return False
-
-    moved = db.update_pipeline_status(row["id"], status)
-    if moved:
-        append_human_label(
-            row["id"], action, dict(row), surface=SURFACE_CLI, bulk=bulk
-        )
-    return moved
+    """Apply one decision. True if the status moved. See src/decisions.py."""
+    return apply_decision(db, row, verb, surface=SURFACE_CLI, bulk=bulk)
 
 
 def cmd_decide(db: Database, verb: str, job_id: str | None, all_flag: bool,
@@ -674,7 +643,7 @@ def cmd_decide(db: Database, verb: str, job_id: str | None, all_flag: bool,
         return 1
 
     if not _decide(db, row, verb, bulk=False):
-        status, _ = _DECISIONS[verb]
+        status, _ = DECISIONS[verb]
         _emit(
             {"verb": verb, "ok": False, "error": "no_transition", "id": job_id,
              "status": row["pipeline_status"]},
@@ -683,7 +652,7 @@ def cmd_decide(db: Database, verb: str, job_id: str | None, all_flag: bool,
         )
         return 1
 
-    status, _ = _DECISIONS[verb]
+    status, _ = DECISIONS[verb]
     _emit(
         {"verb": verb, "ok": True, "id": job_id, "status": status, "bulk": False},
         as_json,
@@ -756,7 +725,10 @@ def main(argv: list[str] | None = None) -> int:
     load_dotenv()
     args = build_parser().parse_args(argv)
 
-    if args.verb in _DECISIONS and not args.all and not args.id:
+    # Which verbs accept `--all` is an argument-parsing fact, not decision
+    # policy — keying it off DECISIONS coupled it to that table's contents and
+    # broke `tailor` the moment tailor was added there.
+    if args.verb in _BULK_CAPABLE_VERBS and not args.all and not args.id:
         print(f"`{args.verb}` needs a listing id, or --all for the current page.",
               file=sys.stderr)
         return 2

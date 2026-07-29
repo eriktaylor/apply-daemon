@@ -15,10 +15,11 @@ from src.models import JobListing
 
 DEFAULT_DB_PATH = Path("apply_daemon.db")
 
-# Confidence band width for review-queue ordering. Matches
-# process_queue._BAND_WIDTH: raw confidence is not trustworthy to
-# single-digit precision, so distance breaks ties inside a band.
-_CONFIDENCE_BAND_WIDTH = 5
+# Confidence band width. Raw confidence is not trustworthy to single-digit
+# precision, so both consumers band it first: the review queue lets distance
+# break ties inside a band, and autopilot's _select_top_n walks bands
+# high→low. One definition — process_queue imports this (R-1).
+CONFIDENCE_BAND_WIDTH = 5
 
 # Statuses eligible for the CLI review queue, in presentation order.
 # 'auto' first: those rows already have cached Deep Research in output/,
@@ -858,7 +859,7 @@ class Database:
 
         - ``auto`` rows lead because their Deep Research is already cached in
           ``output/``, making a deep-dive token-free.
-        - Confidence is banded (``_CONFIDENCE_BAND_WIDTH``) before distance is
+        - Confidence is banded (``CONFIDENCE_BAND_WIDTH``) before distance is
           consulted, mirroring ``process_queue._band()``'s existing admission
           that raw confidence isn't trustworthy to single-digit precision. So
           a nearer listing outranks a marginally-higher-scoring far one, but
@@ -900,7 +901,7 @@ class Database:
             "AND confidence >= ? "
             f"{cutoff_clause}{age_clause}"
             "ORDER BY tier_rank, "
-            f"  (confidence / {_CONFIDENCE_BAND_WIDTH}) DESC, "
+            f"  (confidence / {CONFIDENCE_BAND_WIDTH}) DESC, "
             "  (distance_bucket IS NULL), distance_bucket ASC, "
             "  confidence DESC, date_ingested DESC "
             "LIMIT ?"

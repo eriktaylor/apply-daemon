@@ -36,6 +36,7 @@ from slack_sdk.errors import SlackApiError
 load_dotenv()
 
 from src.db import Database
+from src.decisions import is_allowed, target_status
 from src.human_labels import SURFACE_SLACK, append_human_label
 from src.model_usage import log_response_usage
 from src.notifications import _get_slack_config, _import_slack_app
@@ -1061,8 +1062,13 @@ def _is_chatops_badge(block: dict) -> bool:
 
 
 def _handle_pass(app, db: Database, channel: str, ts: str, job_id: str, msg: dict) -> None:
-    """Process a thumbsdown: update DB and replace message with gray receipt."""
-    db.update_pipeline_status(job_id, "passed")
+    """Process a thumbsdown: update DB and replace message with gray receipt.
+
+    Target status comes from src/decisions.py so Slack and the CLI cannot
+    disagree about what "pass" means (R-1). The Slack card update below is
+    this surface's own transport and stays here.
+    """
+    db.update_pipeline_status(job_id, target_status("pass"))
     logger.info("Passed listing %s", job_id[:8])
 
     try:
@@ -1088,8 +1094,19 @@ def _handle_pass(app, db: Database, channel: str, ts: str, job_id: str, msg: dic
 
 
 def _handle_save(app, db: Database, channel: str, ts: str, job_id: str) -> None:
-    """Process a thumbsup: update DB and add checkmark receipt."""
-    db.update_pipeline_status(job_id, "saved")
+    """Process a thumbsup: update DB and add checkmark receipt.
+
+    Honors the shared guard (src/decisions.py): 👍 arriving after a 👎 must
+    not revive a passed listing — pass is terminal per docs/CHATOPS.md, and
+    db.update_pipeline_status would otherwise happily undo it.
+    """
+    row = db.get_listing_by_id(job_id)
+    current = row["pipeline_status"] if row else None
+    if not is_allowed(current, "save"):
+        logger.info("Save ignored for %s — status is %s", job_id[:8], current)
+        return
+
+    db.update_pipeline_status(job_id, target_status("save"))
     logger.info("Saved listing %s", job_id[:8])
 
     try:
