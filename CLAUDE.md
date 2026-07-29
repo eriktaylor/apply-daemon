@@ -23,7 +23,7 @@ python -m src.jobspy_ingest     # Track A: proactive JobSpy scrape
 python -m src.pipeline          # Track B: email ingestion
 python -m src.digest            # Post Slack digest cards
 python -m src.sweeper           # Process Slack reactions + ChatOps commands
-python -m src.cli next --top 3  # CLI review surface (also: show/deep-dive/save/pass)
+python -m src.cli status        # CLI review surface (also: next/show/deep-dive/save/pass/tailor)
 python -m src.batch_process     # Concurrent tailor for all saved listings
 python -m src.process_queue     # Autopilot Speculative Agent (no-op unless AUTOPILOT_ENABLED=true)
 python -m src.process_queue --backfill        # Promote existing YES/MAYBE into autopilot queue
@@ -62,7 +62,9 @@ apply-daemon/
 │   ├── sweeper.py               # Reaction sweeper + ChatOps parser. Priority: pass > tailor > save. Idempotent.
 │   │                            # THREAD COMMANDS ARE FROZEN — see Conventions.
 │   ├── human_labels.py          # Shared human-feedback ledger writer (data/human_labels.jsonl)
-│   ├── cli.py                   # CLI review surface (next/show/deep-dive/save/pass). Local-only: no LLM, no network.
+│   ├── cli.py                   # CLI review surface (status/next/show/deep-dive/save/pass/tailor). Local-only except tailor --via api.
+│   ├── budget.py                # Spend ceilings: daily USD cap, run cooldown, projection (refuse-and-report)
+│   ├── geo_backfill.py          # One-time distance_bucket backfill so the queue can sort by location
 │   ├── tailor.py                # Cloud LLM escalation engine (multi-line prompts; E501 ignored)
 │   ├── compile.py               # .docx generation from tailored bullets
 │   ├── research.py              # Deep Research agent (semantic scraping; runs before every tailor)
@@ -204,4 +206,4 @@ When auditing your own or prior work, these are steps rather than instincts:
 - Squash on merge; commit messages on `main` read like changelog entries.
 - **Slack thread commands (`!applied`, `!triage`, `!trend`, …) are frozen** — they still work, but new post-triage functionality belongs in the CLI review surface, not `sweeper.py`. Slack *reactions* (👍 👎 ✏️ ❓) are unaffected. See `docs/CHATOPS.md`.
 - **Every human decision must append to `data/human_labels.jsonl`** via `src/human_labels.py::append_human_label` (pass `surface=`). That ledger is the only input to the preference-pair extractor behind the ranking evals — a surface that skips it is invisible to that work, silently.
-- **Metered spend must be auditable.** Any code path that calls OpenRouter routes its token count through `src/model_usage.py::log_model_usage` (model, stage, tokens — never prompt or response content). `logs/model_usage.log` is the audit trail and the basis for spend ceilings; a spending path missing from it makes the budget unenforceable. Currently only `triage.py` complies — `tailor.py`, `research.py`, and `process_queue.py` are known gaps. In-session (subscription-billed) work is exempt: it has no metered cost to record.
+- **Metered spend must be auditable.** Any code path that calls OpenRouter routes its token count through `src/model_usage.py::log_model_usage` (model, stage, tokens — never prompt or response content). `logs/model_usage.log` is the audit trail and the basis for spend ceilings (`src/budget.py`); a spending path missing from it makes the budget unenforceable. All nine call sites comply, and `tests/test_model_usage.py::TestMeteringCoverage` fails the suite if a new one doesn't. In-session (subscription-billed) work is exempt: it has no metered cost to record.
