@@ -65,6 +65,33 @@ Details the diagram doesn't show:
 - **Stage 5 triage** returns YES / MAYBE / NO with 0–100 confidence; NO always drops, YES/MAYBE survive above `CONFIDENCE_THRESHOLD`, with skills match and reasoning attached.
 - **Enrichment**: Nominatim commute distance from `home_location`, plus a repost timeline when a listing has been seen before.
 
+### The daily loop
+
+Same four gestures every listing, every day — the repetition is the point:
+
+```
+$ ./script.sh --dry-run                 # what would a run cost?
+$ ./script.sh                           # scrape → score → enrich (budget-gated)
+
+$ python -m src.cli status              # 43 fresh of 490 · $0.00 of $3.00 today
+$ python -m src.cli next                # top 3, best match first
+
+  [1] Staff ML Engineer — Acme             YES 95%  ·  auto  ·  Local  ·  2d
+  [2] ...
+
+$ python -m src.cli deep-dive <id>      # Stage 5 vs post-research verdict + research
+$ python -m src.cli save <id>           # or: pass <id> · pass --all
+$ python -m src.cli tailor <id>         # resume tailored in-session, no API cost
+$ python -m src.cli next                # next 3…
+```
+
+Or just ask Claude Code *"anything good today?"* — the bundled skill runs
+these verbs for you and reports what each step costs.
+
+> **Still worth a manual click:** the CLI doesn't yet check whether a posting
+> is still live, so open the URL before investing in a tailor — especially on
+> listings more than a couple of weeks old.
+
 ### Review & apply — one store, two surfaces
 
 Everything above converges on SQLite. Everything below fans back out of it:
@@ -104,11 +131,6 @@ thread ChatOps: frozen                   deep-dive  → Stage 5 vs post-
 
 Autopilot sits above the fork because its enrichment serves both surfaces — and it's why deep-diving an `auto`-tier listing costs no tokens: the research is already on disk. The CLI's `deep-dive` shows the Stage 5 score *and* the post-research re-score side by side; they routinely disagree, and that gap is the most decision-relevant thing about a listing.
 
-```bash
-python -m src.cli next --top 3        # what's new
-python -m src.cli deep-dive <id>      # why it scored that way
-python -m src.cli save <id>           # or: pass <id>, pass --all
-```
 
 ## Setup
 
@@ -273,7 +295,15 @@ Post-triage work happens on two surfaces.
 
 **The CLI** (`python -m src.cli`, command list in step H) is where new work goes. A bundled Claude Code skill (`.claude/skills/apply-daemon/`) drives it conversationally: ask Claude "what's new?" and it walks you through the top matches, deep-dives whichever you pick, and records your decisions. Reviewing never spends tokens — enrichment is pre-cached by autopilot, and in-session tailoring is billed to your Claude session, not an API.
 
-**Slack** is the ambient surface: the digest plus four reactions, processed by `python -m src.sweeper`. Thread commands (`!applied`, `!coverletter`, `!trend`, …) still work but are **frozen** — new verbs land in the CLI. Full reference: [`docs/CHATOPS.md`](docs/CHATOPS.md).
+**Slack** is the ambient surface: the digest plus four reactions, processed by `python -m src.sweeper`. Thread commands are **frozen** — new verbs land in the CLI — but three things are still Slack-only today, so a full application often ends there:
+
+| Still Slack-only | Command |
+|---|---|
+| Polish a tailor run you didn't like | `!polish` |
+| Cover letter | `!coverletter` |
+| Answer custom application questions | `!answer` |
+
+Full reference: [`docs/CHATOPS.md`](docs/CHATOPS.md).
 
 ## Running tests
 
