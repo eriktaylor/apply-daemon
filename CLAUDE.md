@@ -15,15 +15,16 @@ pytest tests/ -q
 # Single test
 pytest tests/test_triage.py::test_name -q
 
-# Full daily batch (Track A → digest → Track B → digest → autopilot)
-./script.sh
+# Full daily batch — thin wrapper over `src.cli refresh`, which owns the
+# stage sequence and gates on the spend ceiling. Args are forwarded.
+./script.sh [--dry-run|--top-n N|--force]
 
 # Individual entry points
 python -m src.jobspy_ingest     # Track A: proactive JobSpy scrape
 python -m src.pipeline          # Track B: email ingestion
 python -m src.digest            # Post Slack digest cards
 python -m src.sweeper           # Process Slack reactions + ChatOps commands
-python -m src.cli status        # CLI review surface (also: next/show/deep-dive/save/pass/tailor)
+python -m src.cli status        # CLI review surface (also: refresh/next/show/deep-dive/save/pass/tailor)
 python -m src.batch_process     # Concurrent tailor for all saved listings
 python -m src.process_queue     # Autopilot Speculative Agent (no-op unless AUTOPILOT_ENABLED=true)
 python -m src.process_queue --backfill        # Promote existing YES/MAYBE into autopilot queue
@@ -63,6 +64,7 @@ apply-daemon/
 │   │                            # THREAD COMMANDS ARE FROZEN — see Conventions.
 │   ├── human_labels.py          # Shared human-feedback ledger writer (data/human_labels.jsonl)
 │   ├── cli.py                   # CLI review surface (status/next/show/deep-dive/save/pass/tailor). Local-only except tailor --via api.
+│   ├── decisions.py             # Shared decision policy (verb→status, guard) for every surface
 │   ├── budget.py                # Spend ceilings: daily USD cap, run cooldown, projection (refuse-and-report)
 │   ├── geo_backfill.py          # One-time distance_bucket backfill so the queue can sort by location
 │   ├── tailor.py                # Cloud LLM escalation engine (multi-line prompts; E501 ignored)

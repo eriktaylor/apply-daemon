@@ -31,7 +31,8 @@ load_dotenv()
 
 from src.compile import generate_assets
 from src.db import Database
-from src.file_utils import read_dropzone_file
+from src.decisions import target_status
+from src.file_utils import find_output_folder, read_dropzone_file
 from src.model_usage import log_response_usage
 from src.profile_loader import load_profile
 from src.research import run_deep_research
@@ -411,7 +412,7 @@ def generate_immediate(
     )
 
     with Database() as db:
-        db.update_pipeline_status(job_id, "tailored")
+        db.update_pipeline_status(job_id, target_status("tailor"))
 
     logger.info("Immediate tailor complete: %s → %s", job_id[:8], output_path)
     return output_path, claude_json
@@ -527,13 +528,12 @@ def generate_answers_only(job_id: str, custom_questions: str) -> tuple[Path, dic
 
 
 def _find_existing_output(job_id: str) -> Path | None:
-    """Find the existing output directory for a job_id."""
-    if not OUTPUT_DIR.exists():
-        return None
-    for d in OUTPUT_DIR.iterdir():
-        if d.is_dir() and job_id[:8] in d.name:
-            return d
-    return None
+    """Find the existing output directory for a job_id.
+
+    Thin wrapper so ``OUTPUT_DIR`` stays monkeypatchable per module; the
+    lookup itself lives in file_utils (R-1).
+    """
+    return find_output_folder(job_id, OUTPUT_DIR)
 
 
 
@@ -1001,7 +1001,7 @@ async def _tailor_one_async(
         parsed = _parse_tailor_response(text)
         generate_assets(job_id, parsed, listing)
         with Database() as db:
-            db.update_pipeline_status(job_id, "tailored")
+            db.update_pipeline_status(job_id, target_status("tailor"))
         logger.info("Batch tailor complete for %s", job_id[:8])
     except (RuntimeError, ValueError):
         logger.error("Failed to parse tailor response for %s", job_id[:8], exc_info=True)

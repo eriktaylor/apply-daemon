@@ -40,7 +40,8 @@ load_dotenv()
 
 from src.audit_log import log_drop
 from src.compile import _serialize_safe
-from src.db import Database
+from src.db import CONFIDENCE_BAND_WIDTH, Database
+from src.decisions import target_status
 from src.expired_probe import probe as expired_probe
 from src.file_utils import read_dropzone_file
 from src.geo import get_distance
@@ -59,9 +60,8 @@ OUTPUT_DIR = Path("output")
 _OPENROUTER_BASE_URL = "https://openrouter.ai/api/v1"
 
 # Ranking knobs for selecting the top-N out of the auto_queue.
-# Lexicographic primary: confidence band (5-point wide).
+# Lexicographic primary: confidence band (db.CONFIDENCE_BAND_WIDTH wide).
 # Within-band composite: verdict bonus + skill score + geo bonus.
-_BAND_WIDTH = 5
 _VERDICT_BONUS_YES = 3
 # Geo bucket scores: 0=Remote, 1=Local(<=30mi), 2=Commute(<=60mi), 3=Relocation(>60mi)
 _GEO_SCORES: dict[int, int] = {0: 5, 1: 4, 2: 3, 3: 1}
@@ -144,7 +144,7 @@ def _tailor_model() -> str:
 
 def _band(confidence: int) -> int:
     """Map a 0-100 confidence to its 5-point band index (higher = better)."""
-    return int(confidence) // _BAND_WIDTH
+    return int(confidence) // CONFIDENCE_BAND_WIDTH
 
 
 def _compute_distance_bucket(location: str) -> int:
@@ -600,7 +600,7 @@ async def _process_one(
                 reason=f"{gate}: anchor company not present in body or url",
             )
             with Database() as db:
-                db.update_pipeline_status(job_id, "passed")
+                db.update_pipeline_status(job_id, target_status("pass"))
             logger.info(
                 "Autopilot: %s dropped by mismatch gate (%s) — %s claimed vs observed '%s'",
                 short, gate, company, observed,
@@ -687,7 +687,7 @@ async def _process_one(
                     _replace_card_with_passed, app, channel, existing_ts,
                 )
             with Database() as db:
-                db.update_pipeline_status(job_id, "passed")
+                db.update_pipeline_status(job_id, target_status("pass"))
                 db.mark_slack_notified(job_id)
                 db.mark_autopilot_processed(job_id)
             logger.info(

@@ -217,11 +217,12 @@ Walks the checklist, reporting which components are configured and reachable. In
 **Daily batch (recommended):**
 
 ```bash
-# Chains: jobspy_ingest → digest → pipeline → digest → process_queue
-./script.sh
+./script.sh              # budget-gated run of both tracks + autopilot
+./script.sh --dry-run    # show the stages and budget verdict, run nothing
+./script.sh --top-n 5    # raise autopilot enrichment for this run only
 ```
 
-The bundled `script.sh` runs both tracks back-to-back and then fires the autopilot Speculative Agent. `process_queue` is a no-op when `AUTOPILOT_ENABLED=false`, so the script is safe to use either way. After it returns, the only command needed to triage the batch is `python -m src.sweeper`.
+`script.sh` is a thin wrapper over `python -m src.cli refresh`, which owns the stage sequence and checks your spend ceiling first (see `DAILY_USD_BUDGET` and `MIN_RUN_INTERVAL_MINUTES` in `.env.example`). It refuses rather than half-running, reports what the run cost, and exits non-zero if a stage fails. Then review with `python -m src.cli next` — or `python -m src.sweeper` if you triage from Slack.
 
 **Manual run:**
 
@@ -250,6 +251,7 @@ python -m src.report --days 7    # Last 7 days reference
 
 # CLI review surface — triage without Slack. Add --json for scripting.
 python -m src.cli status         # Queue freshness + today's spend vs budget
+python -m src.cli refresh        # Run the pipeline (--dry-run / --top-n N / --force)
 python -m src.cli next --top 3   # Next page of candidates
 python -m src.cli deep-dive <id> # Stage 5 vs post-research verdict + dossier
 python -m src.cli save <id>      # or: pass <id> / pass --all

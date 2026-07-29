@@ -4,6 +4,7 @@ Replaces Slack thread commands (frozen; see docs/CHATOPS.md) with verbs that
 are testable in-process:
 
     python -m src.cli status              # queue freshness + spend vs budget
+    python -m src.cli refresh             # run the pipeline (budget-gated)
     python -m src.cli next [--top 3]      # next page of candidates
     python -m src.cli show <id>           # one listing in full
     python -m src.cli deep-dive <id>      # + post-research verdict, dossier
@@ -38,6 +39,7 @@ import json
 import logging
 import os
 import sqlite3
+import subprocess
 import sys
 from datetime import datetime, timezone
 from pathlib import Path
@@ -45,6 +47,9 @@ from pathlib import Path
 from dotenv import load_dotenv
 
 from src.db import Database
+from src.decisions import DECISIONS, target_status
+from src.decisions import apply as apply_decision
+from src.file_utils import find_output_folder
 from src.human_labels import SURFACE_CLI, append_human_label
 
 logger = logging.getLogger(__name__)
@@ -72,22 +77,25 @@ _TIER_LABELS = {0: "auto", 1: "auto_queued", 2: "triaged"}
 # the queue order — an invisible sort key reads as a broken sort.
 _DISTANCE_LABELS = {0: "Remote", 1: "Local", 2: "Commute", 3: "Far"}
 
-# Verb → (pipeline_status, ledger action). Ledger actions must match the
-# vocabulary eval/preference_pairs.py scores (save → positive, pass →
-# negative), or CLI decisions land in the ledger as neutral and vanish from
-# the preference pairs.
-_DECISIONS = {
-    "save": ("saved", "save"),
-    "pass": ("passed", "pass"),
-}
-
-# Past-tense forms for human output ("Saveed" otherwise).
+# Past-tense forms for human output ("Saveed" otherwise). Presentation only —
+# the decision policy itself lives in src/decisions.py.
 _PAST_TENSE = {"save": "Saved", "pass": "Passed"}
 
-# Statuses a listing cannot be saved back out of. Mirrors the documented
-# Slack rule that 👎 is terminal (docs/CHATOPS.md) — reviving a passed
-# listing goes through re-triage, not a save.
-_TERMINAL_STATUSES = frozenset({"passed", "expired"})
+# Verbs that accept `--all` (act on the whole presented page). An
+# argument-parsing concern, deliberately not derived from DECISIONS.
+_BULK_CAPABLE_VERBS = ("save", "pass")
+
+# The ingestion sequence, in order. THE definition — script.sh wraps this
+# verb rather than repeating the chain (R-1). digest runs twice on purpose:
+# once after each track, so Slack sees Track A's listings without waiting on
+# IMAP. It no-ops harmlessly when Slack isn't configured.
+REFRESH_STAGES: tuple[tuple[str, str], ...] = (
+    ("track A scrape", "src.jobspy_ingest"),
+    ("digest (A)", "src.digest"),
+    ("track B email", "src.pipeline"),
+    ("digest (B)", "src.digest"),
+    ("autopilot", "src.process_queue"),
+)
 
 
 def _json_list(raw: object) -> list:
@@ -104,18 +112,13 @@ def _json_list(raw: object) -> list:
 
 
 def _output_folder(job_id: str) -> Path | None:
-    """Locate this job's asset folder.
+    """Locate this job's asset folder (see file_utils.find_output_folder).
 
-    Mirrors tailor._find_existing_output's ``job_id[:8]`` folder convention,
-    reimplemented here so the CLI doesn't import tailor (which pulls openai
-    and dotenv at import time and would slow every invocation).
+    Wrapper rather than a direct call so this module's ``OUTPUT_DIR`` stays
+    monkeypatchable. file_utils is import-light, so the CLI still avoids
+    pulling openai via tailor.
     """
-    if not OUTPUT_DIR.exists():
-        return None
-    for folder in OUTPUT_DIR.iterdir():
-        if folder.is_dir() and job_id[:8] in folder.name:
-            return folder
-    return None
+    return find_output_folder(job_id, OUTPUT_DIR)
 
 
 def _research_cached(job_id: str) -> bool:
@@ -457,6 +460,98 @@ def cmd_status(db: Database, as_json: bool) -> int:
     return 0
 
 
+def cmd_refresh(db: Database, *, top_n: int | None, force: bool,
+                dry_run: bool, as_json: bool) -> int:
+    """Fire the ingestion pipeline, budget permitting.
+
+    **Owns the stage sequence.** ``script.sh`` is a thin wrapper over this verb
+    so the sequence exists once (R-1): duplicating it in shell would put the
+    budget gate on only one of two paths.
+
+    Orchestrates, never reimplements — each stage runs as its own subprocess
+    exactly as ``script.sh`` used to invoke it, so a stage's behavior is
+    unchanged and a crash is attributable to one module.
+    """
+    from src.budget import check_run_allowed, record_run
+
+    decision = check_run_allowed()
+    stages = list(REFRESH_STAGES)
+
+    if dry_run:
+        _emit(
+            {"verb": "refresh", "ok": True, "dry_run": True,
+             "would_run": [s[0] for s in stages],
+             "allowed": decision.allowed, "reason": decision.reason,
+             "spent_usd_today": decision.spent_usd,
+             "budget_usd": decision.budget_usd},
+            as_json,
+            f"Would run: {' → '.join(s[0] for s in stages)}\n"
+            f"Budget: {decision.reason}\n"
+            + ("Allowed." if decision.allowed else "BLOCKED — would refuse."),
+        )
+        return 0
+
+    if not decision.allowed and not force:
+        _emit(
+            {"verb": "refresh", "ok": False, "error": "budget_blocked",
+             "reason": decision.reason,
+             "spent_usd_today": decision.spent_usd,
+             "budget_usd": decision.budget_usd},
+            as_json,
+            f"Refused — {decision.reason}\n"
+            "Override with --force if you mean it.",
+        )
+        return 1
+
+    env = dict(os.environ)
+    if top_n is not None:
+        # Per-run enrichment budget without editing .env.
+        env["AUTOPILOT_TOP_N"] = str(top_n)
+
+    # Recorded BEFORE the stages run: the cooldown must apply to an attempt,
+    # not only a success, or a crashing run could be retried without limit.
+    record_run("cli")
+
+    results = []
+    failed = None
+    for name, module in stages:
+        proc = subprocess.run(
+            [sys.executable, "-m", module],
+            env=env, capture_output=True, text=True,
+        )
+        results.append({"stage": name, "module": module,
+                        "returncode": proc.returncode})
+        if proc.returncode != 0:
+            failed = name
+            logger.error("Stage %s failed (rc=%d): %s", name, proc.returncode,
+                         (proc.stderr or "")[-400:])
+            break
+
+    after = check_run_allowed()
+    spent = None
+    if after.spent_usd is not None and decision.spent_usd is not None:
+        spent = round(after.spent_usd - decision.spent_usd, 4)
+
+    payload = {"verb": "refresh", "ok": failed is None, "stages": results,
+               "failed_stage": failed, "spent_usd_this_run": spent,
+               "spent_usd_today": after.spent_usd}
+
+    human = "\n".join(
+        f"  {'ok ' if r['returncode'] == 0 else 'FAIL'}  {r['stage']}"
+        for r in results
+    )
+    if spent is not None:
+        human += f"\n\nThis run cost ~${spent:.4f}"
+        if after.budget_usd > 0 and after.spent_usd is not None:
+            human += f" (${after.spent_usd:.2f} of ${after.budget_usd:.2f} today)"
+    if failed:
+        human += f"\n\nStopped at {failed} — see logs. Later stages did not run."
+    else:
+        human += "\n\nRun `next` to review what came in."
+    _emit(payload, as_json, human)
+    return 0 if failed is None else 1
+
+
 def cmd_deep_dive(db: Database, job_id: str, as_json: bool) -> int:
     """Everything known about one listing, from local cache only.
 
@@ -568,7 +663,7 @@ def cmd_tailor(db: Database, job_id: str, *, apply_from: str | None,
         # generate_immediate already sets this on its own connection; repeating
         # it here is idempotent and keeps the verb's contract self-contained —
         # "ok means tailored" shouldn't depend on a callee's side effect.
-        db.update_pipeline_status(job_id, "tailored")
+        db.update_pipeline_status(job_id, target_status("tailor"))
         append_human_label(job_id, "tailor", dict(row), surface=SURFACE_CLI)
         _emit({"verb": "tailor", "ok": True, "id": job_id, "route": "api",
                "folder": str(folder), "status": "tailored"},
@@ -598,7 +693,7 @@ def cmd_tailor(db: Database, job_id: str, *, apply_from: str | None,
         )
         folder = generate_assets(job_id, parsed, listing,
                                  research_context=research)
-        db.update_pipeline_status(job_id, "tailored")
+        db.update_pipeline_status(job_id, target_status("tailor"))
         append_human_label(job_id, "tailor", dict(row), surface=SURFACE_CLI)
         _emit({"verb": "tailor", "ok": True, "id": job_id, "route": "in_session",
                "folder": str(folder), "status": "tailored"},
@@ -626,28 +721,8 @@ def cmd_tailor(db: Database, job_id: str, *, apply_from: str | None,
 
 
 def _decide(db: Database, row: sqlite3.Row, verb: str, *, bulk: bool) -> bool:
-    """Apply one decision: pipeline_status + ledger. True if the status moved.
-
-    ``db.update_pipeline_status`` is an unconditional UPDATE — it happily
-    re-applies a status a row already has, and would let a save undo a pass.
-    The guard therefore lives here: no-op when the row is already at the
-    target status, and never save a listing back out of a terminal one.
-    Without it a repeated `pass` would append a duplicate ledger row every
-    time, inflating the preference-pair corpus with phantom decisions.
-    """
-    status, action = _DECISIONS[verb]
-    current = row["pipeline_status"]
-    if current == status:
-        return False
-    if verb == "save" and current in _TERMINAL_STATUSES:
-        return False
-
-    moved = db.update_pipeline_status(row["id"], status)
-    if moved:
-        append_human_label(
-            row["id"], action, dict(row), surface=SURFACE_CLI, bulk=bulk
-        )
-    return moved
+    """Apply one decision. True if the status moved. See src/decisions.py."""
+    return apply_decision(db, row, verb, surface=SURFACE_CLI, bulk=bulk)
 
 
 def cmd_decide(db: Database, verb: str, job_id: str | None, all_flag: bool,
@@ -674,7 +749,7 @@ def cmd_decide(db: Database, verb: str, job_id: str | None, all_flag: bool,
         return 1
 
     if not _decide(db, row, verb, bulk=False):
-        status, _ = _DECISIONS[verb]
+        status, _ = DECISIONS[verb]
         _emit(
             {"verb": verb, "ok": False, "error": "no_transition", "id": job_id,
              "status": row["pipeline_status"]},
@@ -683,7 +758,7 @@ def cmd_decide(db: Database, verb: str, job_id: str | None, all_flag: bool,
         )
         return 1
 
-    status, _ = _DECISIONS[verb]
+    status, _ = DECISIONS[verb]
     _emit(
         {"verb": verb, "ok": True, "id": job_id, "status": status, "bulk": False},
         as_json,
@@ -722,6 +797,17 @@ def build_parser() -> argparse.ArgumentParser:
     sub.add_parser("status", parents=[common],
                    help="Queue freshness and today's spend against budget")
 
+    p_refresh = sub.add_parser(
+        "refresh", parents=[common],
+        help="Run the ingestion pipeline (budget-gated) and report what it cost")
+    p_refresh.add_argument("--top-n", type=int, default=None, dest="top_n",
+                           metavar="N",
+                           help="Autopilot enrichment budget for this run only")
+    p_refresh.add_argument("--force", action="store_true",
+                           help="Run even if the budget check refuses")
+    p_refresh.add_argument("--dry-run", action="store_true", dest="dry_run",
+                           help="Show the stages and budget verdict, run nothing")
+
     p_show = sub.add_parser("show", parents=[common],
                             help="Show one listing in full")
     p_show.add_argument("id")
@@ -756,7 +842,10 @@ def main(argv: list[str] | None = None) -> int:
     load_dotenv()
     args = build_parser().parse_args(argv)
 
-    if args.verb in _DECISIONS and not args.all and not args.id:
+    # Which verbs accept `--all` is an argument-parsing fact, not decision
+    # policy — keying it off DECISIONS coupled it to that table's contents and
+    # broke `tailor` the moment tailor was added there.
+    if args.verb in _BULK_CAPABLE_VERBS and not args.all and not args.id:
         print(f"`{args.verb}` needs a listing id, or --all for the current page.",
               file=sys.stderr)
         return 2
@@ -765,6 +854,9 @@ def main(argv: list[str] | None = None) -> int:
     try:
         if args.verb == "status":
             return cmd_status(db, args.json)
+        if args.verb == "refresh":
+            return cmd_refresh(db, top_n=args.top_n, force=args.force,
+                               dry_run=args.dry_run, as_json=args.json)
         if args.verb == "next":
             return cmd_next(db, args.top, args.json, args.max_age)
         if args.verb == "show":

@@ -1,21 +1,31 @@
 #!/usr/bin/env bash
-# Daily Ingestion Trigger — chains the full intake batch and, when
-# AUTOPILOT_ENABLED=true in .env, fires the Speculative Agent at the end.
+# Daily Ingestion Trigger — the no-session entry point to the pipeline.
 #
-# After this script returns, the only command needed to triage the batch is:
-#     python -m src.sweeper
+# A thin wrapper over `python -m src.cli refresh`, which owns the stage
+# sequence. The chain used to live here as well; duplicating it meant the
+# budget gate applied to only one of the two paths. Any argument you pass is
+# forwarded, so:
 #
-# Re-run this script to start the next batch.
+#     ./script.sh                 # budget-gated run, then review with `next`
+#     ./script.sh --dry-run       # show the stages and budget verdict
+#     ./script.sh --top-n 5       # raise autopilot enrichment for this run
+#     ./script.sh --force         # run even if the budget check refuses
+#
+# Exits non-zero if a stage fails or the budget refuses the run.
 
 set -euo pipefail
 
 cd "$(dirname "$0")"
 
-python -m src.jobspy_ingest
-python -m src.digest
-python -m src.pipeline
-python -m src.digest
+# Prefer the project venv so the script works from a plain shell — the
+# previous version assumed an already-activated venv and died with
+# "exec: python: not found".
+if [[ -x .venv/bin/python ]]; then
+  PY=.venv/bin/python
+elif command -v python3 >/dev/null 2>&1; then
+  PY=python3
+else
+  PY=python
+fi
 
-# src.process_queue is a no-op when AUTOPILOT_ENABLED is unset/false,
-# so it is always safe to call here.
-python -m src.process_queue
+exec "$PY" -m src.cli refresh "$@"

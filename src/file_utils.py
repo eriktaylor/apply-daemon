@@ -70,3 +70,17 @@ def _read_pdf(path: Path) -> str:
             if text:
                 pages.append(text)
     return "\n".join(pages)
+
+def find_output_folder(job_id: str, output_dir: Path) -> Path | None:
+    """Locate a job's asset folder inside ``output_dir``, or None.
+
+    Folders are named ``<Company>_<Title>_<job_id[:8]>``, so the id prefix is
+    the lookup key. Shared by tailor, process_queue, and the CLI — the naming
+    convention is one fact and lives here (plan item R-1).
+    """
+    if not output_dir.exists():
+        return None
+    for folder in output_dir.iterdir():
+        if folder.is_dir() and job_id[:8] in folder.name:
+            return folder
+    return None
