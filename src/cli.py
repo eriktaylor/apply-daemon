@@ -36,6 +36,7 @@ from __future__ import annotations
 import argparse
 import json
 import logging
+import os
 import sqlite3
 import sys
 from datetime import datetime, timezone
@@ -58,6 +59,11 @@ AUTO_ASSETS_FILE = "auto_assets.json"
 SESSION_WINDOW_MINUTES = 120
 
 DEFAULT_TOP = 3
+
+# Ingestion-age bound for `next`, in days. Generous by design — see
+# review_max_age_days(). Override per-call with --max-age, or globally with
+# REVIEW_MAX_AGE_DAYS.
+DEFAULT_MAX_AGE_DAYS = 30
 
 _TIER_LABELS = {0: "auto", 1: "auto_queued", 2: "triaged"}
 
@@ -252,25 +258,61 @@ def _fmt_card(card: dict, index: int | None = None) -> str:
     return "\n".join(lines)
 
 
-def cmd_next(db: Database, top: int, as_json: bool) -> int:
+def review_max_age_days() -> int:
+    """Ingestion-age bound for the review queue. 0 disables.
+
+    This is the freshness surface, so it needs a bound — `digest.py` has
+    limited Slack to 14 days all along while this had no check at all. The
+    default is deliberately generous rather than matching the digest: a tight
+    bound would empty an aged queue with no explanation, which reads as a
+    broken tool. What it hides is always reported.
+    """
+    raw = os.getenv("REVIEW_MAX_AGE_DAYS", "").strip()
+    if not raw:
+        return DEFAULT_MAX_AGE_DAYS
+    try:
+        return max(0, int(raw))
+    except ValueError:
+        logger.warning("REVIEW_MAX_AGE_DAYS=%r is not an integer; using %d",
+                       raw, DEFAULT_MAX_AGE_DAYS)
+        return DEFAULT_MAX_AGE_DAYS
+
+
+def cmd_next(db: Database, top: int, as_json: bool, max_age: int | None) -> int:
+    max_age = review_max_age_days() if max_age is None else max_age
     rows = db.get_review_queue(
-        limit=top, session_window_minutes=SESSION_WINDOW_MINUTES
+        limit=top,
+        session_window_minutes=SESSION_WINDOW_MINUTES,
+        max_age_days=max_age or None,
     )
     cards = [_card(r) for r in rows]
     db.mark_presented([r["id"] for r in rows])
+    stale = db.count_stale_reviewable(max_age) if max_age else 0
+
+    payload = {"verb": "next", "count": len(cards), "listings": cards,
+               "max_age_days": max_age, "hidden_stale": stale}
 
     if not cards:
-        _emit(
-            {"verb": "next", "count": 0, "listings": []},
-            as_json,
-            "Nothing left to review. Run the pipeline, or wait for the "
-            f"{SESSION_WINDOW_MINUTES}-minute window to release skipped listings.",
-        )
+        if stale:
+            human = (
+                f"Nothing fresh to review — {stale} listing(s) are older than "
+                f"{max_age} days and were hidden.\nRun a refresh for new "
+                f"listings, or `next --max-age 0` to see the stale ones anyway."
+            )
+        else:
+            human = (
+                "Nothing left to review. Run the pipeline, or wait for the "
+                f"{SESSION_WINDOW_MINUTES}-minute window to release skipped "
+                "listings."
+            )
+        _emit(payload, as_json, human)
         return 0
 
     human = "\n\n".join(_fmt_card(c, i) for i, c in enumerate(cards, 1))
     human += "\n\nDeep-dive one, pass what doesn't fit, or run `next` for more."
-    _emit({"verb": "next", "count": len(cards), "listings": cards}, as_json, human)
+    if stale:
+        human += f"\n({stale} older than {max_age}d hidden — `--max-age 0` to include.)"
+    _emit(payload, as_json, human)
     return 0
 
 
@@ -649,6 +691,10 @@ def build_parser() -> argparse.ArgumentParser:
                             help="Show the next page of candidates")
     p_next.add_argument("--top", type=int, default=DEFAULT_TOP,
                         help=f"How many to show (default: {DEFAULT_TOP})")
+    p_next.add_argument("--max-age", type=int, default=None, dest="max_age",
+                        metavar="DAYS",
+                        help=f"Hide listings ingested more than DAYS ago "
+                             f"(default: {DEFAULT_MAX_AGE_DAYS}; 0 disables)")
 
     sub.add_parser("status", parents=[common],
                    help="Queue freshness and today's spend against budget")
@@ -697,7 +743,7 @@ def main(argv: list[str] | None = None) -> int:
         if args.verb == "status":
             return cmd_status(db, args.json)
         if args.verb == "next":
-            return cmd_next(db, args.top, args.json)
+            return cmd_next(db, args.top, args.json, args.max_age)
         if args.verb == "show":
             return cmd_show(db, args.id, args.json)
         if args.verb == "deep-dive":

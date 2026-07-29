@@ -15,6 +15,11 @@ from src.models import JobListing
 
 DEFAULT_DB_PATH = Path("apply_daemon.db")
 
+# Confidence band width for review-queue ordering. Matches
+# process_queue._BAND_WIDTH: raw confidence is not trustworthy to
+# single-digit precision, so distance breaks ties inside a band.
+_CONFIDENCE_BAND_WIDTH = 5
+
 # Statuses eligible for the CLI review queue, in presentation order.
 # 'auto' first: those rows already have cached Deep Research in output/,
 # so deep-diving one costs no tokens.
@@ -830,6 +835,7 @@ class Database:
         *,
         min_confidence_pct: int = 0,
         session_window_minutes: int | None = None,
+        max_age_days: int | None = None,
     ) -> list[sqlite3.Row]:
         """Return the next page of listings awaiting a human decision.
 
@@ -845,12 +851,26 @@ class Database:
         recently, so ``next`` pages forward within a sitting and undecided
         rows reappear later.
 
-        Ordering is tier, then ``confidence DESC, date_ingested DESC`` — all
-        in SQL. ``auto`` rows come first because their Deep Research is
-        already cached in ``output/``, making a deep-dive token-free.
-        ``process_queue._select_top_n`` is deliberately NOT reused: its
-        composite resolves geo per row via Nominatim, and an interactive
-        verb cannot block on network calls.
+        **Ordering — tier, then quality band, then distance, then exact
+        quality, then recency.** All in SQL, no network calls: an interactive
+        verb cannot block on Nominatim, which is why
+        ``process_queue._select_top_n`` is deliberately NOT reused.
+
+        - ``auto`` rows lead because their Deep Research is already cached in
+          ``output/``, making a deep-dive token-free.
+        - Confidence is banded (``_CONFIDENCE_BAND_WIDTH``) before distance is
+          consulted, mirroring ``process_queue._band()``'s existing admission
+          that raw confidence isn't trustworthy to single-digit precision. So
+          a nearer listing outranks a marginally-higher-scoring far one, but
+          never a substantially better one.
+        - Rows with no ``distance_bucket`` sort last within their band, never
+          first — an unknown commute must not masquerade as a short one. Run
+          ``python -m src.geo_backfill`` to populate them.
+
+        ``max_age_days`` bounds *ingestion* age. It exists because this is the
+        freshness surface and had no age check at all, while ``digest.py``
+        bounds Slack to 14 days. Callers pass their own default and report
+        what was hidden — see ``cli.cmd_next``.
         """
         params: list = [min_confidence_pct]
         cutoff_clause = ""
@@ -861,6 +881,14 @@ class Database:
             cutoff_clause = "AND (presented_at IS NULL OR presented_at < ?) "
             params.append(cutoff)
 
+        age_clause = ""
+        if max_age_days is not None and max_age_days > 0:
+            age_cutoff = (
+                datetime.now(timezone.utc) - timedelta(days=max_age_days)
+            ).isoformat()
+            age_clause = "AND date_ingested >= ? "
+            params.append(age_cutoff)
+
         placeholders = ", ".join("?" for _ in REVIEW_STATUSES)
         sql = (
             "SELECT *, CASE pipeline_status "
@@ -870,13 +898,37 @@ class Database:
             f"WHERE pipeline_status IN ({placeholders}) "
             "AND verdict IN ('YES', 'MAYBE') "
             "AND confidence >= ? "
-            f"{cutoff_clause}"
-            "ORDER BY tier_rank, confidence DESC, date_ingested DESC "
+            f"{cutoff_clause}{age_clause}"
+            "ORDER BY tier_rank, "
+            f"  (confidence / {_CONFIDENCE_BAND_WIDTH}) DESC, "
+            "  (distance_bucket IS NULL), distance_bucket ASC, "
+            "  confidence DESC, date_ingested DESC "
             "LIMIT ?"
         )
         # Status placeholders bind before min_confidence_pct in the SQL text.
         params = [*REVIEW_STATUSES, *params, limit]
         return self.conn.execute(sql, params).fetchall()
+
+    def count_stale_reviewable(self, max_age_days: int) -> int:
+        """Reviewable listings excluded by a ``max_age_days`` bound.
+
+        Lets the caller say "12 hidden as stale" instead of showing an empty
+        page — an empty queue with no explanation reads as a broken tool.
+        """
+        if max_age_days <= 0:
+            return 0
+        cutoff = (
+            datetime.now(timezone.utc) - timedelta(days=max_age_days)
+        ).isoformat()
+        placeholders = ", ".join("?" for _ in REVIEW_STATUSES)
+        row = self.conn.execute(
+            "SELECT COUNT(*) n FROM listings "
+            f"WHERE pipeline_status IN ({placeholders}) "
+            "AND verdict IN ('YES', 'MAYBE') "
+            "AND date_ingested < ?",
+            [*REVIEW_STATUSES, cutoff],
+        ).fetchone()
+        return row["n"]
 
     def get_queue_stats(self) -> dict:
         """Snapshot for the CLI `status` verb (C-1).

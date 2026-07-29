@@ -93,7 +93,7 @@ class TestNextVerb:
     def test_empty_queue_is_not_an_error(self, db, capsys):
         code, payload = _run_json(capsys, "next")
         assert code == 0
-        assert payload == {"verb": "next", "count": 0, "listings": []}
+        assert payload["count"] == 0 and payload["listings"] == []
 
     def test_auto_tier_first(self, db, capsys):
         _seed(db, title="Queued", company="A", confidence=99, status="auto_queued")
@@ -124,7 +124,8 @@ class TestJsonContract:
     def test_next_card_keys(self, db, capsys):
         _seed(db)
         _, payload = _run_json(capsys, "next")
-        assert set(payload) == {"verb", "count", "listings"}
+        assert set(payload) == {"verb", "count", "listings", "max_age_days",
+                                "hidden_stale"}
         assert set(payload["listings"][0]) == self.CARD_KEYS
 
     def test_show_card_keys(self, db, capsys):
@@ -733,3 +734,105 @@ class TestStatusVerb:
         _run_json(capsys, "status")
         assert db.get_listing_by_id(job_id)["presented_at"] is None
         assert not _ledger.exists()
+
+
+class TestFreshnessBound:
+    """D-2 — the review surface had no age check while digest.py bounded
+    Slack to 14 days. Measured before the fix: 0 reviewable listings under
+    15 days old, 91% over 30 days."""
+
+    def _age(self, db, job_id, days):
+        from datetime import datetime, timedelta, timezone
+        when = (datetime.now(timezone.utc) - timedelta(days=days)).isoformat()
+        db.conn.execute("UPDATE listings SET date_ingested = ? WHERE id = ?",
+                        (when, job_id))
+        db.conn.commit()
+
+    def test_stale_listing_hidden_by_default(self, db, capsys):
+        job_id = _seed(db)
+        self._age(db, job_id, 45)
+        _, payload = _run_json(capsys, "next")
+        assert payload["count"] == 0
+        assert payload["hidden_stale"] == 1
+
+    def test_fresh_listing_shown(self, db, capsys):
+        _seed(db)
+        _, payload = _run_json(capsys, "next")
+        assert payload["count"] == 1
+        assert payload["hidden_stale"] == 0
+
+    def test_max_age_zero_disables_bound(self, db, capsys):
+        job_id = _seed(db)
+        self._age(db, job_id, 400)
+        _, payload = _run_json(capsys, "next", "--max-age", "0")
+        assert payload["count"] == 1
+
+    def test_explicit_max_age_override(self, db, capsys):
+        job_id = _seed(db)
+        self._age(db, job_id, 45)
+        assert _run_json(capsys, "next", "--max-age", "60")[1]["count"] == 1
+
+    def test_env_default(self, db, capsys, monkeypatch):
+        monkeypatch.setenv("REVIEW_MAX_AGE_DAYS", "10")
+        job_id = _seed(db)
+        self._age(db, job_id, 20)
+        assert _run_json(capsys, "next")[1]["count"] == 0
+
+    def test_empty_page_explains_staleness(self, db, capsys):
+        """An empty queue with no explanation reads as a broken tool."""
+        job_id = _seed(db)
+        self._age(db, job_id, 45)
+        _, out = _run(capsys, "next")
+        assert "older than 30 days" in out
+        assert "--max-age 0" in out
+
+    def test_visible_page_notes_hidden_count(self, db, capsys):
+        fresh = _seed(db, title="Fresh", company="F")
+        stale = _seed(db, title="Stale", company="S")
+        self._age(db, stale, 45)
+        _, out = _run(capsys, "next")
+        assert "Fresh" in out and "1 older than 30d hidden" in out
+        assert fresh  # fresh row is the one shown
+
+
+class TestLocationOrdering:
+    """D-3 — location joins the sort inside a confidence band."""
+
+    def _bucket(self, db, job_id, bucket):
+        db.set_distance_bucket(job_id, bucket)
+
+    def test_nearer_wins_within_band(self, db, capsys):
+        far = _seed(db, title="Far", company="F", confidence=92)
+        near = _seed(db, title="Near", company="N", confidence=90)
+        self._bucket(db, far, 3)    # relocation
+        self._bucket(db, near, 1)   # local
+        _, payload = _run_json(capsys, "next")
+        # 90 and 92 share a 5-point band, so distance decides.
+        assert payload["listings"][0]["id"] == near
+
+    def test_big_quality_gap_still_wins(self, db, capsys):
+        far = _seed(db, title="Far", company="F", confidence=98)
+        near = _seed(db, title="Near", company="N", confidence=60)
+        self._bucket(db, far, 3)
+        self._bucket(db, near, 1)
+        _, payload = _run_json(capsys, "next")
+        # Different bands — location must not override a real quality gap.
+        assert payload["listings"][0]["id"] == far
+
+    def test_unknown_distance_sorts_last_in_band(self, db, capsys):
+        known = _seed(db, title="Known", company="K", confidence=90)
+        _seed(db, title="Unknown", company="U", confidence=92)  # no bucket
+        self._bucket(db, known, 2)
+        _, payload = _run_json(capsys, "next")
+        # An unknown commute must not masquerade as a short one.
+        assert payload["listings"][0]["id"] == known
+
+    def test_tier_still_outranks_location(self, db, capsys):
+        auto = _seed(db, title="Auto", company="A", confidence=60,
+                     status="auto")
+        queued = _seed(db, title="Queued", company="Q", confidence=99,
+                       status="auto_queued")
+        self._bucket(db, auto, 3)
+        self._bucket(db, queued, 0)
+        _, payload = _run_json(capsys, "next")
+        assert payload["listings"][0]["id"] == auto

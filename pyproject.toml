@@ -47,6 +47,7 @@ select = ["E", "F", "W", "I"]
 # concatenation would mangle the wire-format.
 "src/batch_process.py" = ["E402"]
 "src/digest.py"        = ["E402"]
+"src/geo_backfill.py"  = ["E402"]
 "src/jobspy_ingest.py" = ["E402"]
 "src/pipeline.py"      = ["E402"]
 "src/process_queue.py" = ["E402"]
