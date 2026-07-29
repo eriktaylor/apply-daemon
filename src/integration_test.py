@@ -231,6 +231,9 @@ def _check_openrouter(do_network: bool, do_llm: bool) -> CheckResult:
             max_tokens=1,
             temperature=0,
         )
+        # Tiny, but metered — invariant 7 admits no exceptions.
+        from src.model_usage import log_response_usage
+        log_response_usage(resp, model, "integration_test")
     except Exception as exc:
         return CheckResult(
             "E. OpenRouter",

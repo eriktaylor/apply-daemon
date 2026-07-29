@@ -29,6 +29,8 @@ import os
 import re
 from urllib.parse import urlparse
 
+from src.model_usage import log_response_usage
+
 logger = logging.getLogger(__name__)
 
 # Tokens shorter than this are dropped from the company-name token set.
@@ -119,6 +121,7 @@ def _llm_check(
             temperature=0.0,
             response_format={"type": "json_object"},
         )
+        log_response_usage(resp, model, "mismatch_gate")
         raw = resp.choices[0].message.content or "{}"
         data = json.loads(raw)
         matches = bool(data.get("matches", True))

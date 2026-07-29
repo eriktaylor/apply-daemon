@@ -40,6 +40,8 @@ import logging
 import os
 from dataclasses import dataclass, field
 
+from src.model_usage import log_response_usage
+
 logger = logging.getLogger(__name__)
 
 VALID_MODES = ("off", "listwise", "swiss")
@@ -85,6 +87,11 @@ def ranking_mode(surface: str) -> str:
         )
         return "off"
     return mode
+
+
+def _rank_stage(surface: str) -> str:
+    """Usage-log stage tag for a ranking call, e.g. ``rank_track_b``."""
+    return f"rank_{surface.lower()}" if surface else "rank"
 
 
 def _rank_model(fallback_model: str) -> str:
@@ -152,6 +159,7 @@ def rank_listwise(
     client,
     model: str,
     candidates: list[RankCandidate],
+    surface: str = "",
 ) -> list[RankCandidate]:
     """Order ``candidates`` best→worst with one listwise LLM call.
 
@@ -165,13 +173,15 @@ def rank_listwise(
     )
     prompt = _LISTWISE_PROMPT.format(candidates_block=block)
     try:
+        rank_model = _rank_model(model)
         resp = client.chat.completions.create(
-            model=_rank_model(model),
+            model=rank_model,
             messages=[{"role": "user", "content": prompt}],
             max_tokens=500,
             temperature=0.0,
             response_format={"type": "json_object"},
         )
+        log_response_usage(resp, rank_model, _rank_stage(surface))
         raw = resp.choices[0].message.content or "{}"
         data = json.loads(raw)
         ordered_ids = data.get("order")
@@ -202,7 +212,7 @@ def rank_candidates(
     if mode == "off" or len(candidates) < 2:
         return candidates
     if mode == "listwise":
-        return rank_listwise(client, model, candidates)
+        return rank_listwise(client, model, candidates, surface=surface)
     if mode == "swiss":
         logger.warning(
             "RANKING_MODE swiss not yet implemented (M-3) — keeping input order",

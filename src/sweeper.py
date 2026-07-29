@@ -37,6 +37,7 @@ load_dotenv()
 
 from src.db import Database
 from src.human_labels import SURFACE_SLACK, append_human_label
+from src.model_usage import log_response_usage
 from src.notifications import _get_slack_config, _import_slack_app
 
 logger = logging.getLogger(__name__)
@@ -2118,6 +2119,7 @@ async def _canonicalize_cohort(
             temperature=0,
             max_tokens=max_tokens,
         )
+        log_response_usage(response, model, "trend_canonicalize")
         text = (response.choices[0].message.content or "").strip()
         # Strip markdown code fences if the model wraps output in them
         if "```" in text:

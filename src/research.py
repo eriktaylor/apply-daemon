@@ -17,6 +17,8 @@ import time
 
 import openai
 
+from src.model_usage import log_response_usage
+
 logger = logging.getLogger(__name__)
 
 _MAX_WORDS = 2000
@@ -39,8 +41,14 @@ def _get_openrouter_config() -> tuple[str, str]:
 
 def _openrouter_generate(
     api_key: str, model: str, prompt: str, max_tokens: int = 512,
+    stage: str = "research",
 ) -> str:
-    """Generate text via OpenRouter. Returns raw response text."""
+    """Generate text via OpenRouter. Returns raw response text.
+
+    ``stage`` separates the two calls each Deep Research run makes — query
+    generation and synthesis — in the usage log, since they have very
+    different token profiles.
+    """
     client = openai.OpenAI(
         base_url="https://openrouter.ai/api/v1",
         api_key=api_key,
@@ -51,6 +59,7 @@ def _openrouter_generate(
         max_tokens=max_tokens,
         temperature=0.0,
     )
+    log_response_usage(resp, model, stage)
     return resp.choices[0].message.content or ""
 
 
@@ -90,7 +99,7 @@ Job context: {job_description[:500]}
 
 Respond with ONLY 3 queries, one per line, no numbering or bullets.\
 """
-    raw = _openrouter_generate(api_key, model, prompt)
+    raw = _openrouter_generate(api_key, model, prompt, stage="research_queries")
     queries = [q.strip().strip("-•*0123456789.") for q in raw.strip().split("\n") if q.strip()]
     queries = queries[:3]
     if not queries:
@@ -223,7 +232,9 @@ Keep it factual and concise. Maximum 500 words. If information is missing \
 for a section, skip it. Do not fabricate details.\
 """
 
-    synthesis = _openrouter_generate(api_key, model, synthesis_prompt, max_tokens=1024)
+    synthesis = _openrouter_generate(
+        api_key, model, synthesis_prompt, max_tokens=1024, stage="research_synth",
+    )
     if not synthesis.strip():
         return ""
 

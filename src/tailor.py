@@ -32,6 +32,7 @@ load_dotenv()
 from src.compile import generate_assets
 from src.db import Database
 from src.file_utils import read_dropzone_file
+from src.model_usage import log_response_usage
 from src.profile_loader import load_profile
 from src.research import run_deep_research
 
@@ -402,7 +403,7 @@ def generate_immediate(
     )
 
     logger.info("Calling OpenRouter API (immediate) for listing %s...", job_id[:8])
-    response_text = _call_openrouter(client, prompt)
+    response_text = _call_openrouter(client, prompt, stage="tailor")
     claude_json = _parse_tailor_response(response_text)
 
     output_path = generate_assets(
@@ -504,7 +505,7 @@ def generate_answers_only(job_id: str, custom_questions: str) -> tuple[Path, dic
     )
 
     logger.info("Calling OpenRouter API (answers-only) for listing %s...", job_id[:8])
-    response_text = _call_openrouter(client, prompt, max_tokens=1024)
+    response_text = _call_openrouter(client, prompt, max_tokens=1024, stage="tailor_answers")
     answers_json = _parse_answers_response(response_text)
 
     # Save answers to the existing output directory
@@ -724,7 +725,7 @@ def generate_cover_letter_only(job_id: str) -> tuple[Path, dict]:
     )
 
     logger.info("Calling OpenRouter API (cover letter only) for listing %s...", job_id[:8])
-    response_text = _call_openrouter(client, prompt, max_tokens=2048)
+    response_text = _call_openrouter(client, prompt, max_tokens=2048, stage="tailor_coverletter")
     cl_json = _parse_single_asset_response(response_text, "clean_cover_letter_text")
 
     # Compile cover letter .docx — versioned so repeat calls produce _v2, _v3, …
@@ -768,7 +769,7 @@ def generate_interview_prep_only(job_id: str) -> tuple[Path, dict]:
     )
 
     logger.info("Calling OpenRouter API (interview prep only) for listing %s...", job_id[:8])
-    response_text = _call_openrouter(client, prompt, max_tokens=2048)
+    response_text = _call_openrouter(client, prompt, max_tokens=2048, stage="tailor_prep")
     prep_json = _parse_single_asset_response(response_text, "interview_prep_guide")
 
     # Save interview prep as Markdown — versioned so repeat calls produce _v2, _v3, …
@@ -846,7 +847,7 @@ def generate_polish_resume(job_id: str) -> tuple[Path, dict]:
     )
 
     logger.info("Calling OpenRouter API (polish resume) for listing %s...", job_id[:8])
-    response_text = _call_openrouter(client, prompt, max_tokens=4096)
+    response_text = _call_openrouter(client, prompt, max_tokens=4096, stage="tailor_polish")
     polish_json = _parse_single_asset_response(response_text, "polished_resume_text")
 
     # Write polished resume .docx — versioned so repeat calls produce _v2, _v3, …
@@ -995,6 +996,7 @@ async def _tailor_one_async(
             max_tokens=4096,
             response_format={"type": "json_object"},
         )
+        log_response_usage(resp, model, "tailor_batch")
         text = resp.choices[0].message.content or ""
         parsed = _parse_tailor_response(text)
         generate_assets(job_id, parsed, listing)
@@ -1092,11 +1094,15 @@ def _call_openrouter(
     client: openai.OpenAI,
     prompt: str,
     max_tokens: int = 4096,
+    stage: str = "tailor",
 ) -> str:
     """Make a chat completion request via OpenRouter.
 
     Uses json_object response format so the model returns valid JSON directly.
     Returns the raw text content of the response.
+
+    ``stage`` tags the usage-log entry so the on-demand asset generators are
+    distinguishable from a full tailor run in ``report --spend``.
 
     Raises ResponseTruncatedError if finish_reason='length' (token cap hit).
     """
@@ -1107,6 +1113,9 @@ def _call_openrouter(
         max_tokens=max_tokens,
         response_format={"type": "json_object"},
     )
+    # Logged before the truncation check below so a capped-out response still
+    # records the tokens it burned — those are billed either way.
+    log_response_usage(resp, model, stage)
     choice = resp.choices[0]
     content = choice.message.content
     if not content:

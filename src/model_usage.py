@@ -77,6 +77,28 @@ def _get_logger() -> logging.Logger | None:
     return logger
 
 
+def log_response_usage(resp: object, model: str, stage: str) -> int:
+    """Log token usage straight from an OpenAI-SDK response object.
+
+    Every metered call site should use this rather than reaching for
+    ``resp.usage`` itself — the extraction is defensive (``usage`` is absent
+    on some providers and on malformed responses) and the ledger must never
+    be the reason a pipeline stage crashes.
+
+    Returns the token count logged (0 when unavailable), so callers that
+    already track tokens can keep doing so without a second read.
+    """
+    tokens = 0
+    try:
+        usage = getattr(resp, "usage", None)
+        if usage is not None:
+            tokens = int(getattr(usage, "total_tokens", 0) or 0)
+    except (TypeError, ValueError):
+        tokens = 0
+    log_model_usage(model, stage, tokens)
+    return tokens
+
+
 def log_model_usage(model: str, stage: str, tokens: int) -> None:
     """Append one pipe-delimited usage record. Never raises."""
     if not _enabled():
