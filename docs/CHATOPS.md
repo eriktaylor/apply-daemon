@@ -1,5 +1,22 @@
 # ChatOps & Commands
 
+> ## ⚠️ Thread commands are frozen
+>
+> **Slack reactions (👍 👎 ✏️ ❓) remain fully supported** — the digest is the
+> ambient/mobile surface and is not going away.
+>
+> **Slack *thread commands* (`!applied`, `!triage`, `!trend`, `!coverletter`,
+> `!prep`, `!polish`, `!regenerate`, `!update`, `!answer`, …) are frozen:**
+> they work as documented, but no new verbs will be added here. New
+> post-triage functionality goes to the CLI review surface
+> (`python -m src.cli`), which a Claude Code skill drives conversationally.
+>
+> Rationale: thread commands grew to ~2,000 lines re-implementing an
+> interactive shell inside Slack messages. The same verbs are cheaper and
+> testable as a CLI. See `plans/cli_skill_interface.md` (item S-1); whether
+> these commands are eventually removed is decided by S-2 after both
+> surfaces have run side by side.
+
 The entire post-triage workflow is driven by Slack reactions and thread commands, processed each time you run `python -m src.sweeper` — no Socket Mode or webhooks required.
 
 ## How reactions work

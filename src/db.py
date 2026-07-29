@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import json
+import os
 import sqlite3
 from datetime import datetime, timedelta, timezone
 from difflib import SequenceMatcher
@@ -13,6 +14,36 @@ from rapidfuzz.fuzz import token_set_ratio
 from src.models import JobListing
 
 DEFAULT_DB_PATH = Path("apply_daemon.db")
+
+# Confidence band width for review-queue ordering. Matches
+# process_queue._BAND_WIDTH: raw confidence is not trustworthy to
+# single-digit precision, so distance breaks ties inside a band.
+_CONFIDENCE_BAND_WIDTH = 5
+
+# Statuses eligible for the CLI review queue, in presentation order.
+# 'auto' first: those rows already have cached Deep Research in output/,
+# so deep-diving one costs no tokens.
+REVIEW_STATUSES = ("auto", "auto_queued", "triaged")
+
+# Milliseconds a writer waits on a locked DB before raising. WAL gives
+# concurrent readers, but writers still serialize; short-lived CLI processes
+# invoked back-to-back would otherwise fail with "database is locked".
+_BUSY_TIMEOUT_MS = 5000
+
+
+def resolve_db_path(db_path: Path | None = None) -> Path:
+    """Resolve the database path: explicit arg → $APPLY_DAEMON_DB → default.
+
+    The default is relative, so a process started outside the project root
+    would silently create an empty database in the wrong directory. Setting
+    APPLY_DAEMON_DB pins one store regardless of the working directory.
+    """
+    if db_path is not None:
+        return Path(db_path)
+    env_path = os.getenv("APPLY_DAEMON_DB", "").strip()
+    if env_path:
+        return Path(env_path).expanduser()
+    return DEFAULT_DB_PATH
 
 SCHEMA = """
 CREATE TABLE IF NOT EXISTS listings (
@@ -65,10 +96,11 @@ class Database:
     """SQLite access layer for the listings pipeline."""
 
     def __init__(self, db_path: Path | None = None):
-        self.db_path = db_path or DEFAULT_DB_PATH
+        self.db_path = resolve_db_path(db_path)
         self.conn = sqlite3.connect(str(self.db_path))
         self.conn.row_factory = sqlite3.Row
         self.conn.execute("PRAGMA journal_mode=WAL")
+        self.conn.execute(f"PRAGMA busy_timeout={_BUSY_TIMEOUT_MS}")
         self._init_schema()
 
     def _init_schema(self) -> None:
@@ -86,6 +118,10 @@ class Database:
             (
                 "date_posted",
                 "ALTER TABLE listings ADD COLUMN date_posted TEXT",
+            ),
+            (
+                "presented_at",
+                "ALTER TABLE listings ADD COLUMN presented_at TEXT",
             ),
             (
                 "gmail_message_id",
@@ -376,6 +412,18 @@ class Database:
             (verdict,),
         ).fetchall()
 
+    def get_listing_signals(self) -> list[sqlite3.Row]:
+        """Return (id, verdict, confidence, date_ingested) for every listing.
+
+        Read-only support for eval preference-pair mining (ranking_upgrade.md
+        E-3): lets the miner find un-reacted listings in the same ingestion
+        batch without loading full rows or raw content.
+        """
+        return self.conn.execute(
+            "SELECT id, verdict, confidence, date_ingested "
+            "FROM listings ORDER BY date_ingested"
+        ).fetchall()
+
     def get_recent_listings(self, hours: int = 1) -> list[sqlite3.Row]:
         """Get listings ingested within the last N hours."""
         return self.conn.execute(
@@ -586,6 +634,41 @@ class Database:
             ).fetchall()
         return {row["pipeline_status"]: row["cnt"] for row in rows}
 
+    def get_model_breakdown(self, max_age_days: int | None = None) -> dict[str, dict]:
+        """Per-model outcome breakdown for the live model report (O-2).
+
+        Same spirit as :meth:`get_funnel_counts` but grouped by ``model_used``
+        instead of a single funnel. One query; aggregated in Python so the
+        report layer can derive save-rate, interviews/YES, and confidence
+        calibration without extra round-trips.
+
+        Returns ``model_used → {"statuses": {status: n},
+        "verdicts": {VERDICT: n}, "confidences": [(confidence, status), ...]}``.
+        Rows with a NULL/empty ``model_used`` bucket under ``"(unknown)"``.
+        """
+        where, params = "", []
+        if max_age_days is not None:
+            cutoff = (datetime.now(timezone.utc) - timedelta(days=max_age_days)).isoformat()
+            where = "WHERE date_ingested >= ?"
+            params = [cutoff]
+        rows = self.conn.execute(
+            f"SELECT model_used, pipeline_status, verdict, confidence FROM listings {where}",
+            params,
+        ).fetchall()
+
+        out: dict[str, dict] = {}
+        for r in rows:
+            model = (r["model_used"] or "").strip() or "(unknown)"
+            entry = out.setdefault(
+                model, {"statuses": {}, "verdicts": {}, "confidences": []}
+            )
+            status = r["pipeline_status"] or "(none)"
+            entry["statuses"][status] = entry["statuses"].get(status, 0) + 1
+            verdict = (r["verdict"] or "").upper() or "(none)"
+            entry["verdicts"][verdict] = entry["verdicts"].get(verdict, 0) + 1
+            entry["confidences"].append((r["confidence"] or 0, status))
+        return out
+
     def get_listing_history(
         self, title: str, company: str, current_job_id: str, threshold: float = 85.0
     ) -> str:
@@ -745,6 +828,190 @@ class Database:
         if row["pipeline_status"] in self._AUTOPILOT_BLOCKED_STATUSES:
             return False
         return self.update_pipeline_status(listing_id, "auto_queued")
+
+    def get_review_queue(
+        self,
+        limit: int = 3,
+        *,
+        min_confidence_pct: int = 0,
+        session_window_minutes: int | None = None,
+        max_age_days: int | None = None,
+    ) -> list[sqlite3.Row]:
+        """Return the next page of listings awaiting a human decision.
+
+        Backs the CLI review surface (`plans/cli_skill_interface.md` I-1).
+
+        **``presented_at`` is paging state, not an eligibility gate.**
+        Eligibility comes from ``pipeline_status`` alone — a listing is
+        undecided until a human acts on it. Unlike ``slack_notified`` (a
+        one-way gate, correct there because a posted card persists in the
+        channel), a CLI presentation persists nowhere: if it gated
+        eligibility, "show 3" followed by a dead session would strand those
+        three forever. ``session_window_minutes`` only skips rows shown that
+        recently, so ``next`` pages forward within a sitting and undecided
+        rows reappear later.
+
+        **Ordering — tier, then quality band, then distance, then exact
+        quality, then recency.** All in SQL, no network calls: an interactive
+        verb cannot block on Nominatim, which is why
+        ``process_queue._select_top_n`` is deliberately NOT reused.
+
+        - ``auto`` rows lead because their Deep Research is already cached in
+          ``output/``, making a deep-dive token-free.
+        - Confidence is banded (``_CONFIDENCE_BAND_WIDTH``) before distance is
+          consulted, mirroring ``process_queue._band()``'s existing admission
+          that raw confidence isn't trustworthy to single-digit precision. So
+          a nearer listing outranks a marginally-higher-scoring far one, but
+          never a substantially better one.
+        - Rows with no ``distance_bucket`` sort last within their band, never
+          first — an unknown commute must not masquerade as a short one. Run
+          ``python -m src.geo_backfill`` to populate them.
+
+        ``max_age_days`` bounds *ingestion* age. It exists because this is the
+        freshness surface and had no age check at all, while ``digest.py``
+        bounds Slack to 14 days. Callers pass their own default and report
+        what was hidden — see ``cli.cmd_next``.
+        """
+        params: list = [min_confidence_pct]
+        cutoff_clause = ""
+        if session_window_minutes is not None:
+            cutoff = (
+                datetime.now(timezone.utc) - timedelta(minutes=session_window_minutes)
+            ).isoformat()
+            cutoff_clause = "AND (presented_at IS NULL OR presented_at < ?) "
+            params.append(cutoff)
+
+        age_clause = ""
+        if max_age_days is not None and max_age_days > 0:
+            age_cutoff = (
+                datetime.now(timezone.utc) - timedelta(days=max_age_days)
+            ).isoformat()
+            age_clause = "AND date_ingested >= ? "
+            params.append(age_cutoff)
+
+        placeholders = ", ".join("?" for _ in REVIEW_STATUSES)
+        sql = (
+            "SELECT *, CASE pipeline_status "
+            "  WHEN 'auto' THEN 0 WHEN 'auto_queued' THEN 1 ELSE 2 "
+            "END AS tier_rank "
+            "FROM listings "
+            f"WHERE pipeline_status IN ({placeholders}) "
+            "AND verdict IN ('YES', 'MAYBE') "
+            "AND confidence >= ? "
+            f"{cutoff_clause}{age_clause}"
+            "ORDER BY tier_rank, "
+            f"  (confidence / {_CONFIDENCE_BAND_WIDTH}) DESC, "
+            "  (distance_bucket IS NULL), distance_bucket ASC, "
+            "  confidence DESC, date_ingested DESC "
+            "LIMIT ?"
+        )
+        # Status placeholders bind before min_confidence_pct in the SQL text.
+        params = [*REVIEW_STATUSES, *params, limit]
+        return self.conn.execute(sql, params).fetchall()
+
+    def count_stale_reviewable(self, max_age_days: int) -> int:
+        """Reviewable listings excluded by a ``max_age_days`` bound.
+
+        Lets the caller say "12 hidden as stale" instead of showing an empty
+        page — an empty queue with no explanation reads as a broken tool.
+        """
+        if max_age_days <= 0:
+            return 0
+        cutoff = (
+            datetime.now(timezone.utc) - timedelta(days=max_age_days)
+        ).isoformat()
+        placeholders = ", ".join("?" for _ in REVIEW_STATUSES)
+        row = self.conn.execute(
+            "SELECT COUNT(*) n FROM listings "
+            f"WHERE pipeline_status IN ({placeholders}) "
+            "AND verdict IN ('YES', 'MAYBE') "
+            "AND date_ingested < ?",
+            [*REVIEW_STATUSES, cutoff],
+        ).fetchone()
+        return row["n"]
+
+    def get_queue_stats(self) -> dict:
+        """Snapshot for the CLI `status` verb (C-1).
+
+        Answers "is it worth running today?" — how much undecided work is
+        already queued, and how stale it is. All counts come from one pass so
+        the numbers are mutually consistent.
+        """
+        placeholders = ", ".join("?" for _ in REVIEW_STATUSES)
+        rows = self.conn.execute(
+            "SELECT pipeline_status, COUNT(*) n FROM listings "
+            f"WHERE pipeline_status IN ({placeholders}) "
+            "AND verdict IN ('YES', 'MAYBE') "
+            "GROUP BY pipeline_status",
+            list(REVIEW_STATUSES),
+        ).fetchall()
+        by_status = {r["pipeline_status"]: r["n"] for r in rows}
+
+        last_ingest = self.conn.execute(
+            "SELECT MAX(date_ingested) d FROM listings"
+        ).fetchone()["d"]
+        last_decision = self.conn.execute(
+            "SELECT MAX(updated_at) d FROM listings "
+            "WHERE pipeline_status IN ('saved', 'passed', 'tailored')"
+        ).fetchone()["d"]
+        total = self.conn.execute(
+            "SELECT COUNT(*) n FROM listings"
+        ).fetchone()["n"]
+
+        return {
+            "reviewable": sum(by_status.values()),
+            "by_status": by_status,
+            "total_listings": total,
+            "last_ingest": last_ingest,
+            "last_decision": last_decision,
+        }
+
+    def get_presented_page(self, within_minutes: int) -> list[sqlite3.Row]:
+        """Return the most recently presented page of undecided listings.
+
+        Defines "the current page" for bulk actions in a world of ephemeral
+        CLI processes: there is no session object, so the page is the set of
+        rows sharing the latest ``presented_at`` stamp — :meth:`mark_presented`
+        writes one timestamp per page, which makes that set exact.
+
+        Deliberately NOT "everything presented in the last N minutes": a user
+        who viewed three pages and typed `pass --all` means the three rows on
+        screen, not all nine. ``within_minutes`` only bounds staleness, so a
+        page from yesterday is never the target.
+        """
+        cutoff = (
+            datetime.now(timezone.utc) - timedelta(minutes=within_minutes)
+        ).isoformat()
+        placeholders = ", ".join("?" for _ in REVIEW_STATUSES)
+        return self.conn.execute(
+            "SELECT * FROM listings "
+            f"WHERE pipeline_status IN ({placeholders}) "
+            "AND presented_at IS NOT NULL AND presented_at >= ? "
+            "AND presented_at = ("
+            "  SELECT MAX(presented_at) FROM listings "
+            f"  WHERE pipeline_status IN ({placeholders}) "
+            "  AND presented_at IS NOT NULL AND presented_at >= ?"
+            ") "
+            "ORDER BY confidence DESC",
+            [*REVIEW_STATUSES, cutoff, *REVIEW_STATUSES, cutoff],
+        ).fetchall()
+
+    def mark_presented(self, listing_ids: list[str]) -> int:
+        """Stamp ``presented_at`` on listings just shown to the user.
+
+        Paging state only — see :meth:`get_review_queue`. Returns the number
+        of rows stamped.
+        """
+        if not listing_ids:
+            return 0
+        now = datetime.now(timezone.utc).isoformat()
+        placeholders = ", ".join("?" for _ in listing_ids)
+        cursor = self.conn.execute(
+            f"UPDATE listings SET presented_at = ? WHERE id IN ({placeholders})",
+            [now, *listing_ids],
+        )
+        self.conn.commit()
+        return cursor.rowcount
 
     def get_auto_queue(
         self,

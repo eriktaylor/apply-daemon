@@ -45,6 +45,7 @@ from src.expired_probe import probe as expired_probe
 from src.file_utils import read_dropzone_file
 from src.geo import get_distance
 from src.mismatch_gate import check_mismatch
+from src.model_usage import log_response_usage
 from src.notifications import _get_slack_config, _import_slack_app
 from src.profile_loader import load_profile
 from src.research import run_deep_research
@@ -659,12 +660,14 @@ async def _process_one(
         if auto_json is None:
             prompt = _build_prompt(listing, research_context, profile_text, resume_text)
             try:
+                auto_model = _tailor_model()
                 resp = await client.chat.completions.create(
-                    model=_tailor_model(),
+                    model=auto_model,
                     messages=[{"role": "user", "content": prompt}],
                     max_tokens=2048,
                     response_format={"type": "json_object"},
                 )
+                log_response_usage(resp, auto_model, "autopilot_rescore")
                 raw = resp.choices[0].message.content or ""
                 auto_json = _parse_auto_response(raw)
             except Exception:

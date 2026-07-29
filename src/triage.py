@@ -19,6 +19,7 @@ from dataclasses import dataclass, field
 import openai
 from dotenv import load_dotenv
 
+from src.model_usage import log_model_usage
 from src.models import JobListing
 
 logger = logging.getLogger(__name__)
@@ -343,7 +344,7 @@ def evaluate_scrape_validity(
     # Truncate to ~3000 chars — enough for the judge, saves tokens
     snippet = text[:3000]
     prompt = _JUDGE_PROMPT.format(scraped_text=snippet)
-    response = _call_openrouter(client, model, prompt, json_mode=True)
+    response = _call_openrouter(client, model, prompt, json_mode=True, stage="stage3_validate")
     raw = response["text"]
     try:
         # Attempt to extract JSON from the response
@@ -629,13 +630,18 @@ class TriageSession:
         model: str | None = None,
         confidence_threshold: float | None = None,
         bypass_rejection: bool = False,
+        stage1_model: str | None = None,
     ):
         _warn_deprecated_ensemble_env()
         env_api_key, env_model = get_openrouter_config()
         self.api_key = env_api_key
         self.model = model or env_model
-        # Stage 1 extraction model — separate fast/cheap model for extraction
-        self.stage1_model = os.getenv("OPENROUTER_STAGE1_MODEL", "openai/gpt-5.4-nano")
+        # Stage 1 extraction model — separate fast/cheap model for extraction.
+        # Explicit override (e.g. eval's --stage1-model) wins over the env slot
+        # so a "nano vs. flash-lite for Stage 1" comparison is possible.
+        self.stage1_model = stage1_model or os.getenv(
+            "OPENROUTER_STAGE1_MODEL", "openai/gpt-5.4-nano"
+        )
         # Max tokens for Stage 5 evaluation responses
         self.max_tokens = int(os.getenv("OPENROUTER_NUM_PREDICT", "1000"))
         self.profile_llm_context = profile_llm_context
@@ -807,7 +813,9 @@ class TriageSession:
             )
 
         try:
-            resp = _call_openrouter(self._client, self.model, prompt, max_tokens=500)
+            resp = _call_openrouter(
+                self._client, self.model, prompt, max_tokens=500, stage="stage3_synth",
+            )
             text = resp.get("text", "").strip()
             if text and len(text.split()) >= 10:
                 logger.info(
@@ -916,6 +924,7 @@ class TriageSession:
         try:
             response = _call_openrouter(
                 self._client, self.model, prompt, max_tokens=200, json_mode=True,
+                stage="stage3_batch_judge",
             )
             raw = response["text"]
             match = re.search(r"\{[^{}]*\}", raw, re.DOTALL)
@@ -1066,6 +1075,7 @@ class TriageSession:
         response = _call_openrouter(
             self._client, extractor_model, prompt,
             max_tokens=4000,  # digest emails may have 10+ listings
+            stage="stage1",
         )
         latency_ms = int((time.monotonic() - start) * 1000)
 
@@ -1176,6 +1186,7 @@ class TriageSession:
             max_tokens=self.max_tokens,
             temperature=temperature,
             json_mode=True,
+            stage="stage5",
         )
         evaluation = _parse_evaluation_json(resp["text"])
         evaluation["model"] = model
@@ -1505,10 +1516,12 @@ def _call_openrouter(
     max_tokens: int = 1000,
     temperature: float = 0.0,
     json_mode: bool = False,
+    stage: str = "unknown",
 ) -> dict:
     """Make a chat completion request via OpenRouter.
 
-    Returns dict with 'text' and 'tokens' keys.
+    Returns dict with 'text' and 'tokens' keys. Emits an O-1 usage record
+    (model slug, stage, token count) to the model-usage telemetry channel.
     """
     kwargs: dict = {
         "model": model,
@@ -1522,4 +1535,5 @@ def _call_openrouter(
     resp = client.chat.completions.create(**kwargs)
     text = resp.choices[0].message.content or ""
     tokens = resp.usage.total_tokens if resp.usage else 0
+    log_model_usage(model, stage, tokens)
     return {"text": text, "tokens": tokens}

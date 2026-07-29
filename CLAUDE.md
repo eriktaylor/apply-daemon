@@ -23,46 +23,27 @@ python -m src.jobspy_ingest     # Track A: proactive JobSpy scrape
 python -m src.pipeline          # Track B: email ingestion
 python -m src.digest            # Post Slack digest cards
 python -m src.sweeper           # Process Slack reactions + ChatOps commands
+python -m src.cli next --top 3  # CLI review surface (also: show/deep-dive/save/pass)
 python -m src.batch_process     # Concurrent tailor for all saved listings
 python -m src.process_queue     # Autopilot Speculative Agent (no-op unless AUTOPILOT_ENABLED=true)
 python -m src.process_queue --backfill        # Promote existing YES/MAYBE into autopilot queue
 python -m src.integration_test  # Config + reachability check (use --no-llm / --no-network to skip)
-python -m src.report --days 7   # Funnel metrics
+python -m src.report --days 7   # Funnel metrics (--models, --spend)
+python -m src.geo_backfill      # One-time distance_bucket backfill (--dry-run first)
 ```
 
 ## Architecture
 
-Two ingestion tracks converge on a shared LLM scoring stage and a single SQLite store (`apply_daemon.db`). All LLM calls route through **OpenRouter**; Slack is the only UI.
+Two ingestion tracks converge on a shared LLM scoring stage and a single SQLite store (`apply_daemon.db`), which then fans back out to two review surfaces. All LLM calls route through **OpenRouter**, except in-session tailoring.
 
-```
-Track A (jobspy_ingest.py)              Track B (pipeline.py)
-  scrape_jobs() → structured rows         IMAP → classify → extract text
-  Stage 4b: lazy-load full description    Stage 1: LLM anchor extraction
-  (when preview < 300 words or truncated) Stage 2-3: validate, scrape, DDGS heal
-                       │                                 │
-                       └────────── dedup (rapidfuzz token-set, 85%) ──────────┘
-                                          │
-                          Stage 5: triage.py LLM scoring
-                          (verdict YES/MAYBE/NO + 0–100 confidence,
-                           gated by CONFIDENCE_THRESHOLD)
-                                          │
-                                  db.upsert_listing()
-                                  (Smart Upsert: fuzzy match → UPDATE, else INSERT)
-                                          │
-                                  digest.py → Slack Block Kit card
-                                          │
-                                  Reactions handled by sweeper.py
-                                  (👍 save, 👎 pass, ✏️ tailor, ❓ smart-route)
-                                          │
-                                  tailor.py + research.py + compile.py
-                                  → output/<Company>_<Title>_<ID>/
-```
+**The pipeline diagrams live in [README.md](README.md#how-it-works)** — "Ingestion & scoring" and "Review & apply". They are not repeated here; see the anti-drift principle below. What follows is the agent-facing map: which module owns what.
 
-**Dedup happens *before* Stage 5** — already-known listings are skipped without spending OpenRouter tokens. The Smart Upsert at the end handles races between the two tracks.
+Load-bearing behaviors a change can easily break:
 
-**Three independent OpenRouter model slots** (`OPENROUTER_STAGE1_MODEL`, `OPENROUTER_MODEL` (Stage 5), `OPENROUTER_TAILOR_MODEL`, plus optional `OPENROUTER_TREND_MODEL`) let cost/quality be tuned per stage. See `docs/MODELS.md`.
-
-**Autopilot (Speculative Agent)** — when `AUTOPILOT_ENABLED=true`, `process_queue.py` runs Deep Research + a Claude match-analysis pass on every listing the pipeline auto-queues, posts the enriched card, and auto-passes post-research NO verdicts. Manual ✏️ tailoring reuses the cached research.
+- **Dedup runs *before* Stage 5** — already-known listings are skipped without spending tokens. The Smart Upsert afterwards handles races between tracks.
+- **Three independent OpenRouter model slots** (`OPENROUTER_STAGE1_MODEL`, `OPENROUTER_MODEL` for Stage 5, `OPENROUTER_TAILOR_MODEL`, plus optional `OPENROUTER_TREND_MODEL`) let cost/quality be tuned per stage. See [docs/MODELS.md](docs/MODELS.md).
+- **Autopilot** (`process_queue.py`) is a no-op unless `AUTOPILOT_ENABLED=true`. It pre-caches Deep Research so a CLI deep-dive costs nothing.
+- **`presented_at` is paging state, not a gate.** The reasoning, and why gating on it would strand a shown page, is in `db.get_review_queue`'s docstring — the only copy.
 
 ### Project structure
 
@@ -79,6 +60,9 @@ apply-daemon/
 │   ├── pipeline.py              # Track B — silent worker (fetch, triage, store)
 │   ├── digest.py                # Slack digest (posts listings for reactions)
 │   ├── sweeper.py               # Reaction sweeper + ChatOps parser. Priority: pass > tailor > save. Idempotent.
+│   │                            # THREAD COMMANDS ARE FROZEN — see Conventions.
+│   ├── human_labels.py          # Shared human-feedback ledger writer (data/human_labels.jsonl)
+│   ├── cli.py                   # CLI review surface (next/show/deep-dive/save/pass). Local-only: no LLM, no network.
 │   ├── tailor.py                # Cloud LLM escalation engine (multi-line prompts; E501 ignored)
 │   ├── compile.py               # .docx generation from tailored bullets
 │   ├── research.py              # Deep Research agent (semantic scraping; runs before every tailor)
@@ -124,8 +108,62 @@ apply-daemon/
 - Logging must emit listing IDs + decisions only — **never raw email content, LLM prompts/responses, or credentials.**
 - Don't weaken `.gitignore`, disable TLS verification, or add raw-content logging.
 
+## Design principles
+
+### One fact, one home
+
+Every idea, feature, number, or result is written **once**, in the surface
+that owns it. Everywhere else points at it.
+
+| Surface | Audience | Owns |
+|---|---|---|
+| `README.md` | humans evaluating or setting up the project | what it does, how to run it, the ASCII architecture diagrams |
+| `CLAUDE.md` | coding agents | repo behavior, invariants, conventions, module→responsibility map |
+| `docs/*.md` | reference | the deep version of one topic (models, chatops, proxy, audit, eval) |
+| `.claude/skills/` | the runtime agent | when to call which verb, how to read its output |
+| `plans/*.md` | planning (gitignored) | what shipped, what's next, and why |
+
+### Anti-drift
+
+Duplicated prose does not stay duplicated — it *diverges*, and then two
+documents disagree with no signal about which is right. This has already
+happened here: CLAUDE.md carried its own copy of the pipeline diagram, and
+it silently went stale, still ending at "reactions handled by sweeper.py"
+long after the CLI review surface shipped.
+
+When editing:
+
+- **Before explaining something, grep for it.** If an explanation exists,
+  link to it instead of writing a second one.
+- **A pointer must not restate.** "See `docs/MODELS.md` for the confidence
+  bands" is a pointer. "See `docs/MODELS.md` — the default is 0.5" is a
+  second copy of the fact, and it will drift.
+- **When behavior changes, grep every mention** and fix the owner; verify
+  the pointers still read true.
+- **Prefer deleting to duplicating.** Moving a section is better than
+  summarizing it in a second place.
+- Same rule in code: shared logic gets one implementation
+  (`human_labels.py`, `model_usage.py`, `ranking.py` all exist for this
+  reason), and one constant has one definition.
+
+### Writing for each audience
+
+- **README** — human-readable and brief. ASCII diagrams over prose where a
+  picture is clearer; prose over tables where it reads better. Aim to be
+  attractive to someone deciding whether to use this. Cut anything a reader
+  doesn't need *at that moment*; push the detail into `docs/`.
+- **CLAUDE.md** — written for a coding agent with no memory of this repo.
+  Favor the non-obvious: invariants, load-bearing behavior, the trap that
+  looks like a bug. Skip anything the code already states plainly.
+- **Interfaces are one surface.** A verb that is correct alone but tells a
+  different story than its neighbors is a defect. Render every affected
+  command on real data before calling interface work done.
+
 ## Conventions
 
 - Multi-line LLM prompt templates in `triage.py` / `tailor.py` are deliberately one prose sentence per line so the wire-format is preserved — do not reflow them; ruff E501 is already ignored for these files.
 - Several entry points need `load_dotenv()` before importing modules that read env at import time → E402 is ignored for those (`pipeline.py`, `digest.py`, `batch_process.py`, `jobspy_ingest.py`, `process_queue.py`, `proxy_test.py`, `sweeper.py`, `tailor.py`).
 - Squash on merge; commit messages on `main` read like changelog entries.
+- **Slack thread commands (`!applied`, `!triage`, `!trend`, …) are frozen** — they still work, but new post-triage functionality belongs in the CLI review surface, not `sweeper.py`. Slack *reactions* (👍 👎 ✏️ ❓) are unaffected. See `docs/CHATOPS.md`.
+- **Every human decision must append to `data/human_labels.jsonl`** via `src/human_labels.py::append_human_label` (pass `surface=`). That ledger is the only input to the preference-pair extractor behind the ranking evals — a surface that skips it is invisible to that work, silently.
+- **Metered spend must be auditable.** Any code path that calls OpenRouter routes its token count through `src/model_usage.py::log_model_usage` (model, stage, tokens — never prompt or response content). `logs/model_usage.log` is the audit trail and the basis for spend ceilings; a spending path missing from it makes the budget unenforceable. Currently only `triage.py` complies — `tailor.py`, `research.py`, and `process_queue.py` are known gaps. In-session (subscription-billed) work is exempt: it has no metered cost to record.
