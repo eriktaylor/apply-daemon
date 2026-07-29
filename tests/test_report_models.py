@@ -101,3 +101,94 @@ class TestPrintModelBreakdown:
     def test_empty_breakdown(self, capsys):
         _print_model_breakdown({})
         assert "no listings" in capsys.readouterr().out.lower()
+
+
+class TestSpendToday:
+    """C-4 — the number C-3's ceiling is enforced against."""
+
+    def _log(self, tmp_path, lines):
+        path = tmp_path / "usage.log"
+        path.write_text("".join(lines), encoding="utf-8")
+        return path
+
+    def test_missing_log_is_zero_not_error(self, tmp_path):
+        from src.model_usage import spend_today
+        tokens, usd = spend_today(tmp_path / "nope.log")
+        assert tokens == 0 and usd is None
+
+    def test_sums_only_today(self, tmp_path):
+        from datetime import datetime, timedelta, timezone
+
+        from src.model_usage import spend_today
+        now = datetime.now(timezone.utc)
+        old = (now - timedelta(days=3)).isoformat()
+        log = self._log(tmp_path, [
+            f"{now.isoformat()}|stage5|google/gemini-3.1-flash-lite|1000\n",
+            f"{old}|stage5|google/gemini-3.1-flash-lite|9999999\n",
+        ])
+        tokens, usd = spend_today(log)
+        assert tokens == 1000
+        assert usd is not None and usd > 0
+
+    def test_unpriced_model_leaves_usd_none(self, tmp_path):
+        """An unpriced model must not read as free — that would let a budget
+        check pass on spend it cannot see."""
+        from datetime import datetime, timezone
+
+        from src.model_usage import spend_today
+        now = datetime.now(timezone.utc).isoformat()
+        log = self._log(tmp_path, [f"{now}|stage5|who/knows|5000\n"])
+        tokens, usd = spend_today(log)
+        assert tokens == 5000
+        assert usd is None
+
+    def test_malformed_lines_skipped(self, tmp_path):
+        from datetime import datetime, timezone
+
+        from src.model_usage import spend_today
+        now = datetime.now(timezone.utc).isoformat()
+        log = self._log(tmp_path, [
+            "GARBAGE\n",
+            f"{now}|stage5|google/gemini-3.1-flash-lite|notanint\n",
+            f"{now}|stage5|google/gemini-3.1-flash-lite|100\n",
+        ])
+        tokens, _ = spend_today(log)
+        assert tokens == 100
+
+
+class TestSpendReport:
+    def test_empty_log_explains_why(self, tmp_path, monkeypatch, capsys):
+        import src.model_usage as mu
+        from src.report import spend_report
+        monkeypatch.setattr(mu, "_DEFAULT_LOG_PATH", str(tmp_path / "none.log"))
+        monkeypatch.setenv("MODEL_USAGE_LOG_PATH", str(tmp_path / "none.log"))
+        spend_report()
+        out = capsys.readouterr().out
+        assert "No metered calls recorded yet" in out
+
+    def test_reports_days_and_stages(self, tmp_path, monkeypatch, capsys):
+        from src.report import spend_report
+        log = tmp_path / "usage.log"
+        log.write_text(
+            "2026-07-28T10:00:00+00:00|stage5|google/gemini-3.1-flash-lite|1000\n"
+            "2026-07-28T11:00:00+00:00|autopilot_rescore|anthropic/claude-sonnet-4.6|2000\n"
+            "2026-07-29T10:00:00+00:00|stage5|google/gemini-3.1-flash-lite|3000\n",
+            encoding="utf-8",
+        )
+        monkeypatch.setenv("MODEL_USAGE_LOG_PATH", str(log))
+        spend_report()
+        out = capsys.readouterr().out
+        assert "2026-07-28" in out and "2026-07-29" in out
+        assert "autopilot_rescore" in out
+        assert "TOTAL" in out
+        assert "verified" in out
+
+    def test_unpriced_model_warns(self, tmp_path, monkeypatch, capsys):
+        from src.report import spend_report
+        log = tmp_path / "usage.log"
+        log.write_text("2026-07-29T10:00:00+00:00|s|mystery/model|500\n",
+                       encoding="utf-8")
+        monkeypatch.setenv("MODEL_USAGE_LOG_PATH", str(log))
+        spend_report()
+        out = capsys.readouterr().out
+        assert "Unpriced models" in out and "mystery/model" in out

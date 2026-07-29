@@ -13,6 +13,7 @@ from __future__ import annotations
 import argparse
 import logging
 import os
+from datetime import datetime, timedelta, timezone
 from pathlib import Path
 
 from src.db import Database
@@ -266,6 +267,85 @@ def _print_cascade_summary(output_root: str = "output") -> None:
         print(f"  Mean confidence gap: {gap:+.1f}  (large − small; blind to false negatives)")
 
 
+def spend_report(days: int | None = None) -> None:
+    """Per-day metered spend from the usage log (C-4).
+
+    Answers "what has this cost me, and is today unusual?" — the number
+    C-3's ceiling is enforced against and the one the control plane reports
+    before firing a run.
+    """
+    from src.model_usage import iter_usage
+
+    try:
+        from eval.model_pricing import (
+            LAST_UPDATED,
+            PRICING_VERIFIED,
+            cost_for_tokens,
+        )
+    except ImportError:
+        print("\n  Pricing table unavailable — cannot cost the usage log.\n")
+        return
+
+    cutoff = None
+    if days:
+        cutoff = (datetime.now(timezone.utc) - timedelta(days=days)).date().isoformat()
+
+    by_day: dict[str, dict] = {}
+    by_stage: dict[str, dict] = {}
+    unpriced: set[str] = set()
+
+    for day, stage, model, tokens in iter_usage():
+        if cutoff and day < cutoff:
+            continue
+        usd = cost_for_tokens(model, tokens)
+        if usd is None:
+            unpriced.add(model)
+        for bucket, key in ((by_day, day), (by_stage, stage)):
+            entry = bucket.setdefault(key, {"calls": 0, "tokens": 0, "usd": 0.0})
+            entry["calls"] += 1
+            entry["tokens"] += tokens
+            entry["usd"] += usd or 0.0
+
+    print()
+    print("  " + "═" * 56)
+    print("    APPLY-DAEMON SPEND REPORT")
+    print(f"    ({f'Last {days} days' if days else 'All-Time'})")
+    print("  " + "═" * 56)
+
+    if not by_day:
+        print("\n  No metered calls recorded yet.")
+        print("  (logs/model_usage.log is written from the next run onward;")
+        print("   spend before it existed was never recorded.)\n")
+        return
+
+    print(f"\n  {'Day':<12} {'Calls':>7} {'Tokens':>12} {'Est $':>10}")
+    print("  " + "─" * 44)
+    for day in sorted(by_day):
+        e = by_day[day]
+        print(f"  {day:<12} {e['calls']:>7} {e['tokens']:>12,} {e['usd']:>10.4f}")
+
+    total_tokens = sum(e["tokens"] for e in by_day.values())
+    total_usd = sum(e["usd"] for e in by_day.values())
+    total_calls = sum(e["calls"] for e in by_day.values())
+    print("  " + "─" * 44)
+    print(f"  {'TOTAL':<12} {total_calls:>7} {total_tokens:>12,} {total_usd:>10.4f}")
+    if by_day:
+        print(f"  {'per day':<12} {'':>7} {'':>12} "
+              f"{total_usd / len(by_day):>10.4f}")
+
+    print(f"\n  {'Stage':<24} {'Calls':>7} {'Tokens':>12} {'Est $':>10}")
+    print("  " + "─" * 56)
+    for stage, e in sorted(by_stage.items(), key=lambda kv: -kv[1]["usd"]):
+        print(f"  {stage:<24} {e['calls']:>7} {e['tokens']:>12,} {e['usd']:>10.4f}")
+
+    if unpriced:
+        print(f"\n  ⚠ Unpriced models costed as $0: {', '.join(sorted(unpriced))}")
+        print("    Add them to eval/model_pricing.py — the total above is a floor.")
+    banner = "verified" if PRICING_VERIFIED else "UNVERIFIED — do not trust $"
+    print(f"\n  Pricing {banner}, dated {LAST_UPDATED}.")
+    print("  In-session (subscription) work is not metered and not shown.\n")
+
+
 def models_report(days: int | None = None) -> None:
     """Print the per-model report: outcomes, calibration, live cost, cascade."""
     with Database() as db:
@@ -342,8 +422,15 @@ def main() -> None:
         help="Show the per-model report (outcomes, calibration, cost, cascade) "
              "instead of the funnel",
     )
+    parser.add_argument(
+        "--spend",
+        action="store_true",
+        help="Show metered spend per day and per stage from the usage log",
+    )
     args = parser.parse_args()
-    if args.models:
+    if args.spend:
+        spend_report(days=args.days)
+    elif args.models:
         models_report(days=args.days)
     else:
         report(days=args.days)

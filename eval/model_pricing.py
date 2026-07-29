@@ -4,10 +4,15 @@ Hand-refreshed table of per-model token prices, used by the eval harness
 (E-1/E-2) to turn token counts into a ``$ per 1k listings`` cost column
 without a live network call inside the eval loop.
 
-IMPORTANT — the numbers below are UNVERIFIED PLACEHOLDERS. Before trusting
-any cost figure, cross-check each slug against https://openrouter.ai/models
-and set ``PRICING_VERIFIED = True``. The eval report prints ``LAST_UPDATED``
-and the verified flag so staleness is visible, never silent.
+Every row below was cross-checked against the model's own openrouter.ai
+page on ``LAST_UPDATED``. Re-verify when that date goes stale — providers
+reprice, and a budget ceiling (``cli_skill_interface.md`` C-3) is only as
+honest as this table. The reports print ``LAST_UPDATED`` and
+``PRICING_VERIFIED`` so staleness is visible, never silent.
+
+Note both list rates ignore prompt caching, which OpenRouter says can cut
+effective cost substantially on the OpenAI and Gemini slugs. Costing at list
+therefore *over*-estimates — the safe direction for a spend ceiling.
 
 Prices are USD per 1,000,000 tokens, split into input (prompt) and output
 (completion). The eval harness only records *total* tokens per listing, so
@@ -21,9 +26,9 @@ from __future__ import annotations
 
 from dataclasses import dataclass
 
-LAST_UPDATED = "2026-07-12"
-# Flip to True only after cross-checking every row against openrouter.ai/models.
-PRICING_VERIFIED = False
+LAST_UPDATED = "2026-07-29"
+# All five rows verified against openrouter.ai on LAST_UPDATED.
+PRICING_VERIFIED = True
 
 # Assumed share of total tokens that are output/completion, used to blend the
 # input and output rates into a single per-1M figure for total-token costing.
@@ -38,13 +43,13 @@ class ModelPrice:
     output_per_1m: float
 
 
-# PLACEHOLDER prices — verify before trusting cost columns (see module docstring).
+# Verified 2026-07-29 against each model's openrouter.ai page.
 PRICING: dict[str, ModelPrice] = {
-    "openai/gpt-5.4-nano": ModelPrice(input_per_1m=0.05, output_per_1m=0.40),
-    "google/gemini-3.1-flash-lite": ModelPrice(input_per_1m=0.10, output_per_1m=0.40),
+    "openai/gpt-5.4-nano": ModelPrice(input_per_1m=0.20, output_per_1m=1.25),
+    "google/gemini-3.1-flash-lite": ModelPrice(input_per_1m=0.25, output_per_1m=1.50),
     "openai/gpt-4o-mini": ModelPrice(input_per_1m=0.15, output_per_1m=0.60),
     "anthropic/claude-sonnet-4.6": ModelPrice(input_per_1m=3.00, output_per_1m=15.00),
-    "deepseek/deepseek-v4-flash": ModelPrice(input_per_1m=0.05, output_per_1m=0.30),
+    "deepseek/deepseek-v4-flash": ModelPrice(input_per_1m=0.09, output_per_1m=0.18),
 }
 
 

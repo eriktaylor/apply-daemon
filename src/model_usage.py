@@ -30,6 +30,7 @@ from __future__ import annotations
 
 import logging
 import os
+from collections.abc import Iterator
 from datetime import datetime, timezone
 from pathlib import Path
 
@@ -75,6 +76,54 @@ def _get_logger() -> logging.Logger | None:
     except OSError:
         return None
     return logger
+
+
+def iter_usage(path: Path | None = None) -> Iterator[tuple[str, str, str, int]]:
+    """Yield ``(day, stage, model, tokens)`` from the usage log.
+
+    ``day`` is the ISO date prefix of the timestamp. Malformed lines are
+    skipped rather than raised on: the log is append-only telemetry written
+    by many processes, and a torn line must never break a report.
+    """
+    target = path or _log_path()
+    if not target.exists():
+        return
+    for line in target.read_text(encoding="utf-8", errors="replace").splitlines():
+        parts = line.strip().split("|")
+        if len(parts) != 4:
+            continue
+        ts, stage, model, tokens = parts
+        try:
+            tok = int(tokens)
+        except ValueError:
+            continue
+        yield ts[:10], stage, model, tok
+
+
+def spend_today(path: Path | None = None) -> tuple[int, float | None]:
+    """Return ``(tokens, usd)`` metered so far today (UTC).
+
+    ``usd`` is None when no row could be priced — the caller must treat that
+    as "unknown", never as zero, or an unpriced model would silently look
+    free to a budget check (`cli_skill_interface.md` C-3).
+    """
+    today = datetime.now(timezone.utc).date().isoformat()
+    tokens = 0
+    usd: float | None = None
+    try:
+        from eval.model_pricing import cost_for_tokens
+    except ImportError:
+        cost_for_tokens = None
+
+    for day, _stage, model, tok in iter_usage(path):
+        if day != today:
+            continue
+        tokens += tok
+        if cost_for_tokens is not None:
+            priced = cost_for_tokens(model, tok)
+            if priced is not None:
+                usd = (usd or 0.0) + priced
+    return tokens, usd
 
 
 def log_response_usage(resp: object, model: str, stage: str) -> int:
