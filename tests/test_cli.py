@@ -115,7 +115,7 @@ class TestJsonContract:
     CARD_KEYS = {
         "id", "title", "company", "location", "salary", "verdict",
         "confidence", "status", "tier", "research_cached", "url",
-        "date_ingested",
+        "date_ingested", "age_days", "distance",
     }
     DETAIL_KEYS = CARD_KEYS | {
         "reason", "job_summary", "matching_skills", "missing_skills",
@@ -682,8 +682,9 @@ class TestStatusVerb:
         _, payload = _run_json(capsys, "status")
         assert set(payload) == {"verb", "queue", "budget"}
         assert set(payload["queue"]) == {
-            "reviewable", "by_tier", "total_listings", "last_ingest",
-            "last_ingest_age_hours", "last_decision",
+            "reviewable", "fresh", "stale_hidden", "max_age_days", "by_tier",
+            "total_listings", "last_ingest", "last_ingest_age_hours",
+            "last_decision",
         }
         assert set(payload["budget"]) == {
             "can_run", "reason", "spent_usd_today", "spent_tokens_today",
@@ -728,6 +729,33 @@ class TestStatusVerb:
     def test_suggests_refresh_when_queue_empty(self, db, capsys):
         _, out = _run(capsys, "status")
         assert "refresh" in out.lower()
+
+    def test_suggests_refresh_when_only_stale_remains(self, db, capsys):
+        """400 stale rows must not stop status from recommending a refresh
+        — the hint keys off FRESH work, not total."""
+        from datetime import datetime, timedelta, timezone
+        job_id = _seed(db)
+        when = (datetime.now(timezone.utc) - timedelta(days=45)).isoformat()
+        db.conn.execute("UPDATE listings SET date_ingested = ? WHERE id = ?",
+                        (when, job_id))
+        db.conn.commit()
+        _, payload = _run_json(capsys, "status")
+        assert payload["queue"]["fresh"] == 0
+        assert payload["queue"]["stale_hidden"] == 1
+        _, out = _run(capsys, "status")
+        assert "refresh" in out.lower()
+
+    def test_card_shows_age_and_distance(self, db, capsys):
+        """Distance silently shapes queue order — an invisible sort key
+        reads as a broken sort, so both new keys surface on the card."""
+        job_id = _seed(db)
+        db.set_distance_bucket(job_id, 1)
+        _, payload = _run_json(capsys, "next")
+        card = payload["listings"][0]
+        assert card["distance"] == "Local"
+        assert card["age_days"] == 0
+        _, out = _run(capsys, "show", job_id)
+        assert "Local" in out
 
     def test_status_makes_no_state_change(self, db, capsys, _ledger):
         job_id = _seed(db)

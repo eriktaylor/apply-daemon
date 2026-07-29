@@ -67,6 +67,11 @@ DEFAULT_MAX_AGE_DAYS = 30
 
 _TIER_LABELS = {0: "auto", 1: "auto_queued", 2: "triaged"}
 
+# Human labels for distance_bucket (populated by src/geo_backfill.py /
+# autopilot). Surfaced on every card because distance now silently shapes
+# the queue order — an invisible sort key reads as a broken sort.
+_DISTANCE_LABELS = {0: "Remote", 1: "Local", 2: "Commute", 3: "Far"}
+
 # Verb → (pipeline_status, ledger action). Ledger actions must match the
 # vocabulary eval/preference_pairs.py scores (save → positive, pass →
 # negative), or CLI decisions land in the ledger as neutral and vanish from
@@ -215,6 +220,8 @@ def _card(row: sqlite3.Row, *, detail: bool = False) -> dict:
     this output reaches a model context and potentially logs.
     """
     links = _json_list(row["links"])
+    age_h = _age_hours(row["date_ingested"])
+    bucket = row["distance_bucket"] if "distance_bucket" in row.keys() else None
     card = {
         "id": row["id"],
         "title": row["title"],
@@ -228,6 +235,8 @@ def _card(row: sqlite3.Row, *, detail: bool = False) -> dict:
         "research_cached": _research_cached(row["id"]),
         "url": links[0] if links else None,
         "date_ingested": row["date_ingested"],
+        "age_days": int(age_h // 24) if age_h is not None else None,
+        "distance": _DISTANCE_LABELS.get(bucket),
     }
     if detail:
         card["reason"] = row["reason"]
@@ -244,9 +253,14 @@ def _emit(payload: dict, as_json: bool, human: str) -> None:
 def _fmt_card(card: dict, index: int | None = None) -> str:
     prefix = f"[{index}] " if index is not None else ""
     free = " (research cached — deep-dive is free)" if card["research_cached"] else ""
+    meta = f"    {card['verdict']} {card['confidence']}%  ·  {card['tier']}{free}"
+    if card.get("distance"):
+        meta += f"  ·  {card['distance']}"
+    if card.get("age_days") is not None:
+        meta += f"  ·  {card['age_days']}d"
     lines = [
         f"{prefix}{card['title']} — {card['company']}",
-        f"    {card['verdict']} {card['confidence']}%  ·  {card['tier']}{free}",
+        meta,
     ]
     if card.get("location"):
         lines.append(f"    {card['location']}")
@@ -374,11 +388,17 @@ def cmd_status(db: Database, as_json: bool) -> int:
     stats = db.get_queue_stats()
     decision = check_run_allowed()
     ingest_age = _age_hours(stats["last_ingest"])
+    max_age = review_max_age_days()
+    stale = db.count_stale_reviewable(max_age) if max_age else 0
+    fresh = max(0, stats["reviewable"] - stale)
 
     payload = {
         "verb": "status",
         "queue": {
             "reviewable": stats["reviewable"],
+            "fresh": fresh,
+            "stale_hidden": stale,
+            "max_age_days": max_age,
             "by_tier": stats["by_status"],
             "total_listings": stats["total_listings"],
             "last_ingest": stats["last_ingest"],
@@ -406,7 +426,7 @@ def cmd_status(db: Database, as_json: bool) -> int:
 
     tiers = stats["by_status"]
     lines = [
-        f"Queue:   {stats['reviewable']} awaiting review"
+        f"Queue:   {fresh} fresh of {stats['reviewable']} awaiting review"
         f"  (auto {tiers.get('auto', 0)} · queued {tiers.get('auto_queued', 0)}"
         f" · triaged {tiers.get('triaged', 0)})",
         f"Ingest:  {_fmt_age(ingest_age)}"
@@ -423,10 +443,13 @@ def cmd_status(db: Database, as_json: bool) -> int:
     lines.append(("Run:     ✅ allowed — " if decision.allowed
                   else "Run:     ⛔ blocked — ") + decision.reason)
 
-    # A stale queue with nothing to review is the case worth calling out: it
-    # is the only combination where running is clearly the right move.
-    if stats["reviewable"] == 0:
-        lines.append("\nNothing left to review — a refresh would give you new listings.")
+    # The hint keys off FRESH work, not total: 400 stale rows should not
+    # stop status from saying a refresh is the right move.
+    if fresh == 0:
+        tail = f" ({stale} stale hidden)" if stale else ""
+        lines.append(
+            f"\nNothing fresh to review{tail} — a refresh would give you new listings."
+        )
     elif ingest_age is not None and ingest_age < 12:
         lines.append("\nQueue is fresh; `next` before spending on another run.")
 

@@ -28,7 +28,8 @@ python -m src.batch_process     # Concurrent tailor for all saved listings
 python -m src.process_queue     # Autopilot Speculative Agent (no-op unless AUTOPILOT_ENABLED=true)
 python -m src.process_queue --backfill        # Promote existing YES/MAYBE into autopilot queue
 python -m src.integration_test  # Config + reachability check (use --no-llm / --no-network to skip)
-python -m src.report --days 7   # Funnel metrics
+python -m src.report --days 7   # Funnel metrics (--models, --spend)
+python -m src.geo_backfill      # One-time distance_bucket backfill (--dry-run first)
 ```
 
 ## Architecture

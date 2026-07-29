@@ -24,22 +24,22 @@ python -m src.cli show <id> --json         # detail without the dossier
 python -m src.cli tailor <id> --json       # tailor a resume (see below)
 ```
 
-Start with `next`. Present the three listings compactly — title, company,
-verdict + confidence, location, and whether a deep-dive is free. Then ask
-what they want to do. Running `next` again pages forward; nothing is
-consumed by being shown.
-
-Start with `next`. Lead with `status` instead when the user opens with a
-broad question ("anything new?", "what's the state of things?") — it is free,
-and it tells you whether the queue is already deep enough that spending on
-fresh listings would be wasteful.
+Start with `next`; present the three listings compactly — title, company,
+verdict + confidence, location/distance, age, and whether a deep-dive is
+free — then ask what they want to do. Running `next` again pages forward;
+nothing is consumed by being shown. Lead with `status` instead when the user
+opens with a broad question ("anything new?", "what's the state of
+things?") — it is free, and it says whether the queue already has fresh
+work or a refresh is the right move.
 
 ## Reading the output
 
 **`status`** returns `{verb, queue, budget}`.
 
-- `queue.reviewable` is how much undecided work is already waiting;
+- `queue.fresh` is the number that matters: undecided listings inside the
+  freshness window. `queue.reviewable` is the total including stale;
   `queue.by_tier` splits it into `auto` / `auto_queued` / `triaged`.
+  Fresh 0 with a large stale count means "refresh", not "all done".
 - `queue.last_ingest_age_hours` is how stale the newest listings are.
 - `budget.can_run` is whether a pipeline run is permitted right now, with
   `budget.reason` explaining it. Report the reason verbatim when it is
@@ -54,7 +54,14 @@ fresh listings would be wasteful.
 
 - `tier` is `auto` / `auto_queued` / `triaged`. **`auto` means the research
   is already cached, so a deep-dive costs nothing** — say so when offering.
-- `count: 0` means the queue is empty, not an error.
+- `distance` (`Remote`/`Local`/`Commute`/`Far`) and `age_days` explain the
+  ordering: within a quality band, nearer listings rank first. Mention the
+  distance when presenting — the user asked for location-aware results.
+- `hidden_stale` is how many listings were suppressed as older than
+  `max_age_days`. Report it when nonzero. If the user wants them anyway,
+  `next --max-age 0`.
+- `count: 0` with `hidden_stale > 0` means the queue is stale, not empty —
+  say a refresh would bring new listings rather than "nothing to review".
 
 **`deep-dive`** returns `{verb, ok, listing, research, post_research}`.
 
