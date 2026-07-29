@@ -166,7 +166,7 @@ Fill in your `.env` — every variable is documented inline in [`.env.example`](
 - **OPENROUTER_API_KEY** *(required)* — Powers all LLM calls. Get your key at [openrouter.ai/keys](https://openrouter.ai/keys). All LLM calls route through OpenRouter; three independent model slots (`OPENROUTER_STAGE1_MODEL`, `OPENROUTER_MODEL`, `OPENROUTER_TAILOR_MODEL`, plus an optional `OPENROUTER_TREND_MODEL`) let you optimise cost and quality per pipeline stage. See [`docs/MODELS.md`](docs/MODELS.md) for per-slot defaults and BYOK setup.
 - **SLACK_BOT_TOKEN** / **SLACK_CHANNEL_ID** — From step D.
 - **GMAIL_ADDRESS** / **GMAIL_APP_PASSWORD** — Required only if you plan to use Track B email ingestion (step F). Create a dedicated Gmail account for job alerts, enable 2FA, and generate an [App Password](https://support.google.com/accounts/answer/185833).
-- **CONFIDENCE_THRESHOLD** *(optional, default `0.5`)* — Minimum Stage 5 confidence (0.0–1.0) required to keep a listing. Set to `0.0` to disable auto-rejection, or `0.75`+ for stricter filtering. See [`docs/MODELS.md`](docs/MODELS.md) for how the threshold also gates the AUTO_MATCH band.
+- **CONFIDENCE_THRESHOLD** — minimum Stage 5 confidence to keep a listing. Bands and migration notes: [`docs/MODELS.md`](docs/MODELS.md).
 
 Runtime knobs that don't belong in `profile.md` (model slots, `CONFIDENCE_THRESHOLD`, `GENERATE_ASSETS`, Slack tokens, IPRoyal credentials) all live in `.env`.
 
@@ -262,9 +262,14 @@ python -m src.report             # All-time reference
 python -m src.report --days 7    # Last 7 days reference
 
 # CLI review surface — triage without Slack. Add --json for scripting.
+python -m src.cli status         # Queue freshness + today's spend vs budget
 python -m src.cli next --top 3   # Next page of candidates
 python -m src.cli deep-dive <id> # Stage 5 vs post-research verdict + dossier
 python -m src.cli save <id>      # or: pass <id> / pass --all
+python -m src.cli tailor <id>    # Tailor in-session (--via api to spend)
+
+# One-time: geocode locations so the queue can sort by distance
+python -m src.geo_backfill --dry-run
 ```
 
 The CLI reads `$APPLY_DAEMON_DB` (falling back to `./apply_daemon.db`), so it works from any directory. Showing a listing never consumes it — undecided listings return to the queue after a two-hour window.
