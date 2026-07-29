@@ -14,6 +14,7 @@ that, never the prose output. Run from the repo root.
 ## The loop
 
 ```
+python -m src.cli status --json            # worth running? can it afford to?
 python -m src.cli next --top 3 --json      # a page of candidates
 python -m src.cli deep-dive <id> --json    # why it scored that way + research
 python -m src.cli save <id> --json         # they want it
@@ -28,7 +29,24 @@ verdict + confidence, location, and whether a deep-dive is free. Then ask
 what they want to do. Running `next` again pages forward; nothing is
 consumed by being shown.
 
+Start with `next`. Lead with `status` instead when the user opens with a
+broad question ("anything new?", "what's the state of things?") — it is free,
+and it tells you whether the queue is already deep enough that spending on
+fresh listings would be wasteful.
+
 ## Reading the output
+
+**`status`** returns `{verb, queue, budget}`.
+
+- `queue.reviewable` is how much undecided work is already waiting;
+  `queue.by_tier` splits it into `auto` / `auto_queued` / `triaged`.
+- `queue.last_ingest_age_hours` is how stale the newest listings are.
+- `budget.can_run` is whether a pipeline run is permitted right now, with
+  `budget.reason` explaining it. Report the reason verbatim when it is
+  `false` — "blocked by cooldown for another 40 minutes" is actionable;
+  "couldn't run" is not.
+- A deep queue plus recent ingest means the useful next step is `next`, not
+  a refresh. Say so rather than defaulting to fetching more.
 
 **`next`** returns `{verb, count, listings[]}`. Each card has `id`, `title`,
 `company`, `location`, `salary`, `verdict`, `confidence`, `status`, `tier`,

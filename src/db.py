@@ -878,6 +878,42 @@ class Database:
         params = [*REVIEW_STATUSES, *params, limit]
         return self.conn.execute(sql, params).fetchall()
 
+    def get_queue_stats(self) -> dict:
+        """Snapshot for the CLI `status` verb (C-1).
+
+        Answers "is it worth running today?" — how much undecided work is
+        already queued, and how stale it is. All counts come from one pass so
+        the numbers are mutually consistent.
+        """
+        placeholders = ", ".join("?" for _ in REVIEW_STATUSES)
+        rows = self.conn.execute(
+            "SELECT pipeline_status, COUNT(*) n FROM listings "
+            f"WHERE pipeline_status IN ({placeholders}) "
+            "AND verdict IN ('YES', 'MAYBE') "
+            "GROUP BY pipeline_status",
+            list(REVIEW_STATUSES),
+        ).fetchall()
+        by_status = {r["pipeline_status"]: r["n"] for r in rows}
+
+        last_ingest = self.conn.execute(
+            "SELECT MAX(date_ingested) d FROM listings"
+        ).fetchone()["d"]
+        last_decision = self.conn.execute(
+            "SELECT MAX(updated_at) d FROM listings "
+            "WHERE pipeline_status IN ('saved', 'passed', 'tailored')"
+        ).fetchone()["d"]
+        total = self.conn.execute(
+            "SELECT COUNT(*) n FROM listings"
+        ).fetchone()["n"]
+
+        return {
+            "reviewable": sum(by_status.values()),
+            "by_status": by_status,
+            "total_listings": total,
+            "last_ingest": last_ingest,
+            "last_decision": last_decision,
+        }
+
     def get_presented_page(self, within_minutes: int) -> list[sqlite3.Row]:
         """Return the most recently presented page of undecided listings.
 

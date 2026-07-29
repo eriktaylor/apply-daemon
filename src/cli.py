@@ -3,6 +3,7 @@
 Replaces Slack thread commands (frozen; see docs/CHATOPS.md) with verbs that
 are testable in-process:
 
+    python -m src.cli status              # queue freshness + spend vs budget
     python -m src.cli next [--top 3]      # next page of candidates
     python -m src.cli show <id>           # one listing in full
     python -m src.cli deep-dive <id>      # + post-research verdict, dossier
@@ -37,6 +38,7 @@ import json
 import logging
 import sqlite3
 import sys
+from datetime import datetime, timezone
 from pathlib import Path
 
 from dotenv import load_dotenv
@@ -293,6 +295,100 @@ def cmd_show(db: Database, job_id: str, as_json: bool) -> int:
     if card.get("missing_skills"):
         human += f"\nMissing:  {', '.join(card['missing_skills'])}"
     _emit({"verb": "show", "ok": True, "listing": card}, as_json, human)
+    return 0
+
+
+def _age_hours(stamp: str | None) -> float | None:
+    """Hours since an ISO timestamp, or None if absent/unparseable."""
+    if not stamp:
+        return None
+    try:
+        when = datetime.fromisoformat(stamp)
+    except ValueError:
+        return None
+    if when.tzinfo is None:
+        when = when.replace(tzinfo=timezone.utc)
+    return (datetime.now(timezone.utc) - when).total_seconds() / 3600.0
+
+
+def _fmt_age(hours: float | None) -> str:
+    if hours is None:
+        return "never"
+    if hours < 1:
+        return f"{hours * 60:.0f}m ago"
+    if hours < 48:
+        return f"{hours:.0f}h ago"
+    return f"{hours / 24:.0f}d ago"
+
+
+def cmd_status(db: Database, as_json: bool) -> int:
+    """Is it worth running the pipeline today, and can it afford to?
+
+    Read-only and free. Exists because the batch is run by hand — the daily
+    decision deserves numbers rather than reflex.
+    """
+    from src.budget import check_run_allowed
+
+    stats = db.get_queue_stats()
+    decision = check_run_allowed()
+    ingest_age = _age_hours(stats["last_ingest"])
+
+    payload = {
+        "verb": "status",
+        "queue": {
+            "reviewable": stats["reviewable"],
+            "by_tier": stats["by_status"],
+            "total_listings": stats["total_listings"],
+            "last_ingest": stats["last_ingest"],
+            "last_ingest_age_hours": round(ingest_age, 1) if ingest_age else None,
+            "last_decision": stats["last_decision"],
+        },
+        "budget": {
+            "can_run": decision.allowed,
+            "reason": decision.reason,
+            "spent_usd_today": (
+                round(decision.spent_usd, 4) if decision.spent_usd is not None else None
+            ),
+            "spent_tokens_today": decision.spent_tokens,
+            "budget_usd": decision.budget_usd,
+            "remaining_usd": (
+                round(decision.remaining_usd, 4)
+                if decision.remaining_usd is not None else None
+            ),
+            "minutes_since_run": (
+                round(decision.minutes_since_run)
+                if decision.minutes_since_run is not None else None
+            ),
+        },
+    }
+
+    tiers = stats["by_status"]
+    lines = [
+        f"Queue:   {stats['reviewable']} awaiting review"
+        f"  (auto {tiers.get('auto', 0)} · queued {tiers.get('auto_queued', 0)}"
+        f" · triaged {tiers.get('triaged', 0)})",
+        f"Ingest:  {_fmt_age(ingest_age)}"
+        f"   ·   last decision {_fmt_age(_age_hours(stats['last_decision']))}",
+    ]
+    spent = payload["budget"]["spent_usd_today"]
+    if spent is not None and decision.budget_usd > 0:
+        lines.append(
+            f"Spend:   ${spent:.2f} of ${decision.budget_usd:.2f} today"
+            f"  ({decision.spent_tokens:,} tokens)"
+        )
+    else:
+        lines.append(f"Spend:   {decision.spent_tokens:,} tokens today")
+    lines.append(("Run:     ✅ allowed — " if decision.allowed
+                  else "Run:     ⛔ blocked — ") + decision.reason)
+
+    # A stale queue with nothing to review is the case worth calling out: it
+    # is the only combination where running is clearly the right move.
+    if stats["reviewable"] == 0:
+        lines.append("\nNothing left to review — a refresh would give you new listings.")
+    elif ingest_age is not None and ingest_age < 12:
+        lines.append("\nQueue is fresh; `next` before spending on another run.")
+
+    _emit(payload, as_json, "\n".join(lines))
     return 0
 
 
@@ -554,6 +650,9 @@ def build_parser() -> argparse.ArgumentParser:
     p_next.add_argument("--top", type=int, default=DEFAULT_TOP,
                         help=f"How many to show (default: {DEFAULT_TOP})")
 
+    sub.add_parser("status", parents=[common],
+                   help="Queue freshness and today's spend against budget")
+
     p_show = sub.add_parser("show", parents=[common],
                             help="Show one listing in full")
     p_show.add_argument("id")
@@ -595,6 +694,8 @@ def main(argv: list[str] | None = None) -> int:
 
     db = Database()
     try:
+        if args.verb == "status":
+            return cmd_status(db, args.json)
         if args.verb == "next":
             return cmd_next(db, args.top, args.json)
         if args.verb == "show":

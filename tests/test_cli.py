@@ -664,3 +664,72 @@ class TestTailorNeverSpendsInSession:
         resp.write_text(json.dumps({"match_analysis": "x"}), encoding="utf-8")
         _run_json(capsys, "tailor", job_id, "--apply", str(resp))
         assert gen.call_args.kwargs["research_context"] == "REAL RESEARCH"
+
+
+class TestStatusVerb:
+    """C-1 — the read-only verb that informs the daily run decision."""
+
+    @pytest.fixture(autouse=True)
+    def _budget_env(self, tmp_path, monkeypatch):
+        monkeypatch.setenv("RUN_LOG_PATH", str(tmp_path / "run_log"))
+        monkeypatch.setenv("MODEL_USAGE_LOG_PATH", str(tmp_path / "usage.log"))
+        for k in ("DAILY_USD_BUDGET", "MIN_RUN_INTERVAL_MINUTES",
+                  "RUN_USD_ESTIMATE", "BUDGET_ALLOW_UNPRICED"):
+            monkeypatch.delenv(k, raising=False)
+
+    def test_json_envelope_keys(self, db, capsys):
+        _, payload = _run_json(capsys, "status")
+        assert set(payload) == {"verb", "queue", "budget"}
+        assert set(payload["queue"]) == {
+            "reviewable", "by_tier", "total_listings", "last_ingest",
+            "last_ingest_age_hours", "last_decision",
+        }
+        assert set(payload["budget"]) == {
+            "can_run", "reason", "spent_usd_today", "spent_tokens_today",
+            "budget_usd", "remaining_usd", "minutes_since_run",
+        }
+
+    def test_empty_db_is_not_an_error(self, db, capsys):
+        code, payload = _run_json(capsys, "status")
+        assert code == 0
+        assert payload["queue"]["reviewable"] == 0
+        assert payload["queue"]["last_ingest"] is None
+
+    def test_counts_by_tier(self, db, capsys):
+        _seed(db, title="A", company="A", status="auto")
+        _seed(db, title="B", company="B", status="auto_queued")
+        _seed(db, title="C", company="C")  # triaged
+        _, payload = _run_json(capsys, "status")
+        assert payload["queue"]["reviewable"] == 3
+        assert payload["queue"]["by_tier"]["auto"] == 1
+
+    def test_decided_listings_excluded_from_queue(self, db, capsys):
+        job_id = _seed(db, title="Gone", company="G")
+        _run_json(capsys, "save", job_id)
+        _, payload = _run_json(capsys, "status")
+        assert payload["queue"]["reviewable"] == 0
+        assert payload["queue"]["last_decision"] is not None
+
+    def test_reports_budget_block(self, db, capsys, monkeypatch):
+        from src.budget import record_run
+        monkeypatch.setenv("MIN_RUN_INTERVAL_MINUTES", "60")
+        record_run("test")
+        _, payload = _run_json(capsys, "status")
+        assert payload["budget"]["can_run"] is False
+        assert "Cooldown" in payload["budget"]["reason"]
+
+    def test_human_output_readable(self, db, capsys):
+        _seed(db, title="A", company="A", status="auto")
+        code, out = _run(capsys, "status")
+        assert code == 0
+        assert "Queue:" in out and "Spend:" in out and "Run:" in out
+
+    def test_suggests_refresh_when_queue_empty(self, db, capsys):
+        _, out = _run(capsys, "status")
+        assert "refresh" in out.lower()
+
+    def test_status_makes_no_state_change(self, db, capsys, _ledger):
+        job_id = _seed(db)
+        _run_json(capsys, "status")
+        assert db.get_listing_by_id(job_id)["presented_at"] is None
+        assert not _ledger.exists()
