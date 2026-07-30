@@ -1400,3 +1400,109 @@ class TestValidateAndHealIntegration:
 
         assert len(listings) == 0
         mock_escalate.assert_not_called()
+
+
+class TestListwisePrescoring:
+    """M-4 — batch Stage 5 scoring. Off by default; a miss is always safe."""
+
+    def _session(self, monkeypatch, size=None):
+        from src.triage import TriageSession
+        if size is None:
+            monkeypatch.delenv("STAGE5_LISTWISE_BATCH", raising=False)
+        else:
+            monkeypatch.setenv("STAGE5_LISTWISE_BATCH", str(size))
+        s = TriageSession(profile_llm_context="test profile")
+        s._client = MagicMock()
+        return s
+
+    def _anchor(self, title, company):
+        from src.triage import ExtractedListing
+        return ExtractedListing(title=title, company=company)
+
+    def _batch_response(self, pairs):
+        return {"text": json.dumps({"listings": [
+            {"id": f"{t.lower()}|{c.lower()}", "verdict": v, "confidence": conf,
+             "reasoning": "r", "skills_extracted": True,
+             "matching_skills": ["Python"], "missing_skills": [],
+             "job_summary": "s"}
+            for t, c, v, conf in pairs
+        ]}), "tokens": 900}
+
+    def test_disabled_by_default(self, monkeypatch):
+        s = self._session(monkeypatch)
+        items = [(self._anchor("A", "X"), "d"), (self._anchor("B", "Y"), "d")]
+        assert s.prescore_batch(items) == 0
+
+    def test_batch_of_one_stays_pointwise(self, monkeypatch):
+        """Batching a single listing saves nothing and adds blast radius."""
+        s = self._session(monkeypatch, 1)
+        assert s.prescore_batch([(self._anchor("A", "X"), "d")]) == 0
+
+    def test_scores_and_caches(self, monkeypatch):
+        s = self._session(monkeypatch, 10)
+        items = [(self._anchor("A", "X"), "d"), (self._anchor("B", "Y"), "d")]
+        with patch("src.triage._call_openrouter") as call:
+            call.return_value = self._batch_response(
+                [("A", "X", "YES", 90), ("B", "Y", "NO", 20)])
+            assert s.prescore_batch(items) == 2
+            assert call.call_count == 1          # one call, not two
+            assert call.call_args.kwargs["stage"] == "stage5_listwise"
+
+    def test_cached_verdict_replaces_the_pointwise_call(self, monkeypatch):
+        s = self._session(monkeypatch, 10)
+        a = self._anchor("A", "X")
+        with patch("src.triage._call_openrouter") as call:
+            call.return_value = self._batch_response([("A", "X", "YES", 88)])
+            s.prescore_batch([(a, "d")])
+        with patch("src.triage._call_openrouter") as call:
+            got = s._run_eval_prompt(a, "d", "m", 0.0)
+            call.assert_not_called()             # no second spend
+        assert got["verdict"] == "YES" and got["confidence"] == 88
+
+    def test_cache_is_consumed_once(self, monkeypatch):
+        """A second evaluation of the same listing must not silently reuse a
+        stale batch verdict."""
+        s = self._session(monkeypatch, 10)
+        a = self._anchor("A", "X")
+        with patch("src.triage._call_openrouter") as call:
+            call.return_value = self._batch_response([("A", "X", "YES", 88)])
+            s.prescore_batch([(a, "d")])
+        s._run_eval_prompt(a, "d", "m", 0.0)
+        with patch("src.triage._call_openrouter") as call:
+            call.return_value = {"text": json.dumps({
+                "verdict": "NO", "confidence": 10, "reasoning": "r",
+                "skills_extracted": False, "matching_skills": [],
+                "missing_skills": []}), "tokens": 50}
+            s._run_eval_prompt(a, "d", "m", 0.0)
+            call.assert_called_once()            # falls through to pointwise
+
+    def test_batch_failure_leaves_everything_pointwise(self, monkeypatch):
+        """Blast radius: a failed batch must cost calls, not listings."""
+        s = self._session(monkeypatch, 10)
+        items = [(self._anchor("A", "X"), "d"), (self._anchor("B", "Y"), "d")]
+        with patch("src.triage._call_openrouter", side_effect=RuntimeError("boom")):
+            assert s.prescore_batch(items) == 0
+        assert s._listwise_scores == {}
+
+    def test_malformed_json_is_not_fatal(self, monkeypatch):
+        s = self._session(monkeypatch, 10)
+        with patch("src.triage._call_openrouter") as call:
+            call.return_value = {"text": "not json", "tokens": 10}
+            assert s.prescore_batch([(self._anchor("A", "X"), "d")] * 2) == 0
+
+    def test_partial_response_scores_what_it_can(self, monkeypatch):
+        """One listing missing from the reply must not lose the other."""
+        s = self._session(monkeypatch, 10)
+        items = [(self._anchor("A", "X"), "d"), (self._anchor("B", "Y"), "d")]
+        with patch("src.triage._call_openrouter") as call:
+            call.return_value = self._batch_response([("A", "X", "YES", 90)])
+            assert s.prescore_batch(items) == 1
+        assert "b|y" not in s._listwise_scores
+
+    def test_chunks_by_configured_size(self, monkeypatch):
+        s = self._session(monkeypatch, 2)
+        items = [(self._anchor(f"T{i}", "X"), "d") for i in range(5)]
+        with patch("src.triage._call_openrouter") as call:
+            call.return_value = self._batch_response([])
+            s.prescore_batch(items)
+            assert call.call_count == 3          # 2 + 2 + 1

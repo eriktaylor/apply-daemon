@@ -66,6 +66,39 @@ recruiter_title: [title if identifiable]
 Do not include any text outside of this format.\
 """
 
+# M-4: batch scoring. Same task as _EVALUATE_PROMPT, N listings per call, so
+# the candidate profile is sent once instead of once per listing. Measured at
+# ~9x fewer input tokens with 98% verdict agreement against the pointwise path
+# (eval/listwise_compare.py). Gated by STAGE5_LISTWISE_BATCH; pointwise stays
+# the default and the fallback.
+_LISTWISE_EVAL_PROMPT = """\
+You are a recruiting assistant evaluating job listings against a candidate's profile.
+
+## Candidate profile
+{profile_llm_context}
+
+## Job listings
+{listings_block}
+
+## Instructions
+Evaluate EVERY listing above against the candidate profile. Judge each on its own merits;
+use the others only to keep your confidence scale consistent across the batch.
+
+For each listing return an object with:
+- `id`: the listing id exactly as given.
+- `verdict`: YES, MAYBE, or NO.
+- `confidence`: integer 0-100.
+- `reasoning`: one or two sentences on the match.
+- `skills_extracted`: true unless the listing states no requirements at all.
+- `matching_skills`: up to 3 requirements the candidate clearly has.
+- `missing_skills`: up to 3 requirements stated in the listing that the candidate lacks.
+- `job_summary`: 2 punchy sentences describing the company and the role.
+
+Return ONLY a JSON object: {{"listings": [ ... ]}}
+Every id given must appear exactly once.
+"""
+
+
 _EVALUATE_PROMPT = """\
 You are a recruiting assistant evaluating a job listing against a candidate's profile.
 
@@ -289,6 +322,23 @@ def get_openrouter_config() -> tuple[str, str]:
     api_key = os.getenv("OPENROUTER_API_KEY", "")
     model = os.getenv("OPENROUTER_MODEL", "google/gemini-3.1-flash-lite")
     return api_key, model
+
+
+def listwise_batch_size() -> int:
+    """Listings per Stage 5 call. 0 or 1 keeps the pointwise path (default).
+
+    Batching trades blast radius for cost: one malformed response affects a
+    whole batch, so `prescore_batch` parses per item and anything missing
+    falls back to a pointwise call rather than being lost.
+    """
+    raw = os.getenv("STAGE5_LISTWISE_BATCH", "").strip()
+    if not raw:
+        return 0
+    try:
+        return max(0, int(raw))
+    except ValueError:
+        logger.warning("STAGE5_LISTWISE_BATCH=%r is not an integer; ignoring", raw)
+        return 0
 
 
 def get_confidence_threshold() -> float:
@@ -656,6 +706,10 @@ class TriageSession:
         # user-initiated !triage commands so the user sees the verdict + reasoning
         # instead of a silent drop.
         self.bypass_rejection = bypass_rejection
+        # M-4: verdicts pre-computed by prescore_batch, keyed by listing
+        # identity. A miss simply means a pointwise call, so an empty or
+        # partial cache is always safe.
+        self._listwise_scores: dict[str, dict] = {}
 
     def __enter__(self):
         self._client = openai.OpenAI(
@@ -1169,10 +1223,96 @@ class TriageSession:
             anchor, job_text, job_links, classification, source,
         )
 
+    @staticmethod
+    def _batch_key(anchor: "ExtractedListing") -> str:
+        """Identity for cache lookup. Title+company is what dedup already
+        treats as a listing's identity, so it is consistent with the rest of
+        the pipeline."""
+        return f"{(anchor.title or '').strip().lower()}|{(anchor.company or '').strip().lower()}"
+
+    def prescore_batch(self, items: list[tuple["ExtractedListing", str]]) -> int:
+        """Score many listings in one call, caching results for later lookup.
+
+        Returns how many were scored. Callers may pass everything they have;
+        this chunks by ``STAGE5_LISTWISE_BATCH`` and is a no-op when that is
+        unset, so enabling or disabling batching needs no caller change.
+
+        Failure is always partial, never fatal: a batch that errors or returns
+        malformed JSON simply leaves those listings uncached, and they take
+        the pointwise path as though batching were off.
+        """
+        size = listwise_batch_size()
+        if size < 2 or not items:
+            return 0
+
+        scored = 0
+        for start in range(0, len(items), size):
+            chunk = items[start:start + size]
+            block = "\n".join(
+                f"### id: {self._batch_key(a)}\n"
+                f"Title: {a.title}\nCompany: {a.company}\n"
+                f"Location: {a.location}\nSalary: {a.salary}\n"
+                f"Description: {(desc or '')[:2000]}\n"
+                for a, desc in chunk
+            )
+            prompt = _LISTWISE_EVAL_PROMPT.format(
+                profile_llm_context=self.profile_llm_context,
+                listings_block=block,
+            )
+            try:
+                resp = _call_openrouter(
+                    self._client, self.model, prompt,
+                    max_tokens=min(400 * len(chunk) + 500, 8192),
+                    temperature=0.0, json_mode=True, stage="stage5_listwise",
+                )
+                text = (resp["text"] or "").strip()
+                if text.startswith("```"):
+                    text = text.strip("`").removeprefix("json").strip()
+                data = json.loads(text)
+            except Exception:
+                logger.warning(
+                    "Listwise batch of %d failed — those listings fall back "
+                    "to pointwise", len(chunk), exc_info=True,
+                )
+                continue
+
+            for item in (data.get("listings") or []):
+                if not isinstance(item, dict) or not item.get("id"):
+                    continue
+                key = str(item["id"]).strip().lower()
+                try:
+                    self._listwise_scores[key] = {
+                        "verdict": str(item.get("verdict", "MAYBE")).upper(),
+                        "confidence": int(item.get("confidence", 0) or 0),
+                        "reasoning": str(item.get("reasoning", "") or ""),
+                        "skills_extracted": bool(item.get("skills_extracted", True)),
+                        "matching_skills": item.get("matching_skills") or [],
+                        "missing_skills": item.get("missing_skills") or [],
+                        "job_summary": str(item.get("job_summary", "") or ""),
+                        "model": self.model,
+                        "_tokens": 0,  # batch cost is logged once, not per item
+                    }
+                    scored += 1
+                except (TypeError, ValueError):
+                    continue
+
+        logger.info("Listwise pre-scored %d/%d listings", scored, len(items))
+        return scored
+
     def _run_eval_prompt(
         self, anchor: ExtractedListing, description: str, model: str, temperature: float,
     ) -> dict:
-        """Call _EVALUATE_PROMPT for one model; return parsed evaluation dict."""
+        """Call _EVALUATE_PROMPT for one model; return parsed evaluation dict.
+
+        Returns a cached listwise verdict when ``prescore_batch`` produced one
+        for this listing (M-4), avoiding the per-listing call entirely.
+        """
+        cached = self._listwise_scores.pop(self._batch_key(anchor), None)
+        if cached is not None:
+            logger.debug("Stage 5: using listwise verdict for '%s at %s'",
+                         anchor.title, anchor.company)
+            return cached
+
         eval_prompt = _EVALUATE_PROMPT.format(
             profile_llm_context=self.profile_llm_context,
             title=anchor.title,
