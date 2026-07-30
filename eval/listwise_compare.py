@@ -286,7 +286,8 @@ def run(limit: int, batch: int, dry_run: bool, gold_only: bool = False,
         emit: str | None = None, apply_dir: str | None = None,
         shuffle: bool = False, seed: int = 0,
         model_override: str | None = None,
-        via_claude: str | None = None) -> int:
+        via_claude: str | None = None,
+        dump: str | None = None) -> int:
     api_key, model = get_openrouter_config()
     if model_override:
         model = model_override
@@ -417,6 +418,15 @@ def run(limit: int, batch: int, dry_run: bool, gold_only: bool = False,
             if got:
                 row.listwise_verdict = got["verdict"]
                 row.listwise_confidence = got["confidence"]
+        if dump:
+            from pathlib import Path
+            Path(dump).write_text(json.dumps({
+                r.id: {"title": r.title, "verdict": r.listwise_verdict,
+                       "confidence": r.listwise_confidence,
+                       "pointwise_confidence": r.pointwise_confidence}
+                for r in totals.rows if r.listwise_verdict
+            }, indent=1), encoding="utf-8")
+            print(f"  per-listing scores → {dump}")
         _report(totals, model, label=f"claude/{via_claude}",
                 override_cost=cli_cost)
         return 0
@@ -459,6 +469,16 @@ def run(limit: int, batch: int, dry_run: bool, gold_only: bool = False,
         if got:
             row.listwise_verdict = got["verdict"]
             row.listwise_confidence = got["confidence"]
+
+    if dump:
+        from pathlib import Path
+        Path(dump).write_text(json.dumps({
+            r.id: {"title": r.title, "verdict": r.listwise_verdict,
+                   "confidence": r.listwise_confidence,
+                   "pointwise_confidence": r.pointwise_confidence}
+            for r in totals.rows if r.listwise_verdict
+        }, indent=1), encoding="utf-8")
+        print(f"  per-listing scores → {dump}")
 
     _report(totals, model)
     return 0
@@ -560,6 +580,8 @@ def main() -> int:
                    help="Shuffle seed, so arms stay comparable (default: 0)")
     p.add_argument("--model", dest="model_override",
                    help="Override the scoring model slug for this run")
+    p.add_argument("--dump", metavar="PATH",
+                   help="Write per-listing listwise scores to PATH (JSON)")
     p.add_argument("--via-claude", dest="via_claude", metavar="MODEL",
                    help="Score through `claude -p --model MODEL` "
                         "(e.g. haiku, sonnet) instead of OpenRouter")
@@ -568,7 +590,7 @@ def main() -> int:
                emit=args.emit, apply_dir=args.apply_dir,
                shuffle=args.shuffle, seed=args.seed,
                model_override=args.model_override,
-               via_claude=args.via_claude)
+               via_claude=args.via_claude, dump=args.dump)
 
 
 if __name__ == "__main__":
