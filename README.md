@@ -67,30 +67,49 @@ Details the diagram doesn't show:
 
 ### The daily loop
 
-Same four gestures every listing, every day — the repetition is the point:
+Ask, and the bundled Claude Code skill does the rest:
 
 ```
-$ ./script.sh --dry-run                 # what would a run cost?
-$ ./script.sh                           # scrape → score → enrich (budget-gated)
+You:  anything good today?
 
-$ python -m src.cli status              # 43 fresh of 490 · $0.00 of $3.00 today
-$ python -m src.cli next                # top 3, best match first
+      → checks the budget, runs the batch, enriches the top matches,
+        and comes back with the shortlist
 
-  [1] Staff ML Engineer — Acme             YES 95%  ·  auto  ·  Local  ·  2d
-  [2] ...
+Claude: Ran the batch — $0.42, 44 new listings, 3 enriched.
 
-$ python -m src.cli deep-dive <id>      # Stage 5 vs post-research verdict + research
-$ python -m src.cli save <id>           # or: pass <id> · pass --all
-$ python -m src.cli tailor <id>         # resume tailored in-session, no API cost
-$ python -m src.cli next                # next 3…
+        [1] YES: Staff ML Engineer — Acme
+            Palo Alto, CA (Local)  |  new · 2d  |  YES 95%
+            TL;DR: Own the applied-eval stack for agentic systems…
+            Skills: 75% (3/4)
+            match: Agentic AI, Evaluation, Python   gaps: Finance domain
+            auto · research cached — deep-dive is free
+
+        [2] … [3] …
+
+        Deep-dive one, or pass what doesn't fit?
+
+You:  1 looks good, pass the others
 ```
 
-Or just ask Claude Code *"anything good today?"* — the bundled skill runs
-these verbs for you and reports what each step costs.
+One command does the same thing without an agent:
+
+```bash
+./script.sh              # batch + budget check + the top 3, in one step
+./script.sh --dry-run    # what would this cost?
+```
+
+Every card carries the same fields — verdict, confidence, location and
+commute, freshness, TL;DR, and skills matched vs missing. The percentages are
+computed from the model's own lists rather than asked of it, so they cost
+nothing and can't be hallucinated.
 
 > **Still worth a manual click:** the CLI doesn't yet check whether a posting
 > is still live, so open the URL before investing in a tailor — especially on
 > listings more than a couple of weeks old.
+
+The underlying verbs (`status`, `next`, `deep-dive`, `save`, `pass`,
+`tailor`) are a machine interface — an agent's API and your debugging escape
+hatch. Full list in [step H](#h-run-the-pipeline).
 
 ### Review & apply — one store, two surfaces
 

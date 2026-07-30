@@ -112,6 +112,34 @@ apply-daemon/
 - Logging must emit listing IDs + decisions only — **never raw email content, LLM prompts/responses, or credentials.**
 - Don't weaken `.gitignore`, disable TLS verification, or add raw-content logging.
 
+## Agent-facing behavior
+
+The CLI (`src/cli.py`) is a machine interface. A human may type it, but the
+intended driver is the bundled skill in `.claude/skills/apply-daemon/`, which
+is where per-verb guidance lives — this section covers only what a coding
+agent working *on* the repo needs.
+
+**The daily motion is one utterance.** `refresh` runs the batch and chains
+straight into the first page (`page` in its JSON), so "anything good today?"
+is a single call, not a sequence. Any new verb that produces listings should
+chain the same way rather than telling the user to run something else.
+
+**Reviewing is free; `refresh` is the only verb that spends metered money.**
+Enrichment is pre-cached by autopilot, and tailoring runs in-session. Keep it
+that way: a read verb that makes a network call breaks the conversational
+loop's latency and its cost story at once.
+
+**`auto_queued` is backend state, not review material** — raw Stage 5 output
+with no research and no large-model re-score. `next` shows enriched rows only
+when `AUTOPILOT_POST_STAGE_5=false`; `--all-tiers` is the debugging escape.
+
+**Card content is a contract, not formatting.** `src/listing_card.py` owns
+what a review card contains; Slack and the CLI choose presentation only.
+Derive anything derivable (skills %, distance label, freshness) rather than
+asking the model — cheaper and unhallucinatable — and let missing data become
+a stated absence, never an exception or a silent omission.
+`tests/test_listing_card.py` enforces all of it.
+
 ## Design principles
 
 ### One fact, one home

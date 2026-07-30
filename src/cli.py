@@ -315,8 +315,14 @@ def high_signal_only() -> bool:
     )
 
 
-def cmd_next(db: Database, top: int, as_json: bool, max_age: int | None,
-             all_tiers: bool = False) -> int:
+def review_page(db: Database, *, top: int, max_age: int | None = None,
+                all_tiers: bool = False) -> dict:
+    """Fetch and mark one page of review candidates.
+
+    Shared by `next` and `refresh`'s auto-chain (C-5) so the two cannot
+    disagree about what "the top N" means — the chain reimplementing this
+    would be the same drift R-1 collapsed elsewhere.
+    """
     max_age = review_max_age_days() if max_age is None else max_age
     statuses = REVIEW_STATUSES if (all_tiers or not high_signal_only()) \
         else ENRICHED_STATUSES
@@ -328,32 +334,45 @@ def cmd_next(db: Database, top: int, as_json: bool, max_age: int | None,
     )
     cards = [_card(r) for r in rows]
     db.mark_presented([r["id"] for r in rows])
-    stale = db.count_stale_reviewable(max_age) if max_age else 0
+    return {
+        "count": len(cards),
+        "listings": cards,
+        "max_age_days": max_age,
+        "hidden_stale": db.count_stale_reviewable(max_age) if max_age else 0,
+        "tiers": list(statuses),
+    }
 
-    payload = {"verb": "next", "count": len(cards), "listings": cards,
-               "max_age_days": max_age, "hidden_stale": stale,
-               "tiers": list(statuses)}
 
-    if not cards:
-        if stale:
-            human = (
-                f"Nothing fresh to review — {stale} listing(s) are older than "
-                f"{max_age} days and were hidden.\nRun a refresh for new "
-                f"listings, or `next --max-age 0` to see the stale ones anyway."
+def _fmt_page(page: dict) -> str:
+    """Human rendering of a review page, with the stale-hidden footnote."""
+    if not page["listings"]:
+        if page["hidden_stale"]:
+            return (
+                f"Nothing fresh to review — {page['hidden_stale']} listing(s) are "
+                f"older than {page['max_age_days']} days and were hidden.\n"
+                "Run a refresh for new listings, or `next --max-age 0` to see them."
             )
-        else:
-            human = (
-                "Nothing left to review. Run the pipeline, or wait for the "
-                f"{SESSION_WINDOW_MINUTES}-minute window to release skipped "
-                "listings."
-            )
-        _emit(payload, as_json, human)
-        return 0
+        return (
+            "Nothing left to review. Run a refresh, or wait for the "
+            f"{SESSION_WINDOW_MINUTES}-minute window to release skipped listings."
+        )
+    out = "\n\n".join(
+        _fmt_card(c, i) for i, c in enumerate(page["listings"], 1)
+    )
+    if page["hidden_stale"]:
+        out += (f"\n({page['hidden_stale']} older than "
+                f"{page['max_age_days']}d hidden — `--max-age 0` to include.)")
+    return out
 
-    human = "\n\n".join(_fmt_card(c, i) for i, c in enumerate(cards, 1))
-    human += "\n\nDeep-dive one, pass what doesn't fit, or run `next` for more."
-    if stale:
-        human += f"\n({stale} older than {max_age}d hidden — `--max-age 0` to include.)"
+
+def cmd_next(db: Database, top: int, as_json: bool, max_age: int | None,
+             all_tiers: bool = False) -> int:
+    page = review_page(db, top=top, max_age=max_age, all_tiers=all_tiers)
+    payload = {"verb": "next", **page}
+
+    human = _fmt_page(page)
+    if page["listings"]:
+        human += "\n\nDeep-dive one, pass what doesn't fit, or run `next` for more."
     _emit(payload, as_json, human)
     return 0
 
@@ -486,7 +505,7 @@ def cmd_status(db: Database, as_json: bool) -> int:
 
 
 def cmd_refresh(db: Database, *, top_n: int | None, force: bool,
-                dry_run: bool, as_json: bool) -> int:
+                dry_run: bool, as_json: bool, no_next: bool = False) -> int:
     """Fire the ingestion pipeline, budget permitting.
 
     **Owns the stage sequence.** ``script.sh`` is a thin wrapper over this verb
@@ -559,7 +578,15 @@ def cmd_refresh(db: Database, *, top_n: int | None, force: bool,
 
     payload = {"verb": "refresh", "ok": failed is None, "stages": results,
                "failed_stage": failed, "spent_usd_this_run": spent,
-               "spent_usd_today": after.spent_usd}
+               "spent_usd_today": after.spent_usd, "page": None}
+
+    # C-5: chain straight into the first page. The whole point of the batch is
+    # the listings it produced, so making the user issue a second command was
+    # the automation regression this closes. --no-next opts out for scripting.
+    page = None
+    if failed is None and not no_next:
+        page = review_page(db, top=DEFAULT_TOP)
+        payload["page"] = page
 
     human = "\n".join(
         f"  {'ok ' if r['returncode'] == 0 else 'FAIL'}  {r['stage']}"
@@ -571,6 +598,10 @@ def cmd_refresh(db: Database, *, top_n: int | None, force: bool,
             human += f" (${after.spent_usd:.2f} of ${after.budget_usd:.2f} today)"
     if failed:
         human += f"\n\nStopped at {failed} — see logs. Later stages did not run."
+    elif page is not None:
+        human += "\n\n" + _fmt_page(page)
+        if page["listings"]:
+            human += "\n\nDeep-dive one, or pass what doesn't fit."
     else:
         human += "\n\nRun `next` to review what came in."
     _emit(payload, as_json, human)
@@ -834,6 +865,8 @@ def build_parser() -> argparse.ArgumentParser:
                            help="Run even if the budget check refuses")
     p_refresh.add_argument("--dry-run", action="store_true", dest="dry_run",
                            help="Show the stages and budget verdict, run nothing")
+    p_refresh.add_argument("--no-next", action="store_true", dest="no_next",
+                           help="Don't show the first page afterwards")
 
     p_show = sub.add_parser("show", parents=[common],
                             help="Show one listing in full")
@@ -883,7 +916,8 @@ def main(argv: list[str] | None = None) -> int:
             return cmd_status(db, args.json)
         if args.verb == "refresh":
             return cmd_refresh(db, top_n=args.top_n, force=args.force,
-                               dry_run=args.dry_run, as_json=args.json)
+                               dry_run=args.dry_run, as_json=args.json,
+                               no_next=args.no_next)
         if args.verb == "next":
             return cmd_next(db, args.top, args.json, args.max_age,
                             args.all_tiers)

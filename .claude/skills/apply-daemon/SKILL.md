@@ -28,7 +28,17 @@ python -m src.cli show <id> --json         # detail without the dossier
 python -m src.cli tailor <id> --json       # tailor a resume (see below)
 ```
 
-Start with `next`; present the three listings compactly — title, company,
+**Default motion — one call.** For "anything good today?" / "what's new?" /
+"any fresh matches?", run `refresh --json`: it checks the budget, runs the
+batch, and returns the first page in `page`. Report the cost and present that
+page. Don't call `status` then `refresh` then `next` — `refresh` is the whole
+sequence.
+
+Use `status` alone when the user asks about state rather than results ("how's
+the queue?", "what have I spent?"), and `next` alone to page forward through
+an existing queue without spending.
+
+Present the three listings compactly — title, company,
 verdict + confidence, location/distance, age, and whether a deep-dive is
 free — then ask what they want to do. Running `next` again pages forward;
 nothing is consumed by being shown. Lead with `status` instead when the user
@@ -67,7 +77,11 @@ work or a refresh is the right move.
 - `count: 0` with `hidden_stale > 0` means the queue is stale, not empty —
   say a refresh would bring new listings rather than "nothing to review".
 
-**`refresh`** runs the pipeline — **the only verb that spends metered money.**
+**`refresh`** runs the pipeline and returns the first page — **the only verb
+that spends metered money.**
+
+- `page` holds the first page of results; render it rather than calling
+  `next` again, which would skip past those listings.
 
 - Check `status` first: if `queue.fresh` is healthy, reviewing beats refreshing.
 - `--dry-run` shows the stages and the budget verdict without spending; use it

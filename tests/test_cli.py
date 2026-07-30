@@ -986,12 +986,37 @@ class TestRefreshVerb:
         self._ok(mocker)
         _, payload = _run_json(capsys, "refresh")
         assert set(payload) == {"verb", "ok", "stages", "failed_stage",
-                                "spent_usd_this_run", "spent_usd_today"}
+                                "spent_usd_this_run", "spent_usd_today", "page"}
 
-    def test_human_output_suggests_next(self, db, capsys, mocker):
+    def test_chains_into_the_first_page(self, db, capsys, mocker):
+        """C-5: the batch exists for the listings it produced — making the
+        user issue a second command was the automation regression."""
         self._ok(mocker)
+        job_id = _seed(db, title="Fresh Match", company="Acme", status="auto")
+        _, payload = _run_json(capsys, "refresh")
+        assert payload["page"] is not None
+        assert [c["id"] for c in payload["page"]["listings"]] == [job_id]
+
+    def test_chain_renders_cards_in_human_output(self, db, capsys, mocker):
+        self._ok(mocker)
+        _seed(db, title="Fresh Match", company="Acme", status="auto")
         _, out = _run(capsys, "refresh")
-        assert "next" in out
+        assert "Fresh Match" in out and "Deep-dive" in out
+
+    def test_no_next_suppresses_the_chain(self, db, capsys, mocker):
+        self._ok(mocker)
+        _seed(db, title="Fresh Match", company="Acme", status="auto")
+        _, payload = _run_json(capsys, "refresh", "--no-next")
+        assert payload["page"] is None
+
+    def test_no_chain_when_a_stage_failed(self, db, capsys, mocker):
+        """A half-run batch's "top 3" would be misleading."""
+        import subprocess
+        mocker.patch("subprocess.run", return_value=subprocess.CompletedProcess(
+            args=[], returncode=1, stdout="", stderr="boom"))
+        _seed(db, title="Fresh Match", company="Acme", status="auto")
+        _, payload = _run_json(capsys, "refresh")
+        assert payload["ok"] is False and payload["page"] is None
 
 
 class TestScriptShIsAWrapper:
