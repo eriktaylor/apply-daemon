@@ -64,6 +64,11 @@ OWNERSHIP: list[tuple[str, str, str]] = [
         "model_usage.py",
         r"len\(parts\)\s*!=\s*4",
     ),
+    (
+        "review-card field assembly",
+        "listing_card.py",
+        r'"skills_pct":',
+    ),
 ]
 
 

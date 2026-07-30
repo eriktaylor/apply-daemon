@@ -112,20 +112,24 @@ class TestNextVerb:
 class TestJsonContract:
     """E-2 — the keys the skill depends on."""
 
+    # The shared contract (src/listing_card.REQUIRED_FIELDS) plus the two
+    # CLI-only additions. Keeping this literal rather than importing the
+    # contract is deliberate: it must fail when the contract changes, so the
+    # change is reviewed rather than absorbed silently.
     CARD_KEYS = {
-        "id", "title", "company", "location", "salary", "verdict",
-        "confidence", "status", "tier", "research_cached", "url",
-        "date_ingested", "age_days", "distance",
+        "id", "title", "company", "verdict", "confidence", "location",
+        "distance", "url", "tldr", "skills_pct", "skills_matched",
+        "skills_total", "matching_skills", "missing_skills", "age_days",
+        "freshness", "tier", "research_cached",
+        "status", "date_ingested", "salary",
     }
-    DETAIL_KEYS = CARD_KEYS | {
-        "reason", "job_summary", "matching_skills", "missing_skills",
-    }
+    DETAIL_KEYS = CARD_KEYS | {"reason"}
 
     def test_next_card_keys(self, db, capsys):
         _seed(db)
         _, payload = _run_json(capsys, "next")
         assert set(payload) == {"verb", "count", "listings", "max_age_days",
-                                "hidden_stale"}
+                                "hidden_stale", "awaiting_enrichment", "tiers"}
         assert set(payload["listings"][0]) == self.CARD_KEYS
 
     def test_show_card_keys(self, db, capsys):
@@ -682,9 +686,9 @@ class TestStatusVerb:
         _, payload = _run_json(capsys, "status")
         assert set(payload) == {"verb", "queue", "budget"}
         assert set(payload["queue"]) == {
-            "reviewable", "fresh", "stale_hidden", "max_age_days", "by_tier",
-            "total_listings", "last_ingest", "last_ingest_age_hours",
-            "last_decision",
+            "reviewable", "fresh", "ready", "awaiting_enrichment",
+            "stale_hidden", "max_age_days", "by_tier", "total_listings",
+            "last_ingest", "last_ingest_age_hours", "last_decision",
         }
         assert set(payload["budget"]) == {
             "can_run", "reason", "spent_usd_today", "spent_tokens_today",
@@ -982,12 +986,37 @@ class TestRefreshVerb:
         self._ok(mocker)
         _, payload = _run_json(capsys, "refresh")
         assert set(payload) == {"verb", "ok", "stages", "failed_stage",
-                                "spent_usd_this_run", "spent_usd_today"}
+                                "spent_usd_this_run", "spent_usd_today", "page"}
 
-    def test_human_output_suggests_next(self, db, capsys, mocker):
+    def test_chains_into_the_first_page(self, db, capsys, mocker):
+        """C-5: the batch exists for the listings it produced — making the
+        user issue a second command was the automation regression."""
         self._ok(mocker)
+        job_id = _seed(db, title="Fresh Match", company="Acme", status="auto")
+        _, payload = _run_json(capsys, "refresh")
+        assert payload["page"] is not None
+        assert [c["id"] for c in payload["page"]["listings"]] == [job_id]
+
+    def test_chain_renders_cards_in_human_output(self, db, capsys, mocker):
+        self._ok(mocker)
+        _seed(db, title="Fresh Match", company="Acme", status="auto")
         _, out = _run(capsys, "refresh")
-        assert "next" in out
+        assert "Fresh Match" in out and "Deep-dive" in out
+
+    def test_no_next_suppresses_the_chain(self, db, capsys, mocker):
+        self._ok(mocker)
+        _seed(db, title="Fresh Match", company="Acme", status="auto")
+        _, payload = _run_json(capsys, "refresh", "--no-next")
+        assert payload["page"] is None
+
+    def test_no_chain_when_a_stage_failed(self, db, capsys, mocker):
+        """A half-run batch's "top 3" would be misleading."""
+        import subprocess
+        mocker.patch("subprocess.run", return_value=subprocess.CompletedProcess(
+            args=[], returncode=1, stdout="", stderr="boom"))
+        _seed(db, title="Fresh Match", company="Acme", status="auto")
+        _, payload = _run_json(capsys, "refresh")
+        assert payload["ok"] is False and payload["page"] is None
 
 
 class TestScriptShIsAWrapper:
@@ -1011,3 +1040,118 @@ class TestScriptShIsAWrapper:
 
     def test_forwards_arguments(self):
         assert '"$@"' in self._script()
+
+
+class TestHighSignalDefault:
+    """`auto_queued` is backend state: raw Stage 5 output with no research and
+    no large-model re-score. The CLI honors AUTOPILOT_POST_STAGE_5, the knob
+    that has always governed this for the Slack digest."""
+
+    def test_high_signal_hides_unenriched(self, db, capsys, monkeypatch):
+        monkeypatch.setenv("AUTOPILOT_POST_STAGE_5", "false")
+        _seed(db, title="Raw", company="R", status="auto_queued")
+        enriched = _seed(db, title="Enriched", company="E", status="auto")
+        _, payload = _run_json(capsys, "next")
+        assert [c["id"] for c in payload["listings"]] == [enriched]
+        assert payload["tiers"] == ["auto"]
+
+    def test_all_tiers_opts_back_in(self, db, capsys, monkeypatch):
+        monkeypatch.setenv("AUTOPILOT_POST_STAGE_5", "false")
+        _seed(db, title="Raw", company="R", status="auto_queued")
+        _seed(db, title="Enriched", company="E", status="auto")
+        _, payload = _run_json(capsys, "next", "--all-tiers")
+        assert payload["count"] == 2
+
+    def test_funnel_mode_shows_everything(self, db, capsys, monkeypatch):
+        monkeypatch.setenv("AUTOPILOT_POST_STAGE_5", "true")
+        _seed(db, title="Raw", company="R", status="auto_queued")
+        _seed(db, title="Enriched", company="E", status="auto")
+        assert _run_json(capsys, "next")[1]["count"] == 2
+
+
+class TestCardCarriesFullContract:
+    """The key user interface: every decision field on every card."""
+
+    def test_next_card_has_tldr_and_skills(self, db, capsys):
+        import json as _json
+        _seed(db, title="ML Eng", company="Acme",
+              job_summary="Build agentic AI systems for ops automation.",
+              matching_skills=_json.dumps(["Agentic AI", "Python", "Eval"]),
+              missing_skills=_json.dumps(["Finance domain"]))
+        _, payload = _run_json(capsys, "next")
+        card = payload["listings"][0]
+        assert card["tldr"].startswith("Build agentic AI")
+        assert card["skills_pct"] == 75 and card["skills_total"] == 4
+        assert "Agentic AI" in card["matching_skills"]
+        assert "Finance domain" in card["missing_skills"]
+
+    def test_human_render_shows_every_field(self, db, capsys):
+        import json as _json
+        job_id = _seed(db, title="ML Eng", company="Acme", confidence=85,
+                       location="Palo Alto, CA",
+                       job_summary="Architect agentic AI solutions.",
+                       matching_skills=_json.dumps(["Agentic AI"]),
+                       missing_skills=_json.dumps(["Finance"]))
+        db.set_distance_bucket(job_id, 1)
+        _, out = _run(capsys, "next")
+        for expected in ("YES:", "ML Eng", "Acme", "Palo Alto", "Local",
+                         "85%", "TL;DR", "Skills: 50%", "Agentic AI", "Finance"):
+            assert expected in out, f"card is missing {expected!r}"
+
+
+class TestSurfacesTellOneStory:
+    """status's numbers and next's behavior must agree — 'status says 43
+    fresh, next shows 8 then a wall' was the audited failure."""
+
+    @pytest.fixture(autouse=True)
+    def _high_signal(self, monkeypatch, tmp_path):
+        monkeypatch.setenv("AUTOPILOT_POST_STAGE_5", "false")
+        monkeypatch.setenv("RUN_LOG_PATH", str(tmp_path / "rl"))
+        monkeypatch.setenv("MODEL_USAGE_LOG_PATH", str(tmp_path / "ml"))
+
+    def _mixed_queue(self, db):
+        enriched = _seed(db, title="Ready", company="R", status="auto")
+        for i in range(3):
+            _seed(db, title=f"Raw {i}", company=f"C{i}", status="auto_queued")
+        return enriched
+
+    def test_status_splits_ready_from_awaiting(self, db, capsys):
+        self._mixed_queue(db)
+        _, payload = _run_json(capsys, "status")
+        q = payload["queue"]
+        assert q["ready"] == 1
+        assert q["awaiting_enrichment"] == 3
+        assert q["fresh"] == 4
+
+    def test_status_human_line_shows_the_split(self, db, capsys):
+        self._mixed_queue(db)
+        _, out = _run(capsys, "status")
+        assert "1 ready" in out and "3 fresh awaiting enrichment" in out
+
+    def test_status_steers_to_enrichment_not_max_age(self, db, capsys):
+        for i in range(3):
+            _seed(db, title=f"Raw {i}", company=f"C{i}", status="auto_queued")
+        _, out = _run(capsys, "status")
+        assert "enrich" in out.lower()
+
+    def test_empty_page_names_the_enrichment_backlog(self, db, capsys):
+        for i in range(3):
+            _seed(db, title=f"Raw {i}", company=f"C{i}", status="auto_queued")
+        _, payload = _run_json(capsys, "next")
+        assert payload["count"] == 0
+        assert payload["awaiting_enrichment"] == 3
+        _, out = _run(capsys, "next")
+        assert "awaiting autopilot enrichment" in out
+        assert "--all-tiers" in out
+
+    def test_hidden_stale_counts_only_the_shown_tiers(self, db, capsys):
+        """A stale RAW row must not inflate the stale count of the enriched
+        view — that mislabels an enrichment shortfall as staleness."""
+        from datetime import datetime, timedelta, timezone
+        raw = _seed(db, title="Old Raw", company="OR", status="auto_queued")
+        when = (datetime.now(timezone.utc) - timedelta(days=45)).isoformat()
+        db.conn.execute("UPDATE listings SET date_ingested=? WHERE id=?",
+                        (when, raw))
+        db.conn.commit()
+        _, payload = _run_json(capsys, "next")
+        assert payload["hidden_stale"] == 0

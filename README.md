@@ -65,6 +65,52 @@ Details the diagram doesn't show:
 - **Stage 5 triage** returns YES / MAYBE / NO with 0–100 confidence; NO always drops, YES/MAYBE survive above `CONFIDENCE_THRESHOLD`, with skills match and reasoning attached.
 - **Enrichment**: Nominatim commute distance from `home_location`, plus a repost timeline when a listing has been seen before.
 
+### The daily loop
+
+Ask, and the bundled Claude Code skill does the rest:
+
+```
+You:  anything good today?
+
+      → checks the budget, runs the batch, enriches the top matches,
+        and comes back with the shortlist
+
+Claude: Ran the batch — $0.42, 44 new listings, 3 enriched.
+
+        [1] YES: Staff ML Engineer — Acme
+            Palo Alto, CA (Local)  |  new · 2d  |  YES 95%
+            TL;DR: Own the applied-eval stack for agentic systems…
+            Skills: 75% (3/4)
+            match: Agentic AI, Evaluation, Python   gaps: Finance domain
+            auto · research cached — deep-dive is free
+
+        [2] … [3] …
+
+        Deep-dive one, or pass what doesn't fit?
+
+You:  1 looks good, pass the others
+```
+
+One command does the same thing without an agent:
+
+```bash
+./script.sh              # batch + budget check + the top 3, in one step
+./script.sh --dry-run    # what would this cost?
+```
+
+Every card carries the same fields — verdict, confidence, location and
+commute, freshness, TL;DR, and skills matched vs missing. The percentages are
+computed from the model's own lists rather than asked of it, so they cost
+nothing and can't be hallucinated.
+
+> **Still worth a manual click:** the CLI doesn't yet check whether a posting
+> is still live, so open the URL before investing in a tailor — especially on
+> listings more than a couple of weeks old.
+
+The underlying verbs (`status`, `next`, `deep-dive`, `save`, `pass`,
+`tailor`) are a machine interface — an agent's API and your debugging escape
+hatch. Full list in [step H](#h-run-the-pipeline).
+
 ### Review & apply — one store, two surfaces
 
 Everything above converges on SQLite. Everything below fans back out of it:
@@ -104,11 +150,6 @@ thread ChatOps: frozen                   deep-dive  → Stage 5 vs post-
 
 Autopilot sits above the fork because its enrichment serves both surfaces — and it's why deep-diving an `auto`-tier listing costs no tokens: the research is already on disk. The CLI's `deep-dive` shows the Stage 5 score *and* the post-research re-score side by side; they routinely disagree, and that gap is the most decision-relevant thing about a listing.
 
-```bash
-python -m src.cli next --top 3        # what's new
-python -m src.cli deep-dive <id>      # why it scored that way
-python -m src.cli save <id>           # or: pass <id>, pass --all
-```
 
 ## Setup
 
@@ -273,7 +314,15 @@ Post-triage work happens on two surfaces.
 
 **The CLI** (`python -m src.cli`, command list in step H) is where new work goes. A bundled Claude Code skill (`.claude/skills/apply-daemon/`) drives it conversationally: ask Claude "what's new?" and it walks you through the top matches, deep-dives whichever you pick, and records your decisions. Reviewing never spends tokens — enrichment is pre-cached by autopilot, and in-session tailoring is billed to your Claude session, not an API.
 
-**Slack** is the ambient surface: the digest plus four reactions, processed by `python -m src.sweeper`. Thread commands (`!applied`, `!coverletter`, `!trend`, …) still work but are **frozen** — new verbs land in the CLI. Full reference: [`docs/CHATOPS.md`](docs/CHATOPS.md).
+**Slack** is the ambient surface: the digest plus four reactions, processed by `python -m src.sweeper`. Thread commands are **frozen** — new verbs land in the CLI — but three things are still Slack-only today, so a full application often ends there:
+
+| Still Slack-only | Command |
+|---|---|
+| Polish a tailor run you didn't like | `!polish` |
+| Cover letter | `!coverletter` |
+| Answer custom application questions | `!answer` |
+
+Full reference: [`docs/CHATOPS.md`](docs/CHATOPS.md).
 
 ## Running tests
 

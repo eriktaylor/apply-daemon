@@ -28,6 +28,7 @@ load_dotenv()
 
 from src.db import Database
 from src.geo import get_distance
+from src.listing_card import parse_skill_list, skills_match
 from src.notifications import _get_slack_config, _import_slack_app
 from src.profile_loader import load_profile
 from src.triage import get_confidence_threshold
@@ -223,41 +224,30 @@ def build_digest_listing_attachment(listing: dict, history: str = "") -> dict:
             "text": {"type": "mrkdwn", "text": f":memo: *TL;DR:* {job_summary[:800]}"},
         })
 
-    # Skills match
-    skills_extracted = listing.get("skills_extracted", False)
-    # DB stores as integer 0/1
-    if isinstance(skills_extracted, int):
-        skills_extracted = bool(skills_extracted)
+    # Skills match — content from the shared card contract so this surface
+    # cannot drift from the CLI's (src/listing_card.py). Previously this block
+    # did its own unguarded json.loads (one malformed value raised and killed
+    # the whole card) and gated on the separate `skills_extracted` flag, a
+    # second source of truth that could disagree with the data.
+    matching = parse_skill_list(listing.get("matching_skills"))
+    missing = parse_skill_list(listing.get("missing_skills"))
+    pct, matched, total = skills_match(matching, missing)
 
-    if not skills_extracted:
-        blocks.append({
-            "type": "section",
-            "text": {
-                "type": "mrkdwn",
-                "text": ":dart: *Skills Match:* N/A (Not specified in listing)",
-            },
-        })
+    if pct is None:
+        skills_text = ":dart: *Skills Match:* N/A (Not specified in listing)"
     else:
-        matching_raw = listing.get("matching_skills", "")
-        missing_raw = listing.get("missing_skills", "")
-        matching = json.loads(matching_raw) if matching_raw else []
-        missing = json.loads(missing_raw) if missing_raw else []
-        total = len(matching) + len(missing)
-        if total > 0:
-            pct = round(len(matching) / total * 100)
-            skills_text = f":dart: *Skills Match:* {pct}% ({len(matching)}/{total})"
-            parts = []
-            if matching:
-                parts.append(f":white_check_mark: *Matching:* {', '.join(matching)}")
-            if missing:
-                parts.append(f":x: *Gaps:* {', '.join(missing)}")
+        skills_text = f":dart: *Skills Match:* {pct}% ({matched}/{total})"
+        parts = []
+        if matching:
+            parts.append(f":white_check_mark: *Matching:* {', '.join(matching)}")
+        if missing:
+            parts.append(f":x: *Gaps:* {', '.join(missing)}")
+        if parts:
             skills_text += "\n" + "  |  ".join(parts)
-        else:
-            skills_text = ":dart: *Skills Match:* 100% (0/0)"
-        blocks.append({
-            "type": "section",
-            "text": {"type": "mrkdwn", "text": skills_text},
-        })
+    blocks.append({
+        "type": "section",
+        "text": {"type": "mrkdwn", "text": skills_text},
+    })
 
     # Historical context (if any prior encounters)
     if history:
