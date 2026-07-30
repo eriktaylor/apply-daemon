@@ -67,7 +67,17 @@ Details the diagram doesn't show:
 
 ### The daily loop
 
-Ask, and the bundled Claude Code skill does the rest:
+Open a terminal in the repo and start Claude Code:
+
+```bash
+cd apply-daemon
+source .venv/bin/activate
+claude                      # or `claude --resume` to pick up yesterday's session
+```
+
+Then ask. The bundled skill (`.claude/skills/apply-daemon/`) is loaded
+automatically — it recognises job-search questions and runs the pipeline for
+you:
 
 ```
 You:  anything good today?
@@ -91,12 +101,20 @@ Claude: Ran the batch — $0.42, 44 new listings, 3 enriched.
 You:  1 looks good, pass the others
 ```
 
-One command does the same thing without an agent:
+**No agent?** One command does the same thing, and prints per-stage progress
+as it goes:
 
 ```bash
 ./script.sh              # batch + budget check + the top 3, in one step
 ./script.sh --dry-run    # what would this cost?
 ```
+
+A full run takes 10–20 minutes — Track A deliberately waits 7–20s between
+searches to avoid IP bans — so expect the scrape stage to dominate.
+
+**Prefer Slack?** Nothing changed: run `./script.sh`, triage the digest cards
+with reactions, then `python -m src.sweeper`. The two surfaces share one
+database, so you can switch between them freely, even mid-batch.
 
 Every card carries the same fields — verdict, confidence, location and
 commute, freshness, TL;DR, and skills matched vs missing. The percentages are
@@ -178,9 +196,9 @@ cp .env.example .env
 ### C. Install dependencies
 
 ```bash
-# Using uv (recommended)
-# uv automatically creates the virtual environment and syncs dependencies from pyproject.toml
-uv sync && source .venv/bin/activate
+# Using uv (recommended) — creates the venv and installs from pyproject.toml.
+# --extra dev is what pulls in ruff and pytest; plain `uv sync` REMOVES them.
+uv sync --extra dev && source .venv/bin/activate
 
 # Or using pip (legacy)
 python -m venv .venv && source .venv/bin/activate && pip install -e ".[dev]"

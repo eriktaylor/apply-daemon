@@ -45,6 +45,7 @@ from src.decisions import target_status
 from src.expired_probe import probe as expired_probe
 from src.file_utils import read_dropzone_file
 from src.geo import get_distance
+from src.listing_card import parse_skill_list, skills_match
 from src.mismatch_gate import check_mismatch
 from src.model_usage import log_response_usage
 from src.notifications import _get_slack_config, _import_slack_app
@@ -311,6 +312,25 @@ def _merge_assets_json(folder: Path, auto_json: dict, research_context: str) -> 
     path.write_text(json.dumps(merged, indent=2), encoding="utf-8")
 
 
+
+def _card_skills_line(listing: dict) -> str:
+    """Stage 5 skills summary for the autopilot card (shared contract)."""
+    matching = parse_skill_list(listing.get("matching_skills"))
+    missing = parse_skill_list(listing.get("missing_skills"))
+    pct, matched, total = skills_match(matching, missing)
+    if pct is None:
+        return ":dart: *Skills Match:* N/A (Not specified in listing)"
+    text = f":dart: *Skills Match:* {pct}% ({matched}/{total})"
+    parts = []
+    if matching:
+        parts.append(f":white_check_mark: *Matching:* {', '.join(matching)}")
+    if missing:
+        parts.append(f":x: *Gaps:* {', '.join(missing)}")
+    if parts:
+        text += "\n" + "  |  ".join(parts)
+    return text
+
+
 def _build_slack_blocks(listing: dict, auto_json: dict, folder: Path) -> tuple[list[dict], dict]:
     """Build the Slack card + the threaded Deep Evaluation blocks."""
     title = listing.get("title", "Unknown")
@@ -356,6 +376,16 @@ def _build_slack_blocks(listing: dict, auto_json: dict, folder: Path) -> tuple[l
         card_blocks.append({
             "type": "section",
             "text": {"type": "mrkdwn", "text": f":memo: *TL;DR:* {job_summary[:800]}"},
+        },
+        {
+            # Stage 5 skills, via the shared card contract. The autopilot card
+            # is a THIRD renderer (after digest and the CLI) and previously
+            # showed skills only in its thread, from post-research JSON — so an
+            # enriched listing's card silently lacked the skills line every
+            # other surface carries. Post-research skills still appear in the
+            # thread below; this is the card-level summary.
+            "type": "section",
+            "text": {"type": "mrkdwn", "text": _card_skills_line(listing)},
         })
     card_blocks.append({
         "type": "context",

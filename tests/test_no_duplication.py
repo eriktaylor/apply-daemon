@@ -69,6 +69,11 @@ OWNERSHIP: list[tuple[str, str, str]] = [
         "listing_card.py",
         r'"skills_pct":',
     ),
+    (
+        "skills percentage arithmetic",
+        "listing_card.py",
+        r"len\(matching\)\s*[/+]|matched\s*/\s*total",
+    ),
 ]
 
 
