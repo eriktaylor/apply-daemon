@@ -186,15 +186,42 @@ def score_listwise(client, model: str, profile: str, rows: list) -> tuple[dict, 
     return by_id, p_tok, c_tok
 
 
-def run(limit: int, batch: int, dry_run: bool) -> int:
+def load_gold() -> dict[str, str]:
+    """job_id[:8] -> Sonnet's post-research verdict, from autopilot output.
+
+    The best referee available: a larger model that additionally read a
+    research dossier. Not a pure same-input comparison — it knows more than
+    either scorer — but it is the standard the pipeline already trusts enough
+    to auto-pass NO verdicts on.
+    """
+    import glob
+    import os
+    gold: dict[str, str] = {}
+    for path in glob.glob("output/*/auto_assets.json"):
+        try:
+            data = json.load(open(path, encoding="utf-8"))
+        except (OSError, json.JSONDecodeError):
+            continue
+        verdict = (data or {}).get("post_research_verdict")
+        if verdict:
+            gold[os.path.basename(os.path.dirname(path))[-8:]] = str(verdict).upper()
+    return gold
+
+
+def run(limit: int, batch: int, dry_run: bool, gold_only: bool = False,
+        emit: str | None = None, apply_dir: str | None = None) -> int:
     api_key, model = get_openrouter_config()
+    gold = load_gold() if (gold_only or emit or apply_dir) else {}
+
     with Database() as db:
         rows = db.conn.execute(
             "SELECT * FROM listings WHERE verdict IS NOT NULL "
             "AND job_summary IS NOT NULL AND job_summary != '' "
-            "ORDER BY date_ingested DESC LIMIT ?",
-            (limit,),
+            "ORDER BY date_ingested DESC",
         ).fetchall()
+    if gold_only or emit or apply_dir:
+        rows = [r for r in rows if r["id"][:8] in gold]
+    rows = rows[:limit]
 
     if not rows:
         print("No scored listings with summaries available.")
@@ -203,6 +230,30 @@ def run(limit: int, batch: int, dry_run: bool) -> int:
     n_batches = (len(rows) + batch - 1) // batch
     print(f"\n  {len(rows)} listings · batch size {batch} → "
           f"{n_batches} listwise call(s) vs {len(rows)} pointwise")
+    if gold:
+        print(f"  gold standard: {len([r for r in rows if r['id'][:8] in gold])} "
+              "listings carry a Sonnet post-research verdict")
+
+    # --emit writes the batch prompts for an in-session model to answer; the
+    # answers come back via --apply. Same emit/apply handshake as `cli tailor`,
+    # because a subprocess cannot reach the calling session's model.
+    if emit:
+        from pathlib import Path
+
+        from src.profile_loader import load_profile
+        outdir = Path(emit)
+        outdir.mkdir(parents=True, exist_ok=True)
+        profile = load_profile()["llm_context"]
+        for i in range(0, len(rows), batch):
+            chunk = rows[i:i + batch]
+            block = "\n".join(_format_listing(r) for r in chunk)
+            (outdir / f"batch_{i // batch + 1}.txt").write_text(
+                _LISTWISE_PROMPT.format(profile=profile, listings_block=block),
+                encoding="utf-8",
+            )
+        print(f"  wrote {n_batches} prompt(s) to {outdir}/ — answer each as JSON,")
+        print(f"  save as {outdir}/batch_N.json, then re-run with --apply {outdir}")
+        return 0
 
     if dry_run:
         est_pointwise = sum(len(_format_listing(r)) for r in rows)
@@ -211,6 +262,40 @@ def run(limit: int, batch: int, dry_run: bool) -> int:
         print(f"  Listing text total: ~{est_pointwise // 4:,} tokens "
               "(sent once either way)\n")
         print("  Dry run — nothing scored, nothing spent.")
+        return 0
+
+    if apply_dir:
+        from pathlib import Path
+        by_id: dict[str, dict] = {}
+        for f in sorted(Path(apply_dir).glob("batch_*.json")):
+            try:
+                data = json.loads(f.read_text(encoding="utf-8"))
+            except json.JSONDecodeError:
+                print(f"  skipping unparseable {f.name}")
+                continue
+            for item in data.get("listings", []) or []:
+                if isinstance(item, dict) and item.get("id"):
+                    by_id[str(item["id"])] = {
+                        "verdict": str(item.get("verdict", "")).upper(),
+                        "confidence": int(item.get("confidence", 0) or 0),
+                    }
+        totals = Totals()
+        for r in rows:
+            totals.rows.append(Comparison(
+                id=r["id"], title=r["title"],
+                pointwise_verdict=(r["verdict"] or "").upper(),
+                pointwise_confidence=int(r["confidence"] or 0),
+                post_research_verdict=gold.get(r["id"][:8]),
+            ))
+            totals.pointwise_prompt += int(r["tokens_used"] or 0)
+            totals.pointwise_calls += 1
+        for row in totals.rows:
+            got = by_id.get(row.id)
+            if got:
+                row.listwise_verdict = got["verdict"]
+                row.listwise_confidence = got["confidence"]
+        totals.listwise_calls = n_batches
+        _report(totals, model, label="in-session")
         return 0
 
     if not api_key:
@@ -231,7 +316,7 @@ def run(limit: int, batch: int, dry_run: bool) -> int:
             id=r["id"], title=r["title"],
             pointwise_verdict=(r["verdict"] or "").upper(),
             pointwise_confidence=int(r["confidence"] or 0),
-            post_research_verdict=_post_research_verdict(r["id"]),
+            post_research_verdict=gold.get(r["id"][:8]) or _post_research_verdict(r["id"]),
         ))
         totals.pointwise_prompt += int(r["tokens_used"] or 0)
         totals.pointwise_calls += 1
@@ -256,7 +341,7 @@ def run(limit: int, batch: int, dry_run: bool) -> int:
     return 0
 
 
-def _report(t: Totals, model: str) -> None:
+def _report(t: Totals, model: str, label: str = "listwise") -> None:
     from eval.model_pricing import cost_for_usage
 
     scored = [r for r in t.rows if r.listwise_verdict]
@@ -264,8 +349,23 @@ def _report(t: Totals, model: str) -> None:
     disagreed = [r for r in scored if r.agree is False]
 
     print("\n  " + "=" * 58)
-    print("    M-4 — LISTWISE vs POINTWISE")
+    print(f"    M-4 — {label.upper()} vs POINTWISE")
     print("  " + "=" * 58)
+
+    # Accuracy against the Sonnet gold standard, where available.
+    refereed_all = [r for r in t.rows if r.post_research_verdict]
+    if refereed_all:
+        pw = sum(1 for r in refereed_all
+                 if r.pointwise_verdict == r.post_research_verdict)
+        lw_rows = [r for r in refereed_all if r.listwise_verdict]
+        lw = sum(1 for r in lw_rows
+                 if r.listwise_verdict == r.post_research_verdict)
+        print(f"\n  Agreement with Sonnet gold standard "
+              f"({len(refereed_all)} listings):")
+        print(f"    pointwise  {pw}/{len(refereed_all)} = "
+              f"{pw / len(refereed_all):.0%}")
+        if lw_rows:
+            print(f"    {label:<10} {lw}/{len(lw_rows)} = {lw / len(lw_rows):.0%}")
 
     print(f"\n  Coverage:   {len(scored)}/{len(t.rows)} listings returned by listwise")
     if scored:
@@ -322,8 +422,15 @@ def main() -> int:
                    help="Listings per listwise call (default: 10)")
     p.add_argument("--dry-run", action="store_true",
                    help="Show the call-count comparison, spend nothing")
+    p.add_argument("--gold", action="store_true",
+                   help="Only listings carrying a Sonnet post-research verdict")
+    p.add_argument("--emit", metavar="DIR",
+                   help="Write batch prompts for an in-session model to answer")
+    p.add_argument("--apply", metavar="DIR", dest="apply_dir",
+                   help="Score from in-session answers written to DIR")
     args = p.parse_args()
-    return run(args.limit, args.batch, args.dry_run)
+    return run(args.limit, args.batch, args.dry_run, gold_only=args.gold,
+               emit=args.emit, apply_dir=args.apply_dir)
 
 
 if __name__ == "__main__":
