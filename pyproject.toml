@@ -47,6 +47,8 @@ select = ["E", "F", "W", "I"]
 # concatenation would mangle the wire-format.
 "src/batch_process.py" = ["E402"]
 "src/digest.py"        = ["E402"]
+# E501: holds a multi-line LLM prompt template (same rationale as triage.py).
+"eval/listwise_compare.py" = ["E402", "E501"]
 "src/geo_backfill.py"  = ["E402"]
 "src/jobspy_ingest.py" = ["E402"]
 "src/pipeline.py"      = ["E402"]

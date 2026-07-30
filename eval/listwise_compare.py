@@ -1,0 +1,330 @@
+"""M-4 experiment — does listwise Stage 5 scoring beat pointwise?
+
+Answers three questions on real listings, before any live code changes:
+
+1. **Cost.** Pointwise re-sends the candidate profile on every listing;
+   listwise amortizes it across a batch. Stage 5 is 61% of run spend and ~96%
+   input tokens, so this is measurable and should be decisive on its own.
+2. **Agreement.** Do the two methods reach the same verdict? Disagreement is
+   the interesting case, not a failure — pointwise is the incumbent, not the
+   ground truth.
+3. **Which one is right, where they differ.** The labeled eval set is far too
+   small to answer this (8 emails / 11 listings — one flip moves accuracy 9
+   points), so this uses a better signal that already exists: autopilot's
+   post-research verdict from a larger model that read a research dossier
+   (``ranking_upgrade.md`` O-3's cascade). Where a listing has one, it acts
+   as a referee.
+
+**This spends real tokens** — it re-scores listings through OpenRouter. Every
+call is metered and logged, so `report --spend` shows the bill. Start with
+``--limit 20``; scoring 20 listings both ways costs well under $0.10.
+
+Usage:
+    python -m eval.listwise_compare --limit 20 --batch 10 --dry-run
+    python -m eval.listwise_compare --limit 20 --batch 10
+"""
+
+from __future__ import annotations
+
+import argparse
+import json
+import logging
+import sys
+from dataclasses import dataclass, field
+
+from dotenv import load_dotenv
+
+load_dotenv()
+
+from src.db import Database
+from src.listing_card import parse_skill_list
+from src.model_usage import log_response_usage
+from src.triage import get_confidence_threshold, get_openrouter_config
+
+logger = logging.getLogger(__name__)
+
+# One shared preamble, N listings, N verdicts. The saving comes from sending
+# the profile once instead of once per listing; the accuracy claim comes from
+# the model seeing candidates side by side.
+_LISTWISE_PROMPT = """\
+You are a recruiting assistant evaluating job listings against a candidate's profile.
+
+## Candidate profile
+{profile}
+
+## Job listings
+{listings_block}
+
+## Instructions
+Evaluate EVERY listing above against the candidate profile, independently but with
+full awareness of the others — use the comparison to calibrate, so that a listing you
+rate 90 is genuinely a better match than one you rate 70.
+
+For each listing return:
+- `id`: the listing id exactly as given.
+- `verdict`: YES, MAYBE, or NO.
+- `confidence`: integer 0-100, your confidence that this is a strong match.
+- `matching_skills`: up to 3 requirements from the listing the candidate clearly has.
+- `missing_skills`: up to 3 requirements stated in the listing that the candidate lacks.
+
+Return ONLY a JSON object of the form:
+{{"listings": [{{"id": "...", "verdict": "...", "confidence": 0, "matching_skills": [], "missing_skills": []}}]}}
+
+Every id given must appear exactly once in your response.
+"""
+
+
+@dataclass
+class Comparison:
+    """Per-listing pointwise vs listwise outcome."""
+
+    id: str
+    title: str
+    pointwise_verdict: str
+    pointwise_confidence: int
+    listwise_verdict: str | None = None
+    listwise_confidence: int | None = None
+    post_research_verdict: str | None = None
+
+    @property
+    def agree(self) -> bool | None:
+        if self.listwise_verdict is None:
+            return None
+        return self.pointwise_verdict == self.listwise_verdict
+
+    @property
+    def referee(self) -> str | None:
+        """Which method the post-research verdict backs, where it exists."""
+        if not self.post_research_verdict or self.agree is not False:
+            return None
+        if self.post_research_verdict == self.pointwise_verdict:
+            return "pointwise"
+        if self.post_research_verdict == self.listwise_verdict:
+            return "listwise"
+        return "neither"
+
+
+@dataclass
+class Totals:
+    pointwise_prompt: int = 0
+    pointwise_completion: int = 0
+    listwise_prompt: int = 0
+    listwise_completion: int = 0
+    pointwise_calls: int = 0
+    listwise_calls: int = 0
+    rows: list[Comparison] = field(default_factory=list)
+
+
+def _post_research_verdict(job_id: str) -> str | None:
+    """Autopilot's large-model verdict for this listing, if it ran."""
+    from src.cli import AUTO_ASSETS_FILE, OUTPUT_DIR, _read_text
+    from src.file_utils import find_output_folder
+
+    folder = find_output_folder(job_id, OUTPUT_DIR)
+    if not folder:
+        return None
+    raw = _read_text(folder / AUTO_ASSETS_FILE)
+    if not raw:
+        return None
+    try:
+        return (json.loads(raw) or {}).get("post_research_verdict")
+    except json.JSONDecodeError:
+        return None
+
+
+def _format_listing(row) -> str:
+    desc = (row["job_summary"] or row["reason"] or "")[:1200]
+    return (
+        f"### id: {row['id']}\n"
+        f"Title: {row['title']}\n"
+        f"Company: {row['company']}\n"
+        f"Location: {row['location'] or 'not specified'}\n"
+        f"Salary: {row['salary'] or 'not listed'}\n"
+        f"Description: {desc}\n"
+    )
+
+
+def score_listwise(client, model: str, profile: str, rows: list) -> tuple[dict, int, int]:
+    """Score a batch in one call. Returns (by_id, prompt_tokens, completion_tokens).
+
+    Parses per item: a malformed entry costs that listing only, and the caller
+    can retry it pointwise. All-or-nothing batching would make one bad
+    response lose the whole batch — the blast-radius risk the plan flagged.
+    """
+    block = "\n".join(_format_listing(r) for r in rows)
+    prompt = _LISTWISE_PROMPT.format(profile=profile, listings_block=block)
+    resp = client.chat.completions.create(
+        model=model,
+        messages=[{"role": "user", "content": prompt}],
+        max_tokens=200 * len(rows) + 500,
+        temperature=0.0,
+        response_format={"type": "json_object"},
+    )
+    log_response_usage(resp, model, "eval_listwise")
+    usage = getattr(resp, "usage", None)
+    p_tok = int(getattr(usage, "prompt_tokens", 0) or 0)
+    c_tok = int(getattr(usage, "completion_tokens", 0) or 0)
+
+    by_id: dict[str, dict] = {}
+    try:
+        data = json.loads(resp.choices[0].message.content or "{}")
+    except json.JSONDecodeError:
+        logger.warning("Listwise batch returned unparseable JSON")
+        return by_id, p_tok, c_tok
+    for item in data.get("listings", []) or []:
+        if not isinstance(item, dict) or not item.get("id"):
+            continue
+        try:
+            by_id[str(item["id"])] = {
+                "verdict": str(item.get("verdict", "")).upper(),
+                "confidence": int(item.get("confidence", 0) or 0),
+                "matching_skills": parse_skill_list(item.get("matching_skills")),
+                "missing_skills": parse_skill_list(item.get("missing_skills")),
+            }
+        except (TypeError, ValueError):
+            continue
+    return by_id, p_tok, c_tok
+
+
+def run(limit: int, batch: int, dry_run: bool) -> int:
+    api_key, model = get_openrouter_config()
+    with Database() as db:
+        rows = db.conn.execute(
+            "SELECT * FROM listings WHERE verdict IS NOT NULL "
+            "AND job_summary IS NOT NULL AND job_summary != '' "
+            "ORDER BY date_ingested DESC LIMIT ?",
+            (limit,),
+        ).fetchall()
+
+    if not rows:
+        print("No scored listings with summaries available.")
+        return 1
+
+    n_batches = (len(rows) + batch - 1) // batch
+    print(f"\n  {len(rows)} listings · batch size {batch} → "
+          f"{n_batches} listwise call(s) vs {len(rows)} pointwise")
+
+    if dry_run:
+        est_pointwise = sum(len(_format_listing(r)) for r in rows)
+        print(f"  Pointwise re-sends the profile {len(rows)}x; "
+              f"listwise sends it {n_batches}x.")
+        print(f"  Listing text total: ~{est_pointwise // 4:,} tokens "
+              "(sent once either way)\n")
+        print("  Dry run — nothing scored, nothing spent.")
+        return 0
+
+    if not api_key:
+        print("OPENROUTER_API_KEY not set.")
+        return 1
+
+    import openai
+
+    from src.profile_loader import load_profile
+    profile = load_profile()["llm_context"]
+    client = openai.OpenAI(base_url="https://openrouter.ai/api/v1", api_key=api_key)
+
+    totals = Totals()
+    # Pointwise numbers come from what the pipeline already recorded — those
+    # calls happened, and re-running them would spend twice to learn nothing.
+    for r in rows:
+        totals.rows.append(Comparison(
+            id=r["id"], title=r["title"],
+            pointwise_verdict=(r["verdict"] or "").upper(),
+            pointwise_confidence=int(r["confidence"] or 0),
+            post_research_verdict=_post_research_verdict(r["id"]),
+        ))
+        totals.pointwise_prompt += int(r["tokens_used"] or 0)
+        totals.pointwise_calls += 1
+
+    by_id: dict[str, dict] = {}
+    for i in range(0, len(rows), batch):
+        chunk = rows[i:i + batch]
+        print(f"  listwise batch {i // batch + 1}/{n_batches} ({len(chunk)} listings)…")
+        scored, p_tok, c_tok = score_listwise(client, model, profile, chunk)
+        by_id.update(scored)
+        totals.listwise_prompt += p_tok
+        totals.listwise_completion += c_tok
+        totals.listwise_calls += 1
+
+    for row in totals.rows:
+        got = by_id.get(row.id)
+        if got:
+            row.listwise_verdict = got["verdict"]
+            row.listwise_confidence = got["confidence"]
+
+    _report(totals, model)
+    return 0
+
+
+def _report(t: Totals, model: str) -> None:
+    from eval.model_pricing import cost_for_usage
+
+    scored = [r for r in t.rows if r.listwise_verdict]
+    agreed = [r for r in scored if r.agree]
+    disagreed = [r for r in scored if r.agree is False]
+
+    print("\n  " + "=" * 58)
+    print("    M-4 — LISTWISE vs POINTWISE")
+    print("  " + "=" * 58)
+
+    print(f"\n  Coverage:   {len(scored)}/{len(t.rows)} listings returned by listwise")
+    if scored:
+        print(f"  Agreement:  {len(agreed)}/{len(scored)} "
+              f"({len(agreed) / len(scored):.0%})")
+
+    lw_cost = cost_for_usage(model, t.listwise_prompt, t.listwise_completion)
+    print(f"\n  {'':<12} {'calls':>6} {'prompt tok':>12} {'est $':>9}")
+    print(f"  {'pointwise':<12} {t.pointwise_calls:>6} "
+          f"{t.pointwise_prompt:>12,} {'(recorded)':>9}")
+    print(f"  {'listwise':<12} {t.listwise_calls:>6} "
+          f"{t.listwise_prompt:>12,} "
+          f"{(f'{lw_cost:.4f}' if lw_cost is not None else 'n/a'):>9}")
+    if t.pointwise_prompt and t.listwise_prompt:
+        ratio = t.pointwise_prompt / t.listwise_prompt
+        print(f"\n  Prompt tokens: listwise uses {1 / ratio:.0%} of pointwise "
+              f"({ratio:.1f}x reduction)")
+
+    refereed = [r for r in disagreed if r.referee]
+    if refereed:
+        wins = {}
+        for r in refereed:
+            wins[r.referee] = wins.get(r.referee, 0) + 1
+        print(f"\n  Where they disagree, post-research backs "
+              f"({len(refereed)} refereed):")
+        for who, n in sorted(wins.items(), key=lambda kv: -kv[1]):
+            print(f"    {who:<12} {n}")
+    elif disagreed:
+        print(f"\n  {len(disagreed)} disagreement(s), none with a post-research "
+              "verdict to referee.")
+
+    if disagreed:
+        print("\n  Disagreements:")
+        for r in disagreed[:12]:
+            ref = f"  → {r.referee}" if r.referee else ""
+            print(f"    {r.title[:40]:<40} "
+                  f"point={r.pointwise_verdict}({r.pointwise_confidence}) "
+                  f"list={r.listwise_verdict}({r.listwise_confidence}){ref}")
+
+    print(f"\n  Threshold in force: {get_confidence_threshold():.0%}")
+    print("  Listwise is NOT wired into the pipeline — this is a read-only "
+          "experiment.\n")
+
+
+def main() -> int:
+    logging.basicConfig(level=logging.WARNING, format="%(message)s")
+    p = argparse.ArgumentParser(
+        prog="python -m eval.listwise_compare",
+        description="M-4: compare listwise batch scoring against pointwise.",
+    )
+    p.add_argument("--limit", type=int, default=20,
+                   help="Listings to compare (default: 20)")
+    p.add_argument("--batch", type=int, default=10,
+                   help="Listings per listwise call (default: 10)")
+    p.add_argument("--dry-run", action="store_true",
+                   help="Show the call-count comparison, spend nothing")
+    args = p.parse_args()
+    return run(args.limit, args.batch, args.dry_run)
+
+
+if __name__ == "__main__":
+    sys.exit(main())
