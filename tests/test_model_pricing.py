@@ -79,7 +79,7 @@ class TestPricingProvenance:
         # If someone edits a price they must re-date the table; if they can't
         # verify it, they must drop the flag. Both together, or neither.
         assert PRICING_VERIFIED is True
-        assert LAST_UPDATED == "2026-07-29"
+        assert LAST_UPDATED == "2026-07-30"
 
     def test_no_zero_or_negative_rates(self):
         from eval.model_pricing import PRICING

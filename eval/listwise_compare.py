@@ -209,8 +209,12 @@ def load_gold() -> dict[str, str]:
 
 
 def run(limit: int, batch: int, dry_run: bool, gold_only: bool = False,
-        emit: str | None = None, apply_dir: str | None = None) -> int:
+        emit: str | None = None, apply_dir: str | None = None,
+        shuffle: bool = False, seed: int = 0,
+        model_override: str | None = None) -> int:
     api_key, model = get_openrouter_config()
+    if model_override:
+        model = model_override
     gold = load_gold() if (gold_only or emit or apply_dir) else {}
 
     with Database() as db:
@@ -223,6 +227,14 @@ def run(limit: int, batch: int, dry_run: bool, gold_only: bool = False,
         rows = [r for r in rows if r["id"][:8] in gold]
     rows = rows[:limit]
 
+    if shuffle:
+        # Listwise models over-rank early items. A fixed seed keeps arms
+        # comparable while breaking the date_ingested ordering that every
+        # previous run shared — position bias was the largest unmeasured
+        # confound in the first three arms.
+        import random
+        random.Random(seed).shuffle(rows)
+
     if not rows:
         print("No scored listings with summaries available.")
         return 1
@@ -230,6 +242,7 @@ def run(limit: int, batch: int, dry_run: bool, gold_only: bool = False,
     n_batches = (len(rows) + batch - 1) // batch
     print(f"\n  {len(rows)} listings · batch size {batch} → "
           f"{n_batches} listwise call(s) vs {len(rows)} pointwise")
+    print(f"  model: {model}" + ("  · shuffled" if shuffle else "  · date order"))
     if gold:
         print(f"  gold standard: {len([r for r in rows if r['id'][:8] in gold])} "
               "listings carry a Sonnet post-research verdict")
@@ -428,9 +441,17 @@ def main() -> int:
                    help="Write batch prompts for an in-session model to answer")
     p.add_argument("--apply", metavar="DIR", dest="apply_dir",
                    help="Score from in-session answers written to DIR")
+    p.add_argument("--shuffle", action="store_true",
+                   help="Shuffle input order (tests listwise position bias)")
+    p.add_argument("--seed", type=int, default=0,
+                   help="Shuffle seed, so arms stay comparable (default: 0)")
+    p.add_argument("--model", dest="model_override",
+                   help="Override the scoring model slug for this run")
     args = p.parse_args()
     return run(args.limit, args.batch, args.dry_run, gold_only=args.gold,
-               emit=args.emit, apply_dir=args.apply_dir)
+               emit=args.emit, apply_dir=args.apply_dir,
+               shuffle=args.shuffle, seed=args.seed,
+               model_override=args.model_override)
 
 
 if __name__ == "__main__":
