@@ -1531,3 +1531,73 @@ class TestListwisePrescoring:
                     [("A", "X", "YES", 90), ("B", "Y", "NO", 20)])
                 s.prescore_batch(items)
         assert "fall back to pointwise" not in caplog.text
+
+    def _anchored(self, monkeypatch, tmp_path, expected="YES", action="save"):
+        """A session with one human-labelled listing available as anchor."""
+        import json as _json
+
+        import src.human_labels as hl
+        from src.db import Database
+        from src.models import JobListing
+        db_path = tmp_path / "a.db"
+        monkeypatch.setenv("APPLY_DAEMON_DB", str(db_path))
+        listing = JobListing(source="linkedin", email_classification="JOB_DIGEST",
+                             title="Anchor Role", company="AnchorCo",
+                             verdict="YES", confidence=90, model_used="t",
+                             job_summary="A known-good reference listing.")
+        with Database(db_path) as db:
+            db.insert_listing(listing)
+        labels = tmp_path / "labels.jsonl"
+        labels.write_text(_json.dumps(
+            {"job_id": listing.id, "human_reaction": action, "listing": {}}
+        ) + "\n", encoding="utf-8")
+        monkeypatch.setattr(hl, "LABELS_PATH", labels)
+        monkeypatch.delenv("HUMAN_LABELS_PATH", raising=False)
+        return self._session(monkeypatch, 10), expected
+
+    def test_anchor_selected_from_human_labels(self, monkeypatch, tmp_path):
+        s, _ = self._anchored(monkeypatch, tmp_path)
+        got = s._select_anchor()
+        assert got is not None
+        assert got[0].company == "AnchorCo" and got[2] == "YES"
+
+    def test_passed_listing_anchors_as_NO(self, monkeypatch, tmp_path):
+        s, _ = self._anchored(monkeypatch, tmp_path, action="pass")
+        assert s._select_anchor()[2] == "NO"
+
+    def test_no_labels_means_unanchored_not_broken(self, monkeypatch, tmp_path):
+        import src.human_labels as hl
+        monkeypatch.setattr(hl, "LABELS_PATH", tmp_path / "missing.jsonl")
+        monkeypatch.delenv("HUMAN_LABELS_PATH", raising=False)
+        s = self._session(monkeypatch, 10)
+        assert s._select_anchor() is None
+
+    def test_anchor_rides_in_the_batch(self, monkeypatch, tmp_path):
+        s, _ = self._anchored(monkeypatch, tmp_path)
+        with patch("src.triage._call_openrouter") as call:
+            call.return_value = self._batch_response(
+                [("A", "X", "YES", 80), ("Anchor Role", "AnchorCo", "YES", 90)])
+            s.prescore_batch([(self._anchor("A", "X"), "d")])
+            prompt = call.call_args[0][2]
+            assert "AnchorCo" in prompt          # anchor present
+        assert "anchor role|anchorco" not in s._listwise_scores  # not cached
+
+    def test_batch_rejected_when_anchor_misjudged(self, monkeypatch, tmp_path):
+        """The protective behavior: a batch that misjudges a listing the user
+        saved has suspect calibration, so its scores are discarded."""
+        s, _ = self._anchored(monkeypatch, tmp_path)
+        with patch("src.triage._call_openrouter") as call:
+            call.return_value = self._batch_response([
+                ("A", "X", "YES", 95),
+                ("Anchor Role", "AnchorCo", "NO", 10),   # user saved it
+            ])
+            assert s.prescore_batch([(self._anchor("A", "X"), "d")]) == 0
+        assert s._listwise_scores == {}          # all fall back to pointwise
+
+    def test_anchor_disabled_by_env(self, monkeypatch, tmp_path):
+        s, _ = self._anchored(monkeypatch, tmp_path)
+        monkeypatch.setenv("STAGE5_ANCHOR", "false")
+        with patch("src.triage._call_openrouter") as call:
+            call.return_value = self._batch_response([("A", "X", "YES", 80)])
+            s.prescore_batch([(self._anchor("A", "X"), "d")])
+            assert "AnchorCo" not in call.call_args[0][2]

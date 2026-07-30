@@ -519,6 +519,15 @@ def run_jobspy_ingest() -> None:
                     len(jobs_df), search_term, location, tier_name,
                 )
 
+                # M-4: pre-score this search's rows in one batched Stage 5
+                # call, caching verdicts the per-row loop below picks up.
+                # Deliberately excludes rows needing Stage 4b lazy-load: their
+                # description changes after the fetch, so batching them here
+                # would score a truncated posting. Those stay pointwise, as
+                # does anything the batch omits — prescore_batch caches per
+                # item and a miss is just a normal call.
+                _prescore_search_batch(session, db, jobs_df, dedup_window)
+
                 for _, row in jobs_df.iterrows():
                     stats["total"] += 1
 
@@ -631,6 +640,38 @@ def run_jobspy_ingest() -> None:
         "  Verdicts:             YES=%d, MAYBE=%d, NO=%d",
         stats["yes"], stats["maybe"], stats["no"],
     )
+
+
+
+def _prescore_search_batch(session, db, jobs_df, dedup_window: int) -> None:
+    """Batch-score the rows of one search before the per-row loop (M-4).
+
+    No-op unless STAGE5_LISTWISE_BATCH is set. Failure is contained: any
+    exception here leaves the cache empty and every listing takes the
+    pointwise path exactly as before.
+    """
+    from src.triage import listwise_batch_size
+
+    if listwise_batch_size() < 2:
+        return
+    try:
+        items = []
+        for _, row in jobs_df.iterrows():
+            anchor = _row_to_extracted_listing(row)
+            if not anchor.title or not anchor.company:
+                continue
+            if _is_truncated(anchor.description):
+                continue  # Stage 4b will change the text; score it pointwise
+            if db.is_duplicate_listing(
+                anchor.title, anchor.company, window_days=dedup_window
+            ):
+                continue
+            items.append((anchor, anchor.description))
+        if len(items) >= 2:
+            session.prescore_batch(items)
+    except Exception:
+        logger.warning("Listwise pre-scoring failed for this search — "
+                       "falling back to per-listing scoring", exc_info=True)
 
 
 def main() -> None:
