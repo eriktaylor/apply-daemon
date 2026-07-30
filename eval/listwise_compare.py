@@ -144,6 +144,80 @@ def _format_listing(row) -> str:
     )
 
 
+def score_via_claude_cli(model: str, profile: str, rows: list,
+                         timeout_s: int = 300) -> tuple[dict, int, int, float]:
+    """Score a batch through the Claude Code CLI (`claude -p --model ...`).
+
+    This is the membership path made measurable: a subprocess cannot reach the
+    *calling* session's model, but it can start its own, so Haiku and Sonnet
+    are callable head-to-head against the OpenRouter arms. Returns
+    (by_id, input_tokens, output_tokens, reported_cost_usd) — the CLI reports
+    real usage, including cache hits, which OpenRouter's list pricing cannot
+    show us.
+    """
+    import subprocess
+
+    block = "\n".join(_format_listing(r) for r in rows)
+    prompt = _LISTWISE_PROMPT.format(profile=profile, listings_block=block)
+    prompt += "\n\nRespond with ONLY the JSON object, no prose, no code fence."
+
+    # Prompt goes on stdin, not argv: passing it as an argument fails without
+    # a TTY (backgrounded runs error with "Input must be provided either
+    # through stdin or as a prompt argument"), and these prompts are long
+    # enough to risk ARG_MAX.
+    proc = subprocess.run(
+        ["claude", "-p", "--model", model, "--output-format", "json"],
+        input=prompt, capture_output=True, text=True, timeout=timeout_s,
+    )
+    by_id: dict[str, dict] = {}
+    if proc.returncode != 0:
+        logger.warning("claude CLI failed (rc=%d): %s", proc.returncode,
+                       (proc.stderr or "")[-300:])
+        return by_id, 0, 0, 0.0
+    try:
+        envelope = json.loads(proc.stdout)
+    except json.JSONDecodeError:
+        logger.warning("claude CLI returned non-JSON envelope")
+        return by_id, 0, 0, 0.0
+
+    usage = envelope.get("usage", {}) or {}
+    # Cache reads/creations are real input the model processed; counting only
+    # `input_tokens` would understate the batch by orders of magnitude.
+    in_tok = (int(usage.get("input_tokens", 0) or 0)
+              + int(usage.get("cache_read_input_tokens", 0) or 0)
+              + int(usage.get("cache_creation_input_tokens", 0) or 0))
+    out_tok = int(usage.get("output_tokens", 0) or 0)
+    cost = float(envelope.get("total_cost_usd", 0.0) or 0.0)
+
+    text = _strip_fence(envelope.get("result", "") or "")
+    try:
+        data = json.loads(text)
+    except json.JSONDecodeError:
+        logger.warning("claude CLI result was not parseable JSON")
+        return by_id, in_tok, out_tok, cost
+    for item in data.get("listings", []) or []:
+        if isinstance(item, dict) and item.get("id"):
+            try:
+                by_id[str(item["id"])] = {
+                    "verdict": str(item.get("verdict", "")).upper(),
+                    "confidence": int(item.get("confidence", 0) or 0),
+                }
+            except (TypeError, ValueError):
+                continue
+    return by_id, in_tok, out_tok, cost
+
+
+def _strip_fence(text: str) -> str:
+    text = text.strip()
+    if text.startswith("```"):
+        parts = text.split("```")
+        for part in parts:
+            cleaned = part.removeprefix("json").strip()
+            if cleaned.startswith("{"):
+                return cleaned
+    return text
+
+
 def score_listwise(client, model: str, profile: str, rows: list) -> tuple[dict, int, int]:
     """Score a batch in one call. Returns (by_id, prompt_tokens, completion_tokens).
 
@@ -211,7 +285,8 @@ def load_gold() -> dict[str, str]:
 def run(limit: int, batch: int, dry_run: bool, gold_only: bool = False,
         emit: str | None = None, apply_dir: str | None = None,
         shuffle: bool = False, seed: int = 0,
-        model_override: str | None = None) -> int:
+        model_override: str | None = None,
+        via_claude: str | None = None) -> int:
     api_key, model = get_openrouter_config()
     if model_override:
         model = model_override
@@ -311,6 +386,41 @@ def run(limit: int, batch: int, dry_run: bool, gold_only: bool = False,
         _report(totals, model, label="in-session")
         return 0
 
+    if via_claude:
+        from src.profile_loader import load_profile
+        profile = load_profile()["llm_context"]
+        totals = Totals()
+        for r in rows:
+            totals.rows.append(Comparison(
+                id=r["id"], title=r["title"],
+                pointwise_verdict=(r["verdict"] or "").upper(),
+                pointwise_confidence=int(r["confidence"] or 0),
+                post_research_verdict=gold.get(r["id"][:8]),
+            ))
+            totals.pointwise_prompt += int(r["tokens_used"] or 0)
+            totals.pointwise_calls += 1
+        by_id: dict[str, dict] = {}
+        cli_cost = 0.0
+        for i in range(0, len(rows), batch):
+            chunk = rows[i:i + batch]
+            print(f"  {via_claude} batch {i // batch + 1}/{n_batches} "
+                  f"({len(chunk)} listings)…")
+            scored, in_tok, out_tok, cost = score_via_claude_cli(
+                via_claude, profile, chunk)
+            by_id.update(scored)
+            totals.listwise_prompt += in_tok
+            totals.listwise_completion += out_tok
+            totals.listwise_calls += 1
+            cli_cost += cost
+        for row in totals.rows:
+            got = by_id.get(row.id)
+            if got:
+                row.listwise_verdict = got["verdict"]
+                row.listwise_confidence = got["confidence"]
+        _report(totals, model, label=f"claude/{via_claude}",
+                override_cost=cli_cost)
+        return 0
+
     if not api_key:
         print("OPENROUTER_API_KEY not set.")
         return 1
@@ -354,7 +464,8 @@ def run(limit: int, batch: int, dry_run: bool, gold_only: bool = False,
     return 0
 
 
-def _report(t: Totals, model: str, label: str = "listwise") -> None:
+def _report(t: Totals, model: str, label: str = "listwise",
+            override_cost: float | None = None) -> None:
     from eval.model_pricing import cost_for_usage
 
     scored = [r for r in t.rows if r.listwise_verdict]
@@ -385,7 +496,9 @@ def _report(t: Totals, model: str, label: str = "listwise") -> None:
         print(f"  Agreement:  {len(agreed)}/{len(scored)} "
               f"({len(agreed) / len(scored):.0%})")
 
-    lw_cost = cost_for_usage(model, t.listwise_prompt, t.listwise_completion)
+    lw_cost = (override_cost if override_cost is not None
+               else cost_for_usage(model, t.listwise_prompt,
+                                   t.listwise_completion))
     print(f"\n  {'':<12} {'calls':>6} {'prompt tok':>12} {'est $':>9}")
     print(f"  {'pointwise':<12} {t.pointwise_calls:>6} "
           f"{t.pointwise_prompt:>12,} {'(recorded)':>9}")
@@ -447,11 +560,15 @@ def main() -> int:
                    help="Shuffle seed, so arms stay comparable (default: 0)")
     p.add_argument("--model", dest="model_override",
                    help="Override the scoring model slug for this run")
+    p.add_argument("--via-claude", dest="via_claude", metavar="MODEL",
+                   help="Score through `claude -p --model MODEL` "
+                        "(e.g. haiku, sonnet) instead of OpenRouter")
     args = p.parse_args()
     return run(args.limit, args.batch, args.dry_run, gold_only=args.gold,
                emit=args.emit, apply_dir=args.apply_dir,
                shuffle=args.shuffle, seed=args.seed,
-               model_override=args.model_override)
+               model_override=args.model_override,
+               via_claude=args.via_claude)
 
 
 if __name__ == "__main__":
