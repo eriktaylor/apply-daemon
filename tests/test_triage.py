@@ -1506,3 +1506,28 @@ class TestListwisePrescoring:
             call.return_value = self._batch_response([])
             s.prescore_batch(items)
             assert call.call_count == 3          # 2 + 2 + 1
+
+    def test_logs_coverage_and_warns_on_misses(self, monkeypatch, caplog):
+        """Coverage must be observable — the omission is stochastic, so a bad
+        stretch has to show up rather than quietly eroding the saving."""
+        import logging
+        s = self._session(monkeypatch, 10)
+        items = [(self._anchor("A", "X"), "d"), (self._anchor("B", "Y"), "d")]
+        with caplog.at_level(logging.WARNING, logger="src.triage"):
+            with patch("src.triage._call_openrouter") as call:
+                call.return_value = self._batch_response([("A", "X", "YES", 90)])
+                s.prescore_batch(items)
+        text = caplog.text
+        assert "1/2" in text                     # per-batch miss
+        assert "fall back to pointwise" in text
+
+    def test_full_coverage_does_not_warn(self, monkeypatch, caplog):
+        import logging
+        s = self._session(monkeypatch, 10)
+        items = [(self._anchor("A", "X"), "d"), (self._anchor("B", "Y"), "d")]
+        with caplog.at_level(logging.WARNING, logger="src.triage"):
+            with patch("src.triage._call_openrouter") as call:
+                call.return_value = self._batch_response(
+                    [("A", "X", "YES", 90), ("B", "Y", "NO", 20)])
+                s.prescore_batch(items)
+        assert "fall back to pointwise" not in caplog.text

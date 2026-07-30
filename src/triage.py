@@ -1246,8 +1246,12 @@ class TriageSession:
             return 0
 
         scored = 0
+        batches = 0
+        incomplete = 0
         for start in range(0, len(items), size):
             chunk = items[start:start + size]
+            batches += 1
+            before = scored
             block = "\n".join(
                 f"### id: {self._batch_key(a)}\n"
                 f"Title: {a.title}\nCompany: {a.company}\n"
@@ -1296,7 +1300,27 @@ class TriageSession:
                 except (TypeError, ValueError):
                     continue
 
-        logger.info("Listwise pre-scored %d/%d listings", scored, len(items))
+            # Coverage is the metric the economics rest on. Omission is
+            # stochastic (identical inputs at temperature=0 have returned
+            # 24/24 and 14/24), so it has to be observable per batch rather
+            # than inferred from a total — a bad stretch should be visible,
+            # not silently eroding the saving.
+            got = scored - before
+            if got < len(chunk):
+                incomplete += 1
+                logger.warning(
+                    "Listwise batch %d returned %d/%d listings — %d fall back "
+                    "to pointwise", batches, got, len(chunk), len(chunk) - got,
+                )
+
+        missed = len(items) - scored
+        log_fn = logger.warning if missed else logger.info
+        log_fn(
+            "Listwise coverage: %d/%d listings (%.0f%%) in %d batch(es); "
+            "%d incomplete, %d fall back to pointwise",
+            scored, len(items), scored / len(items) * 100 if items else 0.0,
+            batches, incomplete, missed,
+        )
         return scored
 
     def _run_eval_prompt(
