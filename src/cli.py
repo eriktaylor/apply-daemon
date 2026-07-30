@@ -46,11 +46,12 @@ from pathlib import Path
 
 from dotenv import load_dotenv
 
-from src.db import Database
+from src.db import ENRICHED_STATUSES, REVIEW_STATUSES, Database
 from src.decisions import DECISIONS, target_status
 from src.decisions import apply as apply_decision
 from src.file_utils import find_output_folder
 from src.human_labels import SURFACE_CLI, append_human_label
+from src.listing_card import build_card, format_skills_line
 
 logger = logging.getLogger(__name__)
 
@@ -217,36 +218,28 @@ def _tier_of(row: sqlite3.Row) -> str:
 
 
 def _card(row: sqlite3.Row, *, detail: bool = False) -> dict:
-    """Serialize a listing row for JSON output.
+    """Serialize a listing row for output via the shared card contract.
 
-    ``raw_email_text`` is deliberately absent — it is raw email content, and
-    this output reaches a model context and potentially logs.
+    Content comes from src/listing_card.py so this surface cannot drift from
+    the Slack digest — the two assembling their own field sets is how the
+    skills block went missing once. Presentation is ours; content is not.
     """
-    links = _json_list(row["links"])
-    age_h = _age_hours(row["date_ingested"])
-    bucket = row["distance_bucket"] if "distance_bucket" in row.keys() else None
-    card = {
-        "id": row["id"],
-        "title": row["title"],
-        "company": row["company"],
-        "location": row["location"],
-        "salary": row["salary"],
-        "verdict": row["verdict"],
-        "confidence": row["confidence"],
-        "status": row["pipeline_status"],
-        "tier": _tier_of(row),
-        "research_cached": _research_cached(row["id"]),
-        "url": links[0] if links else None,
-        "date_ingested": row["date_ingested"],
-        "age_days": int(age_h // 24) if age_h is not None else None,
-        "distance": _DISTANCE_LABELS.get(bucket),
-    }
+    card = build_card(row, research_cached=_research_cached(row["id"]))
+    card["status"] = row["pipeline_status"]
+    card["date_ingested"] = row["date_ingested"]
     if detail:
-        card["reason"] = row["reason"]
-        card["job_summary"] = row["job_summary"]
-        card["matching_skills"] = _json_list(row["matching_skills"])
-        card["missing_skills"] = _json_list(row["missing_skills"])
+        card["reason"] = _get_row(row, "reason")
+        card["salary"] = _get_row(row, "salary")
+    else:
+        card["salary"] = _get_row(row, "salary")
     return card
+
+
+def _get_row(row: sqlite3.Row, key: str):
+    try:
+        return row[key]
+    except (KeyError, IndexError):
+        return None
 
 
 def _emit(payload: dict, as_json: bool, human: str) -> None:
@@ -254,21 +247,35 @@ def _emit(payload: dict, as_json: bool, human: str) -> None:
 
 
 def _fmt_card(card: dict, index: int | None = None) -> str:
+    """Render the canonical card. Field set is the contract's, not ours."""
     prefix = f"[{index}] " if index is not None else ""
-    free = " (research cached — deep-dive is free)" if card["research_cached"] else ""
-    meta = f"    {card['verdict']} {card['confidence']}%  ·  {card['tier']}{free}"
+    lines = [f"{prefix}{card['verdict']}: {card['title']} — {card['company']}"]
+
+    loc = card.get("location") or "location unknown"
     if card.get("distance"):
-        meta += f"  ·  {card['distance']}"
-    if card.get("age_days") is not None:
-        meta += f"  ·  {card['age_days']}d"
-    lines = [
-        f"{prefix}{card['title']} — {card['company']}",
-        meta,
-    ]
-    if card.get("location"):
-        lines.append(f"    {card['location']}")
+        loc += f" ({card['distance']})"
+    meta = [loc]
+    if card.get("freshness"):
+        age = card.get("age_days")
+        meta.append(f"{card['freshness']}" + (f" · {age}d" if age is not None else ""))
+    meta.append(f"{card['verdict']} {card['confidence']}%")
+    lines.append("    " + "  |  ".join(meta))
+
+    if card.get("tldr"):
+        lines.append(f"    TL;DR: {card['tldr'][:400]}")
+
+    for skill_line in format_skills_line(card).splitlines():
+        lines.append("    " + skill_line.strip() if skill_line.startswith(" ")
+                     else "    " + skill_line)
+
+    tier = card.get("tier")
+    extras = [tier] if tier else []
+    if card.get("research_cached"):
+        extras.append("research cached — deep-dive is free")
     if card.get("salary"):
-        lines.append(f"    {card['salary']}")
+        extras.append(card["salary"])
+    if extras:
+        lines.append("    " + "  ·  ".join(extras))
     if card.get("url"):
         lines.append(f"    {card['url']}")
     lines.append(f"    id: {card['id']}")
@@ -295,19 +302,37 @@ def review_max_age_days() -> int:
         return DEFAULT_MAX_AGE_DAYS
 
 
-def cmd_next(db: Database, top: int, as_json: bool, max_age: int | None) -> int:
+def high_signal_only() -> bool:
+    """Whether `next` shows enriched rows only.
+
+    Follows `AUTOPILOT_POST_STAGE_5`, the knob that already governs this for
+    the Slack digest — raising CONFIDENCE_THRESHOLD and enabling autopilot is
+    a statement that raw Stage 5 output is noise, and the review surface
+    should honor it rather than re-surfacing what was filtered out.
+    """
+    return os.getenv("AUTOPILOT_POST_STAGE_5", "true").strip().lower() not in (
+        "1", "true", "yes",
+    )
+
+
+def cmd_next(db: Database, top: int, as_json: bool, max_age: int | None,
+             all_tiers: bool = False) -> int:
     max_age = review_max_age_days() if max_age is None else max_age
+    statuses = REVIEW_STATUSES if (all_tiers or not high_signal_only()) \
+        else ENRICHED_STATUSES
     rows = db.get_review_queue(
         limit=top,
         session_window_minutes=SESSION_WINDOW_MINUTES,
         max_age_days=max_age or None,
+        statuses=statuses,
     )
     cards = [_card(r) for r in rows]
     db.mark_presented([r["id"] for r in rows])
     stale = db.count_stale_reviewable(max_age) if max_age else 0
 
     payload = {"verb": "next", "count": len(cards), "listings": cards,
-               "max_age_days": max_age, "hidden_stale": stale}
+               "max_age_days": max_age, "hidden_stale": stale,
+               "tiers": list(statuses)}
 
     if not cards:
         if stale:
@@ -789,6 +814,8 @@ def build_parser() -> argparse.ArgumentParser:
                             help="Show the next page of candidates")
     p_next.add_argument("--top", type=int, default=DEFAULT_TOP,
                         help=f"How many to show (default: {DEFAULT_TOP})")
+    p_next.add_argument("--all-tiers", action="store_true", dest="all_tiers",
+                        help="Include un-enriched Stage 5 rows (debugging)")
     p_next.add_argument("--max-age", type=int, default=None, dest="max_age",
                         metavar="DAYS",
                         help=f"Hide listings ingested more than DAYS ago "
@@ -858,7 +885,8 @@ def main(argv: list[str] | None = None) -> int:
             return cmd_refresh(db, top_n=args.top_n, force=args.force,
                                dry_run=args.dry_run, as_json=args.json)
         if args.verb == "next":
-            return cmd_next(db, args.top, args.json, args.max_age)
+            return cmd_next(db, args.top, args.json, args.max_age,
+                            args.all_tiers)
         if args.verb == "show":
             return cmd_show(db, args.id, args.json)
         if args.verb == "deep-dive":

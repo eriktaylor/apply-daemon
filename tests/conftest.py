@@ -26,6 +26,7 @@ os.environ.setdefault("MODEL_USAGE_LOG_ENABLED", "false")
 _ENV_DEFAULTS = {
     "CONFIDENCE_THRESHOLD": "0.5",   # src/triage.py::get_confidence_threshold
     "AUTOPILOT_ENABLED": "false",    # src/process_queue.py::_autopilot_enabled
+    "AUTOPILOT_POST_STAGE_5": "true",  # src/cli.py::high_signal_only
 }
 
 for _key, _value in _ENV_DEFAULTS.items():

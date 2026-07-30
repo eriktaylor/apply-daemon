@@ -112,20 +112,24 @@ class TestNextVerb:
 class TestJsonContract:
     """E-2 — the keys the skill depends on."""
 
+    # The shared contract (src/listing_card.REQUIRED_FIELDS) plus the two
+    # CLI-only additions. Keeping this literal rather than importing the
+    # contract is deliberate: it must fail when the contract changes, so the
+    # change is reviewed rather than absorbed silently.
     CARD_KEYS = {
-        "id", "title", "company", "location", "salary", "verdict",
-        "confidence", "status", "tier", "research_cached", "url",
-        "date_ingested", "age_days", "distance",
+        "id", "title", "company", "verdict", "confidence", "location",
+        "distance", "url", "tldr", "skills_pct", "skills_matched",
+        "skills_total", "matching_skills", "missing_skills", "age_days",
+        "freshness", "tier", "research_cached",
+        "status", "date_ingested", "salary",
     }
-    DETAIL_KEYS = CARD_KEYS | {
-        "reason", "job_summary", "matching_skills", "missing_skills",
-    }
+    DETAIL_KEYS = CARD_KEYS | {"reason"}
 
     def test_next_card_keys(self, db, capsys):
         _seed(db)
         _, payload = _run_json(capsys, "next")
         assert set(payload) == {"verb", "count", "listings", "max_age_days",
-                                "hidden_stale"}
+                                "hidden_stale", "tiers"}
         assert set(payload["listings"][0]) == self.CARD_KEYS
 
     def test_show_card_keys(self, db, capsys):
@@ -1011,3 +1015,60 @@ class TestScriptShIsAWrapper:
 
     def test_forwards_arguments(self):
         assert '"$@"' in self._script()
+
+
+class TestHighSignalDefault:
+    """`auto_queued` is backend state: raw Stage 5 output with no research and
+    no large-model re-score. The CLI honors AUTOPILOT_POST_STAGE_5, the knob
+    that has always governed this for the Slack digest."""
+
+    def test_high_signal_hides_unenriched(self, db, capsys, monkeypatch):
+        monkeypatch.setenv("AUTOPILOT_POST_STAGE_5", "false")
+        _seed(db, title="Raw", company="R", status="auto_queued")
+        enriched = _seed(db, title="Enriched", company="E", status="auto")
+        _, payload = _run_json(capsys, "next")
+        assert [c["id"] for c in payload["listings"]] == [enriched]
+        assert payload["tiers"] == ["auto"]
+
+    def test_all_tiers_opts_back_in(self, db, capsys, monkeypatch):
+        monkeypatch.setenv("AUTOPILOT_POST_STAGE_5", "false")
+        _seed(db, title="Raw", company="R", status="auto_queued")
+        _seed(db, title="Enriched", company="E", status="auto")
+        _, payload = _run_json(capsys, "next", "--all-tiers")
+        assert payload["count"] == 2
+
+    def test_funnel_mode_shows_everything(self, db, capsys, monkeypatch):
+        monkeypatch.setenv("AUTOPILOT_POST_STAGE_5", "true")
+        _seed(db, title="Raw", company="R", status="auto_queued")
+        _seed(db, title="Enriched", company="E", status="auto")
+        assert _run_json(capsys, "next")[1]["count"] == 2
+
+
+class TestCardCarriesFullContract:
+    """The key user interface: every decision field on every card."""
+
+    def test_next_card_has_tldr_and_skills(self, db, capsys):
+        import json as _json
+        _seed(db, title="ML Eng", company="Acme",
+              job_summary="Build agentic AI systems for ops automation.",
+              matching_skills=_json.dumps(["Agentic AI", "Python", "Eval"]),
+              missing_skills=_json.dumps(["Finance domain"]))
+        _, payload = _run_json(capsys, "next")
+        card = payload["listings"][0]
+        assert card["tldr"].startswith("Build agentic AI")
+        assert card["skills_pct"] == 75 and card["skills_total"] == 4
+        assert "Agentic AI" in card["matching_skills"]
+        assert "Finance domain" in card["missing_skills"]
+
+    def test_human_render_shows_every_field(self, db, capsys):
+        import json as _json
+        job_id = _seed(db, title="ML Eng", company="Acme", confidence=85,
+                       location="Palo Alto, CA",
+                       job_summary="Architect agentic AI solutions.",
+                       matching_skills=_json.dumps(["Agentic AI"]),
+                       missing_skills=_json.dumps(["Finance"]))
+        db.set_distance_bucket(job_id, 1)
+        _, out = _run(capsys, "next")
+        for expected in ("YES:", "ML Eng", "Acme", "Palo Alto", "Local",
+                         "85%", "TL;DR", "Skills: 50%", "Agentic AI", "Finance"):
+            assert expected in out, f"card is missing {expected!r}"

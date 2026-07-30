@@ -26,6 +26,12 @@ CONFIDENCE_BAND_WIDTH = 5
 # so deep-diving one costs no tokens.
 REVIEW_STATUSES = ("auto", "auto_queued", "triaged")
 
+# High-signal subset: autopilot-enriched rows only. `auto_queued` holds raw
+# Stage 5 output that has had no Deep Research and no large-model re-score —
+# backend state, not review material. digest.py has gated on this since
+# AUTOPILOT_POST_STAGE_5 existed; the CLI review queue now does too.
+ENRICHED_STATUSES = ("auto",)
+
 # Milliseconds a writer waits on a locked DB before raising. WAL gives
 # concurrent readers, but writers still serialize; short-lived CLI processes
 # invoked back-to-back would otherwise fail with "database is locked".
@@ -837,6 +843,7 @@ class Database:
         min_confidence_pct: int = 0,
         session_window_minutes: int | None = None,
         max_age_days: int | None = None,
+        statuses: tuple[str, ...] = REVIEW_STATUSES,
     ) -> list[sqlite3.Row]:
         """Return the next page of listings awaiting a human decision.
 
@@ -890,7 +897,7 @@ class Database:
             age_clause = "AND date_ingested >= ? "
             params.append(age_cutoff)
 
-        placeholders = ", ".join("?" for _ in REVIEW_STATUSES)
+        placeholders = ", ".join("?" for _ in statuses)
         sql = (
             "SELECT *, CASE pipeline_status "
             "  WHEN 'auto' THEN 0 WHEN 'auto_queued' THEN 1 ELSE 2 "
@@ -907,7 +914,7 @@ class Database:
             "LIMIT ?"
         )
         # Status placeholders bind before min_confidence_pct in the SQL text.
-        params = [*REVIEW_STATUSES, *params, limit]
+        params = [*statuses, *params, limit]
         return self.conn.execute(sql, params).fetchall()
 
     def count_stale_reviewable(self, max_age_days: int) -> int:
