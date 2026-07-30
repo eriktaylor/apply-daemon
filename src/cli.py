@@ -334,11 +334,22 @@ def review_page(db: Database, *, top: int, max_age: int | None = None,
     )
     cards = [_card(r) for r in rows]
     db.mark_presented([r["id"] for r in rows])
+
+    awaiting = 0
+    if statuses == ENRICHED_STATUSES:
+        fresh = db.fresh_counts_by_status(max_age or 0)
+        awaiting = sum(n for st, n in fresh.items() if st not in ENRICHED_STATUSES)
+
     return {
         "count": len(cards),
         "listings": cards,
         "max_age_days": max_age,
-        "hidden_stale": db.count_stale_reviewable(max_age) if max_age else 0,
+        # Counted against the SAME tier filter as the view — an all-tier count
+        # here once blamed staleness for what was an enrichment shortfall.
+        "hidden_stale": (
+            db.count_stale_reviewable(max_age, statuses) if max_age else 0
+        ),
+        "awaiting_enrichment": awaiting,
         "tiers": list(statuses),
     }
 
@@ -346,6 +357,17 @@ def review_page(db: Database, *, top: int, max_age: int | None = None,
 def _fmt_page(page: dict) -> str:
     """Human rendering of a review page, with the stale-hidden footnote."""
     if not page["listings"]:
+        # Steer by the dominant cause, in order of usefulness: fresh listings
+        # awaiting enrichment beat stale ones, which beat a genuinely empty
+        # queue. The wrong steer here sent users to `--max-age 0` (stale rows)
+        # when 35 fresh un-enriched listings were the actual opportunity.
+        if page.get("awaiting_enrichment"):
+            return (
+                f"No enriched listings ready — {page['awaiting_enrichment']} fresh "
+                "listing(s) are awaiting autopilot enrichment.\n"
+                "Run a refresh to enrich the next batch, or "
+                "`next --all-tiers` to review them raw."
+            )
         if page["hidden_stale"]:
             return (
                 f"Nothing fresh to review — {page['hidden_stale']} listing(s) are "
@@ -438,12 +460,17 @@ def cmd_status(db: Database, as_json: bool) -> int:
     max_age = review_max_age_days()
     stale = db.count_stale_reviewable(max_age) if max_age else 0
     fresh = max(0, stats["reviewable"] - stale)
+    fresh_by = db.fresh_counts_by_status(max_age) if max_age else {}
+    ready = sum(n for st, n in fresh_by.items() if st in ENRICHED_STATUSES)
+    awaiting = fresh - ready if max_age else 0
 
     payload = {
         "verb": "status",
         "queue": {
             "reviewable": stats["reviewable"],
             "fresh": fresh,
+            "ready": ready,
+            "awaiting_enrichment": awaiting,
             "stale_hidden": stale,
             "max_age_days": max_age,
             "by_tier": stats["by_status"],
@@ -471,11 +498,9 @@ def cmd_status(db: Database, as_json: bool) -> int:
         },
     }
 
-    tiers = stats["by_status"]
     lines = [
-        f"Queue:   {fresh} fresh of {stats['reviewable']} awaiting review"
-        f"  (auto {tiers.get('auto', 0)} · queued {tiers.get('auto_queued', 0)}"
-        f" · triaged {tiers.get('triaged', 0)})",
+        f"Queue:   {ready} ready to review  ·  {awaiting} fresh awaiting "
+        f"enrichment  ·  {stale} stale  ({stats['reviewable']} total)",
         f"Ingest:  {_fmt_age(ingest_age)}"
         f"   ·   last decision {_fmt_age(_age_hours(stats['last_decision']))}",
     ]
@@ -490,9 +515,15 @@ def cmd_status(db: Database, as_json: bool) -> int:
     lines.append(("Run:     ✅ allowed — " if decision.allowed
                   else "Run:     ⛔ blocked — ") + decision.reason)
 
-    # The hint keys off FRESH work, not total: 400 stale rows should not
-    # stop status from saying a refresh is the right move.
-    if fresh == 0:
+    # The hint keys off READY work: stale rows must not stop status from
+    # recommending a refresh, and a fresh-but-unenriched backlog should steer
+    # to enrichment rather than to `--max-age 0`.
+    if ready == 0 and awaiting > 0:
+        lines.append(
+            f"\nNothing enriched yet — a refresh would enrich the top of the "
+            f"{awaiting} fresh listing(s) waiting."
+        )
+    elif ready == 0:
         tail = f" ({stale} stale hidden)" if stale else ""
         lines.append(
             f"\nNothing fresh to review{tail} — a refresh would give you new listings."

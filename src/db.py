@@ -917,26 +917,58 @@ class Database:
         params = [*statuses, *params, limit]
         return self.conn.execute(sql, params).fetchall()
 
-    def count_stale_reviewable(self, max_age_days: int) -> int:
+    def count_stale_reviewable(
+        self, max_age_days: int, statuses: tuple[str, ...] = REVIEW_STATUSES,
+    ) -> int:
         """Reviewable listings excluded by a ``max_age_days`` bound.
 
         Lets the caller say "12 hidden as stale" instead of showing an empty
         page — an empty queue with no explanation reads as a broken tool.
+        ``statuses`` must match the queue view being described: counting all
+        tiers while showing one blamed staleness for what was actually an
+        enrichment shortfall.
         """
         if max_age_days <= 0:
             return 0
         cutoff = (
             datetime.now(timezone.utc) - timedelta(days=max_age_days)
         ).isoformat()
-        placeholders = ", ".join("?" for _ in REVIEW_STATUSES)
+        placeholders = ", ".join("?" for _ in statuses)
         row = self.conn.execute(
             "SELECT COUNT(*) n FROM listings "
             f"WHERE pipeline_status IN ({placeholders}) "
             "AND verdict IN ('YES', 'MAYBE') "
             "AND date_ingested < ?",
-            [*REVIEW_STATUSES, cutoff],
+            [*statuses, cutoff],
         ).fetchone()
         return row["n"]
+
+    def fresh_counts_by_status(self, max_age_days: int) -> dict[str, int]:
+        """Fresh (inside the age bound) reviewable listings, per status.
+
+        The split `status` and the empty review page both need: how much is
+        actually ready (`auto`) versus awaiting enrichment (`auto_queued`,
+        `triaged`). One number lumping them promises listings the high-signal
+        view will never show.
+        """
+        params: list = list(REVIEW_STATUSES)
+        age_clause = ""
+        if max_age_days > 0:
+            cutoff = (
+                datetime.now(timezone.utc) - timedelta(days=max_age_days)
+            ).isoformat()
+            age_clause = "AND date_ingested >= ? "
+            params.append(cutoff)
+        placeholders = ", ".join("?" for _ in REVIEW_STATUSES)
+        rows = self.conn.execute(
+            "SELECT pipeline_status, COUNT(*) n FROM listings "
+            f"WHERE pipeline_status IN ({placeholders}) "
+            "AND verdict IN ('YES', 'MAYBE') "
+            f"{age_clause}"
+            "GROUP BY pipeline_status",
+            params,
+        ).fetchall()
+        return {r["pipeline_status"]: r["n"] for r in rows}
 
     def get_queue_stats(self) -> dict:
         """Snapshot for the CLI `status` verb (C-1).

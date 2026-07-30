@@ -129,7 +129,7 @@ class TestJsonContract:
         _seed(db)
         _, payload = _run_json(capsys, "next")
         assert set(payload) == {"verb", "count", "listings", "max_age_days",
-                                "hidden_stale", "tiers"}
+                                "hidden_stale", "awaiting_enrichment", "tiers"}
         assert set(payload["listings"][0]) == self.CARD_KEYS
 
     def test_show_card_keys(self, db, capsys):
@@ -686,9 +686,9 @@ class TestStatusVerb:
         _, payload = _run_json(capsys, "status")
         assert set(payload) == {"verb", "queue", "budget"}
         assert set(payload["queue"]) == {
-            "reviewable", "fresh", "stale_hidden", "max_age_days", "by_tier",
-            "total_listings", "last_ingest", "last_ingest_age_hours",
-            "last_decision",
+            "reviewable", "fresh", "ready", "awaiting_enrichment",
+            "stale_hidden", "max_age_days", "by_tier", "total_listings",
+            "last_ingest", "last_ingest_age_hours", "last_decision",
         }
         assert set(payload["budget"]) == {
             "can_run", "reason", "spent_usd_today", "spent_tokens_today",
@@ -1097,3 +1097,61 @@ class TestCardCarriesFullContract:
         for expected in ("YES:", "ML Eng", "Acme", "Palo Alto", "Local",
                          "85%", "TL;DR", "Skills: 50%", "Agentic AI", "Finance"):
             assert expected in out, f"card is missing {expected!r}"
+
+
+class TestSurfacesTellOneStory:
+    """status's numbers and next's behavior must agree — 'status says 43
+    fresh, next shows 8 then a wall' was the audited failure."""
+
+    @pytest.fixture(autouse=True)
+    def _high_signal(self, monkeypatch, tmp_path):
+        monkeypatch.setenv("AUTOPILOT_POST_STAGE_5", "false")
+        monkeypatch.setenv("RUN_LOG_PATH", str(tmp_path / "rl"))
+        monkeypatch.setenv("MODEL_USAGE_LOG_PATH", str(tmp_path / "ml"))
+
+    def _mixed_queue(self, db):
+        enriched = _seed(db, title="Ready", company="R", status="auto")
+        for i in range(3):
+            _seed(db, title=f"Raw {i}", company=f"C{i}", status="auto_queued")
+        return enriched
+
+    def test_status_splits_ready_from_awaiting(self, db, capsys):
+        self._mixed_queue(db)
+        _, payload = _run_json(capsys, "status")
+        q = payload["queue"]
+        assert q["ready"] == 1
+        assert q["awaiting_enrichment"] == 3
+        assert q["fresh"] == 4
+
+    def test_status_human_line_shows_the_split(self, db, capsys):
+        self._mixed_queue(db)
+        _, out = _run(capsys, "status")
+        assert "1 ready" in out and "3 fresh awaiting enrichment" in out
+
+    def test_status_steers_to_enrichment_not_max_age(self, db, capsys):
+        for i in range(3):
+            _seed(db, title=f"Raw {i}", company=f"C{i}", status="auto_queued")
+        _, out = _run(capsys, "status")
+        assert "enrich" in out.lower()
+
+    def test_empty_page_names_the_enrichment_backlog(self, db, capsys):
+        for i in range(3):
+            _seed(db, title=f"Raw {i}", company=f"C{i}", status="auto_queued")
+        _, payload = _run_json(capsys, "next")
+        assert payload["count"] == 0
+        assert payload["awaiting_enrichment"] == 3
+        _, out = _run(capsys, "next")
+        assert "awaiting autopilot enrichment" in out
+        assert "--all-tiers" in out
+
+    def test_hidden_stale_counts_only_the_shown_tiers(self, db, capsys):
+        """A stale RAW row must not inflate the stale count of the enriched
+        view — that mislabels an enrichment shortfall as staleness."""
+        from datetime import datetime, timedelta, timezone
+        raw = _seed(db, title="Old Raw", company="OR", status="auto_queued")
+        when = (datetime.now(timezone.utc) - timedelta(days=45)).isoformat()
+        db.conn.execute("UPDATE listings SET date_ingested=? WHERE id=?",
+                        (when, raw))
+        db.conn.commit()
+        _, payload = _run_json(capsys, "next")
+        assert payload["hidden_stale"] == 0
