@@ -32,8 +32,8 @@ def test_writes_pipe_delimited_record(tmp_path, monkeypatch):
 
     contents = log_path.read_text(encoding="utf-8").strip()
     fields = contents.split("|")
-    # timestamp|stage|model|tokens
-    assert len(fields) == 4
+    # timestamp|stage|model|total|prompt|completion
+    assert len(fields) == 6
     assert fields[1] == "stage1"
     assert fields[2] == "openai/gpt-5.4-nano"
     assert fields[3] == "1234"

@@ -181,9 +181,12 @@ class TestUnpricedSpend:
 
 class TestProjection:
     def test_blocks_when_estimate_would_exceed(self, monkeypatch, _isolate):
+        # Rate-independent: any non-zero spend plus a 0.99 estimate breaches a
+        # 1.00 ceiling. Pinning it to a specific token cost made this fail when
+        # the output-fraction assumption was corrected.
         monkeypatch.setenv("DAILY_USD_BUDGET", "1.00")
-        monkeypatch.setenv("RUN_USD_ESTIMATE", "0.90")
-        _usage(_isolate, tokens=300_000)  # ~$0.19
+        monkeypatch.setenv("RUN_USD_ESTIMATE", "0.99")
+        _usage(_isolate, tokens=300_000)
         decision = check_run_allowed()
         assert decision.allowed is False
         assert "Projected over budget" in decision.reason

@@ -2,6 +2,8 @@
 
 from __future__ import annotations
 
+import pytest
+
 from eval.model_pricing import (
     PRICING,
     ModelPrice,
@@ -12,14 +14,38 @@ from eval.model_pricing import (
 
 
 def test_blended_rate_between_input_and_output():
+    """Blend uses the module's measured output fraction, not a hardcoded one."""
+    from eval.model_pricing import _ASSUMED_OUTPUT_FRACTION
     price = ModelPrice(input_per_1m=1.0, output_per_1m=11.0)
-    # 0.7*1 + 0.3*11 = 4.0 with the module's assumed output fraction (0.3)
     model = "test/only"
     PRICING[model] = price
     try:
-        assert blended_per_1m(model) == 4.0
+        f = _ASSUMED_OUTPUT_FRACTION
+        assert blended_per_1m(model) == pytest.approx(1.0 * (1 - f) + 11.0 * f)
+        # Always strictly between the two rates, whatever the fraction.
+        assert 1.0 < blended_per_1m(model) < 11.0
     finally:
         del PRICING[model]
+
+
+def test_exact_pricing_beats_the_blend_for_input_heavy_calls():
+    """The reason cost_for_usage exists: this workload is ~96% input, and the
+    blend overstated a real run by 2.2x."""
+    from eval.model_pricing import cost_for_tokens, cost_for_usage
+    model = "test/only"
+    PRICING[model] = ModelPrice(input_per_1m=1.0, output_per_1m=11.0)
+    try:
+        exact = cost_for_usage(model, 96_000, 4_000)
+        blended = cost_for_tokens(model, 100_000)
+        assert exact == pytest.approx(96_000 / 1e6 * 1.0 + 4_000 / 1e6 * 11.0)
+        assert exact < blended  # blend still errs high — safe for a ceiling
+    finally:
+        del PRICING[model]
+
+
+def test_unknown_slug_is_none_not_free():
+    from eval.model_pricing import cost_for_usage
+    assert cost_for_usage("who/knows", 1000, 100) is None
 
 
 def test_unknown_slug_returns_none():

@@ -62,7 +62,7 @@ OWNERSHIP: list[tuple[str, str, str]] = [
     (
         "usage-log line parsing (timestamp|stage|model|tokens)",
         "model_usage.py",
-        r"len\(parts\)\s*!=\s*4",
+        r"len\(parts\) not in \(4, 6\)",
     ),
     (
         "review-card field assembly",

@@ -196,7 +196,7 @@ def _parse_usage_log(path: Path | None = None) -> dict[tuple[str, str], dict]:
     from src.model_usage import iter_usage
 
     agg: dict[tuple[str, str], dict] = {}
-    for _day, stage, model, tokens in iter_usage(path):
+    for _day, stage, model, tokens, _p, _c in iter_usage(path):
         entry = agg.setdefault((model, stage), {"calls": 0, "tokens": 0})
         entry["calls"] += 1
         entry["tokens"] += tokens
@@ -271,6 +271,7 @@ def spend_report(days: int | None = None) -> None:
             LAST_UPDATED,
             PRICING_VERIFIED,
             cost_for_tokens,
+            cost_for_usage,
         )
     except ImportError:
         print("\n  Pricing table unavailable — cannot cost the usage log.\n")
@@ -284,10 +285,11 @@ def spend_report(days: int | None = None) -> None:
     by_stage: dict[str, dict] = {}
     unpriced: set[str] = set()
 
-    for day, stage, model, tokens in iter_usage():
+    for day, stage, model, tokens, prompt, completion in iter_usage():
         if cutoff and day < cutoff:
             continue
-        usd = cost_for_tokens(model, tokens)
+        usd = (cost_for_usage(model, prompt, completion)
+               if (prompt or completion) else cost_for_tokens(model, tokens))
         if usd is None:
             unpriced.add(model)
         for bucket, key in ((by_day, day), (by_stage, stage)):
