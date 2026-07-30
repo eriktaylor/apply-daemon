@@ -30,7 +30,7 @@ from __future__ import annotations
 
 from dataclasses import dataclass
 
-LAST_UPDATED = "2026-07-29"
+LAST_UPDATED = "2026-07-30"
 # All five rows verified against openrouter.ai on LAST_UPDATED.
 PRICING_VERIFIED = True
 
@@ -53,6 +53,7 @@ class ModelPrice:
 PRICING: dict[str, ModelPrice] = {
     "openai/gpt-5.4-nano": ModelPrice(input_per_1m=0.20, output_per_1m=1.25),
     "google/gemini-3.1-flash-lite": ModelPrice(input_per_1m=0.25, output_per_1m=1.50),
+    "google/gemini-3.5-flash-lite": ModelPrice(input_per_1m=0.30, output_per_1m=2.50),
     "openai/gpt-4o-mini": ModelPrice(input_per_1m=0.15, output_per_1m=0.60),
     "anthropic/claude-sonnet-4.6": ModelPrice(input_per_1m=3.00, output_per_1m=15.00),
     "deepseek/deepseek-v4-flash": ModelPrice(input_per_1m=0.09, output_per_1m=0.18),
