@@ -341,6 +341,11 @@ def listwise_batch_size() -> int:
         return 0
 
 
+def anchor_enabled() -> bool:
+    """Whether each listwise batch carries a calibration anchor (M-5)."""
+    return os.getenv("STAGE5_ANCHOR", "true").strip().lower() in ("1", "true", "yes")
+
+
 def get_confidence_threshold() -> float:
     """Read CONFIDENCE_THRESHOLD from env, clamped to [0.0, 1.0].
 
@@ -1230,6 +1235,70 @@ class TriageSession:
         the pipeline."""
         return f"{(anchor.title or '').strip().lower()}|{(anchor.company or '').strip().lower()}"
 
+    def _select_anchor(self) -> tuple["ExtractedListing", str, str] | None:
+        """Pick a calibration anchor: (listing, description, expected_verdict).
+
+        Sourced from ``data/human_labels.jsonl`` — a listing the user actually
+        saved or passed. That is the only verdict in the system not produced
+        by a model: autopilot's post-research verdicts are contaminated
+        (``process_queue._AUTO_PROMPT`` feeds the scorer the incumbent's own
+        reasoning), so anchoring on them would measure agreement with a
+        model rather than with the user.
+
+        Prefers a recent decision, since the market moves. Returns None when
+        no usable label exists, in which case batching proceeds unanchored.
+        """
+        from src.db import Database
+        from src.human_labels import resolve_labels_path
+
+        path = resolve_labels_path()
+        if not path.exists():
+            return None
+
+        POSITIVE = {"save", "tailor", "applied", "interview"}
+        NEGATIVE = {"pass", "rejected"}
+        decisions: list[tuple[str, str]] = []
+        try:
+            for line in path.read_text(encoding="utf-8").splitlines():
+                if not line.strip():
+                    continue
+                try:
+                    rec = json.loads(line)
+                except json.JSONDecodeError:
+                    continue
+                action = str(rec.get("human_reaction", "")).lower()
+                job_id = rec.get("job_id")
+                if not job_id:
+                    continue
+                if action in POSITIVE:
+                    decisions.append((str(job_id), "YES"))
+                elif action in NEGATIVE:
+                    decisions.append((str(job_id), "NO"))
+        except OSError:
+            return None
+        if not decisions:
+            return None
+
+        try:
+            with Database() as db:
+                for job_id, expected in reversed(decisions):   # most recent first
+                    row = db.get_listing_by_id(job_id)
+                    if row is None or not (row["job_summary"] or ""):
+                        continue
+                    return (
+                        ExtractedListing(
+                            title=row["title"], company=row["company"],
+                            location=row["location"] or "",
+                            salary=row["salary"] or "",
+                        ),
+                        row["job_summary"],
+                        expected,
+                    )
+        except Exception:
+            logger.debug("Anchor selection failed; batching unanchored",
+                         exc_info=True)
+        return None
+
     def prescore_batch(self, items: list[tuple["ExtractedListing", str]]) -> int:
         """Score many listings in one call, caching results for later lookup.
 
@@ -1245,15 +1314,32 @@ class TriageSession:
         if size < 2 or not items:
             return 0
 
+        anchor = self._select_anchor() if anchor_enabled() else None
+        if anchor is not None:
+            logger.debug("Listwise anchor: '%s at %s' (expected %s)",
+                         anchor[0].title, anchor[0].company, anchor[2])
+
         scored = 0
+        batches = 0
+        incomplete = 0
+        rejected = 0
+        anchor_confidences: list[int] = []
         for start in range(0, len(items), size):
             chunk = items[start:start + size]
+            batches += 1
+            before = scored
+            # The anchor rides in every batch, formatted identically to the
+            # real listings so the model cannot treat it specially. It costs
+            # one slot (~10% at batch 10) and buys a per-batch calibration
+            # check: confidence is meaningful *within* a batch, and without a
+            # fixed reference nothing detects drift across batches.
+            scoring = list(chunk) + ([(anchor[0], anchor[1])] if anchor else [])
             block = "\n".join(
                 f"### id: {self._batch_key(a)}\n"
                 f"Title: {a.title}\nCompany: {a.company}\n"
                 f"Location: {a.location}\nSalary: {a.salary}\n"
                 f"Description: {(desc or '')[:2000]}\n"
-                for a, desc in chunk
+                for a, desc in scoring
             )
             prompt = _LISTWISE_EVAL_PROMPT.format(
                 profile_llm_context=self.profile_llm_context,
@@ -1262,7 +1348,7 @@ class TriageSession:
             try:
                 resp = _call_openrouter(
                     self._client, self.model, prompt,
-                    max_tokens=min(400 * len(chunk) + 500, 8192),
+                    max_tokens=min(400 * len(scoring) + 500, 8192),
                     temperature=0.0, json_mode=True, stage="stage5_listwise",
                 )
                 text = (resp["text"] or "").strip()
@@ -1276,9 +1362,41 @@ class TriageSession:
                 )
                 continue
 
-            for item in (data.get("listings") or []):
-                if not isinstance(item, dict) or not item.get("id"):
-                    continue
+            parsed = {
+                str(i["id"]).strip().lower(): i
+                for i in (data.get("listings") or [])
+                if isinstance(i, dict) and i.get("id")
+            }
+
+            # M-5: the anchor is a listing whose correct verdict is known from
+            # the user's own save/pass decisions — the one signal that is not
+            # model-derived. If the batch misjudges it, the batch's whole
+            # calibration is suspect, so its scores are discarded and every
+            # listing in it takes the pointwise path.
+            if anchor is not None:
+                akey = self._batch_key(anchor[0])
+                got = parsed.pop(akey, None)
+                if got is None:
+                    logger.warning("Listwise batch %d omitted the anchor — "
+                                   "calibration unverified, accepting anyway",
+                                   batches)
+                else:
+                    averdict = str(got.get("verdict", "")).upper()
+                    try:
+                        anchor_confidences.append(int(got.get("confidence", 0) or 0))
+                    except (TypeError, ValueError):
+                        pass
+                    if averdict != anchor[2]:
+                        rejected += 1
+                        logger.warning(
+                            "Listwise batch %d REJECTED — anchor '%s' scored %s, "
+                            "expected %s. %d listing(s) fall back to pointwise.",
+                            batches, anchor[0].title[:40], averdict or "?",
+                            anchor[2], len(chunk),
+                        )
+                        continue
+
+            for item in parsed.values():
                 key = str(item["id"]).strip().lower()
                 try:
                     self._listwise_scores[key] = {
@@ -1296,7 +1414,38 @@ class TriageSession:
                 except (TypeError, ValueError):
                     continue
 
-        logger.info("Listwise pre-scored %d/%d listings", scored, len(items))
+            # Coverage is the metric the economics rest on. Omission is
+            # stochastic (identical inputs at temperature=0 have returned
+            # 24/24 and 14/24), so it has to be observable per batch rather
+            # than inferred from a total — a bad stretch should be visible,
+            # not silently eroding the saving.
+            got = scored - before
+            if got < len(chunk):
+                incomplete += 1
+                logger.warning(
+                    "Listwise batch %d returned %d/%d listings — %d fall back "
+                    "to pointwise", batches, got, len(chunk), len(chunk) - got,
+                )
+
+        if anchor_confidences and len(anchor_confidences) > 1:
+            spread = max(anchor_confidences) - min(anchor_confidences)
+            log_fn2 = logger.warning if spread >= 15 else logger.info
+            log_fn2(
+                "Anchor confidence across %d batches: %s (spread %d) — this is "
+                "cross-batch drift, measured directly",
+                len(anchor_confidences), anchor_confidences, spread,
+            )
+        if rejected:
+            logger.warning("%d batch(es) rejected on anchor mismatch", rejected)
+
+        missed = len(items) - scored
+        log_fn = logger.warning if missed else logger.info
+        log_fn(
+            "Listwise coverage: %d/%d listings (%.0f%%) in %d batch(es); "
+            "%d incomplete, %d fall back to pointwise",
+            scored, len(items), scored / len(items) * 100 if items else 0.0,
+            batches, incomplete, missed,
+        )
         return scored
 
     def _run_eval_prompt(
