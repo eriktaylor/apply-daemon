@@ -15,11 +15,15 @@ effective cost substantially on the OpenAI and Gemini slugs. Costing at list
 therefore *over*-estimates — the safe direction for a spend ceiling.
 
 Prices are USD per 1,000,000 tokens, split into input (prompt) and output
-(completion). The eval harness only records *total* tokens per listing, so
-``blended_per_1m`` collapses the two using ``_ASSUMED_OUTPUT_FRACTION`` — a
-deliberate approximation, documented here rather than hidden. If per-
-direction accuracy is ever needed, log prompt/completion separately in O-1
-and price them independently.
+(completion). Prefer ``cost_for_usage`` — it prices each direction exactly.
+
+``blended_per_1m`` / ``cost_for_tokens`` remain for callers that only have a
+total: the eval harness, and usage-log lines written before O-1 recorded the
+split. Their ``_ASSUMED_OUTPUT_FRACTION`` was measured against a real run and
+found badly wrong — the true output share is ~4% for Stage 5, not 30%, so the
+blend overstated that run's cost by 2.2x. It is now set from that
+measurement, but it remains an approximation: any path with per-direction
+counts should use ``cost_for_usage`` instead.
 """
 
 from __future__ import annotations
@@ -30,9 +34,11 @@ LAST_UPDATED = "2026-07-29"
 # All five rows verified against openrouter.ai on LAST_UPDATED.
 PRICING_VERIFIED = True
 
-# Assumed share of total tokens that are output/completion, used to blend the
-# input and output rates into a single per-1M figure for total-token costing.
-_ASSUMED_OUTPUT_FRACTION = 0.3
+# Share of total tokens that are output/completion, for total-only callers.
+# Measured 2026-07-30 against a real 162-call run reconciled to the OpenRouter
+# invoice: Stage 5 ~3.7%, Sonnet enrichment ~10%. 0.05 is a middle value that
+# errs slightly high (safe for a ceiling). Fallback only — see cost_for_usage.
+_ASSUMED_OUTPUT_FRACTION = 0.05
 
 
 @dataclass(frozen=True)
@@ -65,6 +71,23 @@ def blended_per_1m(model: str) -> float | None:
     return (
         price.input_per_1m * (1 - _ASSUMED_OUTPUT_FRACTION)
         + price.output_per_1m * _ASSUMED_OUTPUT_FRACTION
+    )
+
+
+def cost_for_usage(model: str, prompt_tokens: float,
+                   completion_tokens: float) -> float | None:
+    """Exact USD for a call, priced per direction. None for unknown slugs.
+
+    Preferred over ``cost_for_tokens``: input and output rates differ 5-6x,
+    and this workload is ~96% input. The blended approximation overstated a
+    real run by 2.2x, so anything with per-direction counts should use this.
+    """
+    price = PRICING.get(model)
+    if price is None:
+        return None
+    return (
+        prompt_tokens / 1_000_000 * price.input_per_1m
+        + completion_tokens / 1_000_000 * price.output_per_1m
     )
 
 

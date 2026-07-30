@@ -41,6 +41,7 @@ import os
 import sqlite3
 import subprocess
 import sys
+import time
 from datetime import datetime, timezone
 from pathlib import Path
 
@@ -587,19 +588,40 @@ def cmd_refresh(db: Database, *, top_n: int | None, force: bool,
     # not only a success, or a crashing run could be retried without limit.
     record_run("cli")
 
+    # Progress goes to stderr so it never pollutes --json on stdout, and so a
+    # human watching a 10-minute scrape can tell the difference between "slow"
+    # and "hung". Stage output streams through in human mode: capturing it
+    # (as this did originally) turned `./script.sh` into a silent wait, which
+    # is worse than the noisy chain it replaced.
+    stream = not as_json
+
+    def _progress(text: str) -> None:
+        print(text, file=sys.stderr, flush=True)
+
+    _progress(f"Running {len(stages)} stages — {' → '.join(n for n, _ in stages)}\n")
+
     results = []
     failed = None
-    for name, module in stages:
+    for i, (name, module) in enumerate(stages, 1):
+        _progress(f"[{i}/{len(stages)}] {name} ({module}) …")
+        started = time.monotonic()
         proc = subprocess.run(
             [sys.executable, "-m", module],
-            env=env, capture_output=True, text=True,
+            env=env,
+            capture_output=not stream,
+            text=True,
         )
+        elapsed = time.monotonic() - started
         results.append({"stage": name, "module": module,
-                        "returncode": proc.returncode})
+                        "returncode": proc.returncode,
+                        "seconds": round(elapsed, 1)})
+        mark = "ok" if proc.returncode == 0 else f"FAILED rc={proc.returncode}"
+        _progress(f"[{i}/{len(stages)}] {name} — {mark} in {elapsed:.0f}s\n")
         if proc.returncode != 0:
             failed = name
-            logger.error("Stage %s failed (rc=%d): %s", name, proc.returncode,
-                         (proc.stderr or "")[-400:])
+            if not stream and proc.stderr:
+                _progress(proc.stderr[-800:])
+            logger.error("Stage %s failed (rc=%d)", name, proc.returncode)
             break
 
     after = check_run_allowed()

@@ -78,26 +78,30 @@ def _get_logger() -> logging.Logger | None:
     return logger
 
 
-def iter_usage(path: Path | None = None) -> Iterator[tuple[str, str, str, int]]:
-    """Yield ``(day, stage, model, tokens)`` from the usage log.
+def iter_usage(
+    path: Path | None = None,
+) -> Iterator[tuple[str, str, str, int, int, int]]:
+    """Yield ``(day, stage, model, total, prompt, completion)`` from the log.
 
-    ``day`` is the ISO date prefix of the timestamp. Malformed lines are
-    skipped rather than raised on: the log is append-only telemetry written
-    by many processes, and a torn line must never break a report.
+    Accepts both schemas: four fields (pre-split, prompt/completion reported
+    as 0) and six. ``day`` is the ISO date prefix. Malformed lines are skipped
+    rather than raised on — the log is append-only telemetry written by many
+    processes, and a torn line must never break a report.
     """
     target = path or _log_path()
     if not target.exists():
         return
     for line in target.read_text(encoding="utf-8", errors="replace").splitlines():
         parts = line.strip().split("|")
-        if len(parts) != 4:
+        if len(parts) not in (4, 6):
             continue
-        ts, stage, model, tokens = parts
         try:
-            tok = int(tokens)
+            total = int(parts[3])
+            prompt = int(parts[4]) if len(parts) == 6 else 0
+            completion = int(parts[5]) if len(parts) == 6 else 0
         except ValueError:
             continue
-        yield ts[:10], stage, model, tok
+        yield parts[0][:10], parts[1], parts[2], total, prompt, completion
 
 
 def spend_today(path: Path | None = None) -> tuple[int, float | None]:
@@ -115,15 +119,45 @@ def spend_today(path: Path | None = None) -> tuple[int, float | None]:
     except ImportError:
         cost_for_tokens = None
 
-    for day, _stage, model, tok in iter_usage(path):
+    try:
+        from eval.model_pricing import cost_for_usage
+    except ImportError:
+        cost_for_usage = None
+
+    for day, _stage, model, tok, prompt, completion in iter_usage(path):
         if day != today:
             continue
         tokens += tok
-        if cost_for_tokens is not None:
+        priced = None
+        if cost_for_usage is not None and (prompt or completion):
+            priced = cost_for_usage(model, prompt, completion)
+        elif cost_for_tokens is not None:
             priced = cost_for_tokens(model, tok)
-            if priced is not None:
-                usd = (usd or 0.0) + priced
+        if priced is not None:
+            usd = (usd or 0.0) + priced
     return tokens, usd
+
+
+def _usage_split(resp: object) -> tuple[int, int, int]:
+    """Extract ``(total, prompt, completion)`` tokens from an SDK response.
+
+    Direction matters for pricing: input and output rates differ by 5-6x, and
+    this workload is overwhelmingly input (a large profile + resume preamble
+    against a small JSON reply). Blending them with a fixed ratio overstated
+    real spend by ~2.2x — see eval/model_pricing.
+    """
+    total = prompt = completion = 0
+    try:
+        usage = getattr(resp, "usage", None)
+        if usage is not None:
+            total = int(getattr(usage, "total_tokens", 0) or 0)
+            prompt = int(getattr(usage, "prompt_tokens", 0) or 0)
+            completion = int(getattr(usage, "completion_tokens", 0) or 0)
+    except (TypeError, ValueError):
+        return 0, 0, 0
+    if not total:
+        total = prompt + completion
+    return total, prompt, completion
 
 
 def log_response_usage(resp: object, model: str, stage: str) -> int:
@@ -137,18 +171,13 @@ def log_response_usage(resp: object, model: str, stage: str) -> int:
     Returns the token count logged (0 when unavailable), so callers that
     already track tokens can keep doing so without a second read.
     """
-    tokens = 0
-    try:
-        usage = getattr(resp, "usage", None)
-        if usage is not None:
-            tokens = int(getattr(usage, "total_tokens", 0) or 0)
-    except (TypeError, ValueError):
-        tokens = 0
-    log_model_usage(model, stage, tokens)
-    return tokens
+    total, prompt, completion = _usage_split(resp)
+    log_model_usage(model, stage, total, prompt=prompt, completion=completion)
+    return total
 
 
-def log_model_usage(model: str, stage: str, tokens: int) -> None:
+def log_model_usage(model: str, stage: str, tokens: int, *,
+                    prompt: int = 0, completion: int = 0) -> None:
     """Append one pipe-delimited usage record. Never raises."""
     if not _enabled():
         return
@@ -157,6 +186,12 @@ def log_model_usage(model: str, stage: str, tokens: int) -> None:
         return
     try:
         ts = datetime.now(timezone.utc).isoformat()
-        logger.info("%s|%s|%s|%d", ts, stage, model, int(tokens or 0))
+        # Schema: timestamp|stage|model|total|prompt|completion
+        # Lines written before the split have four fields; iter_usage reads
+        # both, so old logs stay priceable at the blended rate.
+        logger.info(
+            "%s|%s|%s|%d|%d|%d", ts, stage, model,
+            int(tokens or 0), int(prompt or 0), int(completion or 0),
+        )
     except Exception:  # noqa: BLE001 — telemetry must never break a call
         return
