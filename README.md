@@ -15,7 +15,14 @@ Two tracks feed it; three ways to drive it:
 | `python -m src.cli` | Review and decide. A bundled Claude Code skill drives it conversationally; resume tailoring runs in-session at zero API cost. |
 | Slack | Ambient: daily digest cards, triageable from your phone with four reactions. Optional. |
 
-**Tech stack:** Python · OpenRouter · Claude Code · Slack · JobSpy · Gmail · IPRoyal
+**Core:** Python · Claude Code · JobSpy · an [OpenRouter](https://openrouter.ai) key.
+**Each additional key unlocks a track** — none are required:
+
+| Add | Unlocks |
+|---|---|
+| Gmail app password | Track B — email alerts, board digests, Google Alerts |
+| Slack bot token | Ambient digest cards + phone triage via reactions |
+| IPRoyal credentials | Heavy scraping without IP bans |
 
 ## Setup checklist
 
@@ -356,6 +363,8 @@ Test extraction + matching accuracy on labeled emails:
 python -m eval.eval --input eval/eval_example.csv --model google/gemini-3.1-flash-lite
 ```
 
+Full guide (datasets, per-stage model overrides, the listwise-vs-pointwise comparison harness): [`docs/EVAL_GUIDE.md`](docs/EVAL_GUIDE.md).
+
 ## Security
 
 See [`SECURITY.md`](SECURITY.md) for the full security policy, threat
@@ -374,6 +383,13 @@ Quick summary:
 Shipped features are catalogued in [`CHANGELOG.md`](CHANGELOG.md).
 
 ### Up Next
+
+- [ ] **Lite mode — drop in your resume, and Claude does the rest.** No API
+  keys at all: scoring runs in your Claude Code session (subscription-billed)
+  instead of OpenRouter. Honest trade, measured: in-session scoring agrees
+  with the reference standard 64–71% vs 78–88% for the OpenRouter path — lite
+  is for zero setup cost, full mode is for best results. Gated on in-session
+  Stage 5 landing.
 
 - [ ] **The Command Center GUI (Next.js)** — A lightweight local web dashboard that connects to the SQLite DB to visualize the full application funnel (ingested → triaged → saved → tailored → applied). Provides an interface to review and curate the `human_labels.jsonl` dataset for future model fine-tuning. Triage stays in chat/Slack; management and analytics move to this GUI.
 - [ ] **The Dynamic RAG "Brag Document"** — Shift from editing a single `base_resume.docx` to dynamic assembly. A massive `master_brag_document.md` stores every bullet, project, and achievement. The pipeline semantically searches this document against the job description, pulling only the top most relevant bullets for the LLM. Eliminates hallucinations and produces hyper-targeted resumes.
