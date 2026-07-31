@@ -35,7 +35,7 @@ python -m src.geo_backfill      # One-time distance_bucket backfill (--dry-run f
 
 ## Architecture
 
-Two ingestion tracks converge on a shared LLM scoring stage and a single SQLite store (`apply_daemon.db`), which then fans back out to two review surfaces. All LLM calls route through **OpenRouter**, except in-session tailoring.
+Two ingestion tracks converge on a shared LLM scoring stage and a single SQLite store (`apply_daemon.db`), which then fans back out to two review surfaces. All metered LLM calls route through **OpenRouter**; in-session (subscription-billed) work is the exception and is exempt from the spend ceiling but visible in `status`.
 
 **The pipeline diagrams live in [README.md](README.md#how-it-works)** — "Ingestion & scoring" and "Review & apply". They are not repeated here; see the anti-drift principle below. What follows is the agent-facing map: which module owns what.
 
@@ -44,6 +44,10 @@ Load-bearing behaviors a change can easily break:
 - **Dedup runs *before* Stage 5** — already-known listings are skipped without spending tokens. The Smart Upsert afterwards handles races between tracks.
 - **Three independent OpenRouter model slots** (`OPENROUTER_STAGE1_MODEL`, `OPENROUTER_MODEL` for Stage 5, `OPENROUTER_TAILOR_MODEL`, plus optional `OPENROUTER_TREND_MODEL`) let cost/quality be tuned per stage. See [docs/MODELS.md](docs/MODELS.md).
 - **Autopilot** (`process_queue.py`) is a no-op unless `AUTOPILOT_ENABLED=true`. It pre-caches Deep Research so a CLI deep-dive costs nothing.
+- **Stage 5 may batch** (`STAGE5_LISTWISE_BATCH`): `triage.prescore_batch`
+  scores N listings per call and caches verdicts. Coverage is stochastic and
+  logged; anything a batch omits — or a whole batch rejected on its anchor —
+  **falls back to pointwise**. Never assume a listing was scored by one path.
 - **`presented_at` is paging state, not a gate.** The reasoning, and why gating on it would strand a shown page, is in `db.get_review_queue`'s docstring — the only copy.
 
 ### Project structure
@@ -65,6 +69,7 @@ apply-daemon/
 │   ├── human_labels.py          # Shared human-feedback ledger writer (data/human_labels.jsonl)
 │   ├── cli.py                   # CLI review surface (status/next/show/deep-dive/save/pass/tailor). Local-only except tailor --via api.
 │   ├── decisions.py             # Shared decision policy (verb→status, guard) for every surface
+│   ├── listing_card.py          # Card contract: the one field set every review surface renders
 │   ├── budget.py                # Spend ceilings: daily USD cap, run cooldown, projection (refuse-and-report)
 │   ├── geo_backfill.py          # One-time distance_bucket backfill so the queue can sort by location
 │   ├── tailor.py                # Cloud LLM escalation engine (multi-line prompts; E501 ignored)
@@ -124,7 +129,8 @@ straight into the first page (`page` in its JSON), so "anything good today?"
 is a single call, not a sequence. Any new verb that produces listings should
 chain the same way rather than telling the user to run something else.
 
-**Reviewing is free; `refresh` is the only verb that spends metered money.**
+**Reviewing is free; only `refresh` and `tailor --via api` spend metered
+money.**
 Enrichment is pre-cached by autopilot, and tailoring runs in-session. Keep it
 that way: a read verb that makes a network call breaks the conversational
 loop's latency and its cost story at once.
@@ -234,6 +240,11 @@ When auditing your own or prior work, these are steps rather than instincts:
 - Multi-line LLM prompt templates in `triage.py` / `tailor.py` are deliberately one prose sentence per line so the wire-format is preserved — do not reflow them; ruff E501 is already ignored for these files.
 - Several entry points need `load_dotenv()` before importing modules that read env at import time → E402 is ignored for those (`pipeline.py`, `digest.py`, `batch_process.py`, `jobspy_ingest.py`, `process_queue.py`, `proxy_test.py`, `sweeper.py`, `tailor.py`).
 - Squash on merge; commit messages on `main` read like changelog entries.
+- **Stage 5 model swaps must pass the gate:** `python -m eval.listwise_compare
+  --gold --shuffle --model <slug>` before any slug change. Measured basis: a
+  newer model (`gemini-3.5-flash-lite`) was worse *and* dearer, and
+  `gpt-5.4-nano` collapsed to 58% on this task. Version numbers are not
+  fitness.
 - **Slack thread commands (`!applied`, `!triage`, `!trend`, …) are frozen** — they still work, but new post-triage functionality belongs in the CLI review surface, not `sweeper.py`. Slack *reactions* (👍 👎 ✏️ ❓) are unaffected. See `docs/CHATOPS.md`.
 - **Every human decision must append to `data/human_labels.jsonl`** via `src/human_labels.py::append_human_label` (pass `surface=`). That ledger is the only input to the preference-pair extractor behind the ranking evals — a surface that skips it is invisible to that work, silently.
 - **Metered spend must be auditable.** Any code path that calls OpenRouter routes its token count through `src/model_usage.py::log_model_usage` (model, stage, tokens — never prompt or response content). `logs/model_usage.log` is the audit trail and the basis for spend ceilings (`src/budget.py`); a spending path missing from it makes the budget unenforceable. All nine call sites comply, and `tests/test_model_usage.py::TestMeteringCoverage` fails the suite if a new one doesn't. In-session (subscription-billed) work is exempt: it has no metered cost to record.

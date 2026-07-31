@@ -81,8 +81,8 @@ work or a refresh is the right move.
 - `count: 0` with `hidden_stale > 0` means the queue is stale, not empty —
   say a refresh would bring new listings rather than "nothing to review".
 
-**`refresh`** runs the pipeline and returns the first page — **the only verb
-that spends metered money.**
+**`refresh`** runs the pipeline and returns the first page. It and
+`tailor --via api` are the only verbs that spend metered money.
 
 - `page` holds the first page of results; render it rather than calling
   `next` again, which would skip past those listings.
