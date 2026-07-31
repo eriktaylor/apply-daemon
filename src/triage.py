@@ -341,6 +341,27 @@ def listwise_batch_size() -> int:
         return 0
 
 
+def noise_floor_pct() -> int:
+    """Confidence below which a Stage 5 survivor is discarded as noise (M-6).
+
+    `CONFIDENCE_THRESHOLD` was always a blunt noise filter, not a calibrated
+    probability — raising it was how a user compensated for pointwise scoring
+    being over-optimistic. Under rank-based selection the *ranking* does the
+    quality work, so this only needs to strip obvious junk; a high value here
+    starves the pool the ranker chooses from.
+
+    Reads `NOISE_FLOOR_PCT`, else falls back to `CONFIDENCE_THRESHOLD` so
+    existing configs keep working unchanged.
+    """
+    raw = os.getenv("NOISE_FLOOR_PCT", "").strip()
+    if raw:
+        try:
+            return max(0, min(100, int(raw)))
+        except ValueError:
+            logger.warning("NOISE_FLOOR_PCT=%r is not an integer; ignoring", raw)
+    return int(round(get_confidence_threshold() * 100))
+
+
 def anchor_enabled() -> bool:
     """Whether each listwise batch carries a calibration anchor (M-5)."""
     return os.getenv("STAGE5_ANCHOR", "true").strip().lower() in ("1", "true", "yes")
@@ -1235,6 +1256,16 @@ class TriageSession:
         the pipeline."""
         return f"{(anchor.title or '').strip().lower()}|{(anchor.company or '').strip().lower()}"
 
+    # M-5.1: a synthetic anchor that needs no trust and no ledger. Deliberately
+    # absurd for this profile, so any competent scorer ranks it last — which is
+    # what makes it a usable *ordering* reference from a cold start.
+    _SYNTHETIC_WEAK = (
+        "Line Cook (Seasonal)",
+        "Harbourside Grill",
+        "Prepare short-order breakfast dishes on a seasonal beachfront rota. "
+        "No computer work. Must lift 20kg and stand for eight-hour shifts.",
+    )
+
     def _select_anchor(self) -> tuple["ExtractedListing", str, str] | None:
         """Pick a calibration anchor: (listing, description, expected_verdict).
 
@@ -1319,10 +1350,17 @@ class TriageSession:
             logger.debug("Listwise anchor: '%s at %s' (expected %s)",
                          anchor[0].title, anchor[0].company, anchor[2])
 
+        weak = None
+        if anchor is not None:
+            title, company, desc = self._SYNTHETIC_WEAK
+            weak = (ExtractedListing(title=title, company=company,
+                                     location="", salary=""), desc)
+
         scored = 0
         batches = 0
         incomplete = 0
         rejected = 0
+        retry: list[list] = []
         anchor_confidences: list[int] = []
         for start in range(0, len(items), size):
             chunk = items[start:start + size]
@@ -1333,7 +1371,11 @@ class TriageSession:
             # one slot (~10% at batch 10) and buys a per-batch calibration
             # check: confidence is meaningful *within* a batch, and without a
             # fixed reference nothing detects drift across batches.
-            scoring = list(chunk) + ([(anchor[0], anchor[1])] if anchor else [])
+            scoring = list(chunk)
+            if anchor:
+                scoring.append((anchor[0], anchor[1]))
+                if weak:
+                    scoring.append(weak)
             block = "\n".join(
                 f"### id: {self._batch_key(a)}\n"
                 f"Title: {a.title}\nCompany: {a.company}\n"
@@ -1375,25 +1417,43 @@ class TriageSession:
             # listing in it takes the pointwise path.
             if anchor is not None:
                 akey = self._batch_key(anchor[0])
+                wkey = self._batch_key(weak[0]) if weak else None
                 got = parsed.pop(akey, None)
+                wgot = parsed.pop(wkey, None) if wkey else None
                 if got is None:
                     logger.warning("Listwise batch %d omitted the anchor — "
                                    "calibration unverified, accepting anyway",
                                    batches)
                 else:
-                    averdict = str(got.get("verdict", "")).upper()
                     try:
-                        anchor_confidences.append(int(got.get("confidence", 0) or 0))
+                        aconf = int(got.get("confidence", 0) or 0)
+                        anchor_confidences.append(aconf)
                     except (TypeError, ValueError):
-                        pass
-                    if averdict != anchor[2]:
+                        aconf = 0
+
+                    # M-5.1: check ORDERING, not verdict. Verdict-match tested
+                    # an absolute-scale judgement — exactly what M-6 says not
+                    # to rely on. A batch that ranks a deliberately-weak
+                    # listing above one the user actually saved is
+                    # miscalibrated in the only way that matters for
+                    # rank-based selection.
+                    bad_order = False
+                    if wgot is not None:
+                        try:
+                            wconf = int(wgot.get("confidence", 0) or 0)
+                        except (TypeError, ValueError):
+                            wconf = 0
+                        if anchor[2] == "YES" and wconf >= aconf:
+                            bad_order = True
+                            reason = (f"weak reference scored {wconf} >= "
+                                      f"anchor {aconf}")
+                    if bad_order:
                         rejected += 1
                         logger.warning(
-                            "Listwise batch %d REJECTED — anchor '%s' scored %s, "
-                            "expected %s. %d listing(s) fall back to pointwise.",
-                            batches, anchor[0].title[:40], averdict or "?",
-                            anchor[2], len(chunk),
+                            "Listwise batch %d REJECTED — %s. Retrying with a "
+                            "reshuffled composition.", batches, reason,
                         )
+                        retry.append(chunk)
                         continue
 
             for item in parsed.values():
@@ -1426,6 +1486,74 @@ class TriageSession:
                     "Listwise batch %d returned %d/%d listings — %d fall back "
                     "to pointwise", batches, got, len(chunk), len(chunk) - got,
                 )
+
+        # M-5.1: one reshuffled retry before surrendering to pointwise.
+        # Measured drift is composition-dependent, so a rejected batch usually
+        # succeeds with different neighbours — and a retry is far cheaper than
+        # abandoning both the cost saving and the ranking benefit for the whole
+        # batch. Exactly one attempt: a second would risk retry-looping on a
+        # genuinely broken model.
+        if retry:
+            import random
+            for chunk in retry:
+                shuffled = list(chunk)
+                random.shuffle(shuffled)
+                scoring = shuffled + [(anchor[0], anchor[1])]
+                if weak:
+                    scoring.append(weak)
+                block = "\n".join(
+                    f"### id: {self._batch_key(a)}\n"
+                    f"Title: {a.title}\nCompany: {a.company}\n"
+                    f"Location: {a.location}\nSalary: {a.salary}\n"
+                    f"Description: {(desc or '')[:2000]}\n"
+                    for a, desc in scoring
+                )
+                try:
+                    resp = _call_openrouter(
+                        self._client, self.model,
+                        _LISTWISE_EVAL_PROMPT.format(
+                            profile_llm_context=self.profile_llm_context,
+                            listings_block=block,
+                        ),
+                        max_tokens=min(400 * len(scoring) + 500, 8192),
+                        temperature=0.0, json_mode=True,
+                        stage="stage5_listwise_retry",
+                    )
+                    text = (resp["text"] or "").strip()
+                    if text.startswith("```"):
+                        text = text.strip("`").removeprefix("json").strip()
+                    data = json.loads(text)
+                except Exception:
+                    logger.warning("Reshuffled retry failed — %d listing(s) "
+                                   "fall back to pointwise", len(chunk),
+                                   exc_info=True)
+                    continue
+                keys = {self._batch_key(a) for a, _ in chunk}
+                recovered = 0
+                for item in (data.get("listings") or []):
+                    if not isinstance(item, dict) or not item.get("id"):
+                        continue
+                    key = str(item["id"]).strip().lower()
+                    if key not in keys:
+                        continue
+                    try:
+                        self._listwise_scores[key] = {
+                            "verdict": str(item.get("verdict", "MAYBE")).upper(),
+                            "confidence": int(item.get("confidence", 0) or 0),
+                            "reasoning": str(item.get("reasoning", "") or ""),
+                            "skills_extracted": bool(item.get("skills_extracted", True)),
+                            "matching_skills": item.get("matching_skills") or [],
+                            "missing_skills": item.get("missing_skills") or [],
+                            "job_summary": str(item.get("job_summary", "") or ""),
+                            "model": self.model,
+                            "_tokens": 0,
+                        }
+                        scored += 1
+                        recovered += 1
+                    except (TypeError, ValueError):
+                        continue
+                logger.info("Reshuffled retry recovered %d/%d listing(s)",
+                            recovered, len(chunk))
 
         if anchor_confidences and len(anchor_confidences) > 1:
             spread = max(anchor_confidences) - min(anchor_confidences)

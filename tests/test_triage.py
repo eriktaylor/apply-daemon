@@ -1582,17 +1582,23 @@ class TestListwisePrescoring:
             assert "AnchorCo" in prompt          # anchor present
         assert "anchor role|anchorco" not in s._listwise_scores  # not cached
 
-    def test_batch_rejected_when_anchor_misjudged(self, monkeypatch, tmp_path):
-        """The protective behavior: a batch that misjudges a listing the user
-        saved has suspect calibration, so its scores are discarded."""
+    def test_verdict_mismatch_alone_no_longer_rejects(self, monkeypatch, tmp_path):
+        """M-5.1 replaced verdict-match with an ordering check.
+
+        Verdict-match tested an absolute-scale judgement — the very thing M-6
+        says not to rely on, and a scorer can rate a saved listing MAYBE while
+        still ordering the pool correctly. Rejection now requires the weak
+        reference to outrank the anchor.
+        """
         s, _ = self._anchored(monkeypatch, tmp_path)
         with patch("src.triage._call_openrouter") as call:
             call.return_value = self._batch_response([
                 ("A", "X", "YES", 95),
-                ("Anchor Role", "AnchorCo", "NO", 10),   # user saved it
+                ("Anchor Role", "AnchorCo", "MAYBE", 60),   # user saved it
+                ("Line Cook (Seasonal)", "Harbourside Grill", "NO", 5),
             ])
-            assert s.prescore_batch([(self._anchor("A", "X"), "d")]) == 0
-        assert s._listwise_scores == {}          # all fall back to pointwise
+            assert s.prescore_batch([(self._anchor("A", "X"), "d")]) == 1
+            assert call.call_count == 1          # ordering held; no retry
 
     def test_anchor_disabled_by_env(self, monkeypatch, tmp_path):
         s, _ = self._anchored(monkeypatch, tmp_path)
@@ -1601,3 +1607,54 @@ class TestListwisePrescoring:
             call.return_value = self._batch_response([("A", "X", "YES", 80)])
             s.prescore_batch([(self._anchor("A", "X"), "d")])
             assert "AnchorCo" not in call.call_args[0][2]
+
+    def test_synthetic_weak_reference_rides_along(self, monkeypatch, tmp_path):
+        """M-5.1: the ordering check needs a known-weak listing, and it must
+        work from a cold start — hence synthetic, not ledger-derived."""
+        s, _ = self._anchored(monkeypatch, tmp_path)
+        with patch("src.triage._call_openrouter") as call:
+            call.return_value = self._batch_response([("A", "X", "YES", 80)])
+            s.prescore_batch([(self._anchor("A", "X"), "d")])
+            prompt = call.call_args[0][2]
+            assert "Harbourside Grill" in prompt
+
+    def test_batch_rejected_when_weak_outranks_anchor(self, monkeypatch, tmp_path):
+        """The ordering check: a batch that scores the deliberately-weak
+        listing at or above a listing the user saved is miscalibrated."""
+        s, _ = self._anchored(monkeypatch, tmp_path)
+        responses = [
+            self._batch_response([
+                ("A", "X", "YES", 95),
+                ("Anchor Role", "AnchorCo", "YES", 40),
+                ("Line Cook (Seasonal)", "Harbourside Grill", "YES", 70),
+            ]),
+            self._batch_response([("A", "X", "YES", 88)]),  # retry succeeds
+        ]
+        with patch("src.triage._call_openrouter", side_effect=responses) as call:
+            assert s.prescore_batch([(self._anchor("A", "X"), "d")]) == 1
+            assert call.call_count == 2                       # retried
+            assert call.call_args.kwargs["stage"] == "stage5_listwise_retry"
+        assert s._listwise_scores["a|x"]["confidence"] == 88  # retry's value
+
+    def test_good_ordering_accepts_the_batch(self, monkeypatch, tmp_path):
+        s, _ = self._anchored(monkeypatch, tmp_path)
+        with patch("src.triage._call_openrouter") as call:
+            call.return_value = self._batch_response([
+                ("A", "X", "YES", 90),
+                ("Anchor Role", "AnchorCo", "YES", 85),
+                ("Line Cook (Seasonal)", "Harbourside Grill", "NO", 5),
+            ])
+            assert s.prescore_batch([(self._anchor("A", "X"), "d")]) == 1
+            assert call.call_count == 1                       # no retry needed
+
+    def test_retry_happens_once_not_in_a_loop(self, monkeypatch, tmp_path):
+        """A genuinely broken model must not cause retry-looping."""
+        s, _ = self._anchored(monkeypatch, tmp_path)
+        bad = self._batch_response([
+            ("A", "X", "YES", 95),
+            ("Anchor Role", "AnchorCo", "YES", 30),
+            ("Line Cook (Seasonal)", "Harbourside Grill", "YES", 80),
+        ])
+        with patch("src.triage._call_openrouter", return_value=bad) as call:
+            s.prescore_batch([(self._anchor("A", "X"), "d")])
+            assert call.call_count == 2                       # initial + 1 retry
