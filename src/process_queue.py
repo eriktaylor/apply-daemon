@@ -50,9 +50,10 @@ from src.mismatch_gate import check_mismatch
 from src.model_usage import log_response_usage
 from src.notifications import _get_slack_config, _import_slack_app
 from src.profile_loader import load_profile
+from src.ranking import SURFACE_STAGE5, RankCandidate, rank_candidates, ranking_mode
 from src.research import run_deep_research
 from src.tailor import _find_existing_output
-from src.triage import get_confidence_threshold
+from src.triage import get_confidence_threshold, noise_floor_pct
 
 logger = logging.getLogger(__name__)
 
@@ -204,7 +205,48 @@ def _composite_score(row: dict, bucket: int) -> int:
     return verdict_bonus + _skill_score(row) + _GEO_SCORES.get(bucket, 0)
 
 
-def _select_top_n(rows: list[dict], top_n: int, db: Database) -> list[dict]:
+def _rank_select(rows: list[dict], top_n: int, client) -> list[dict] | None:
+    """M-6: pick top-N by listwise *rank position*, not by confidence.
+
+    Returns None when ranking is disabled or fails, so the caller keeps the
+    band+composite heuristic.
+
+    Why position rather than score: confidence is only meaningful *within* one
+    scoring batch. Measured, batch composition alone moved 6 of 24 listings
+    across an absolute threshold — so comparing a scalar to a fixed cutoff is
+    unstable by construction. Relative order inside a pool has no such
+    exposure, and relative order is all top-N selection actually needs.
+    """
+    if ranking_mode(SURFACE_STAGE5) == "off" or len(rows) < 2:
+        return None
+    candidates = [
+        RankCandidate(
+            id=str(r["id"]), title=r.get("title") or "",
+            company=r.get("company") or "",
+            location=r.get("location") or "",
+            signals={"confidence": r.get("confidence", 0),
+                     "verdict": r.get("verdict", "")},
+        )
+        for r in rows
+    ]
+    ordered = rank_candidates(
+        client=client, model=_tailor_model(), surface=SURFACE_STAGE5,
+        candidates=candidates,
+    )
+    order = [c.id for c in ordered]
+    if order == [c.id for c in candidates]:
+        # Unchanged order means the ranker failed open (see ranking.py) —
+        # treat it as "no ranking" rather than silently claiming a rank-based
+        # selection that never happened.
+        return None
+    by_id = {str(r["id"]): r for r in rows}
+    picked = [by_id[i] for i in order if i in by_id][:top_n]
+    logger.info("M-6: selected top %d of %d by rank position", len(picked), len(rows))
+    return picked
+
+
+def _select_top_n(rows: list[dict], top_n: int, db: Database,
+                  client=None) -> list[dict]:
     """Pick up to ``top_n`` rows using confidence bands + within-band composite.
 
     Walks bands high → low. For each band, lazily resolves geo for its rows,
@@ -213,6 +255,10 @@ def _select_top_n(rows: list[dict], top_n: int, db: Database) -> list[dict]:
     """
     if top_n <= 0 or not rows:
         return []
+
+    ranked = _rank_select(rows, top_n, client)
+    if ranked is not None:
+        return ranked
 
     # Group by band, preserving descending confidence (rows are already sorted
     # confidence DESC, date_ingested DESC by get_auto_queue).
@@ -830,7 +876,7 @@ def run() -> int:
         logger.info("Autopilot: AUTOPILOT_TOP_N=%d; nothing to do", top_n)
         return 0
 
-    cutoff_pct = int(round(get_confidence_threshold() * 100))
+    cutoff_pct = noise_floor_pct()
     with Database() as db:
         processed_today = db.count_autopilot_processed_today()
         remaining = max(0, top_n - processed_today)
@@ -848,7 +894,16 @@ def run() -> int:
                 top_n=None, min_confidence_pct=cutoff_pct,
             )
         ]
-        rows = _select_top_n(eligible, remaining, db)
+        # A client only when ranking is on — building one is cheap but
+        # pointless otherwise, and _rank_select fails open without it.
+        rank_client = None
+        if ranking_mode(SURFACE_STAGE5) != "off":
+            api_key = os.getenv("OPENROUTER_API_KEY", "")
+            if api_key:
+                rank_client = openai.OpenAI(
+                    base_url=_OPENROUTER_BASE_URL, api_key=api_key,
+                )
+        rows = _select_top_n(eligible, remaining, db, client=rank_client)
 
     if not rows:
         logger.info(

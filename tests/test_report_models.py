@@ -192,3 +192,75 @@ class TestSpendReport:
         spend_report()
         out = capsys.readouterr().out
         assert "Unpriced models" in out and "mystery/model" in out
+
+
+class TestM6RankSelection:
+    """M-6 — top-N by rank position, not by confidence."""
+
+    def _rows(self, n=5):
+        return [
+            {"id": f"id{i}", "title": f"T{i}", "company": f"C{i}",
+             "location": "SF", "confidence": 50 + i, "verdict": "YES",
+             "date_ingested": "2026-07-30T00:00:00+00:00",
+             "matching_skills": "", "missing_skills": "", "distance_bucket": 1}
+            for i in range(n)
+        ]
+
+    def test_disabled_falls_back_to_heuristic(self, monkeypatch):
+        from src.process_queue import _rank_select
+        monkeypatch.delenv("RANKING_MODE_STAGE5", raising=False)
+        monkeypatch.delenv("RANKING_MODE", raising=False)
+        assert _rank_select(self._rows(), 3, client=None) is None
+
+    def test_rank_order_beats_confidence_order(self, monkeypatch, mocker):
+        """The point of M-6: a lower-confidence listing ranked first wins."""
+        from src.ranking import RankCandidate
+        monkeypatch.setenv("RANKING_MODE_STAGE5", "listwise")
+        rows = self._rows(3)          # confidences 50, 51, 52
+        mocker.patch(
+            "src.process_queue.rank_candidates",
+            return_value=[RankCandidate(id="id0", title="T0"),
+                          RankCandidate(id="id2", title="T2"),
+                          RankCandidate(id="id1", title="T1")],
+        )
+        from src.process_queue import _rank_select
+        picked = _rank_select(rows, 2, client=object())
+        assert [r["id"] for r in picked] == ["id0", "id2"]   # not id2,id1 by conf
+
+    def test_failed_open_ranker_is_treated_as_no_ranking(self, monkeypatch, mocker):
+        """ranking.py fails open by returning input order — that must not be
+        mistaken for a real rank-based selection."""
+        from src.ranking import RankCandidate
+        monkeypatch.setenv("RANKING_MODE_STAGE5", "listwise")
+        rows = self._rows(3)
+        mocker.patch(
+            "src.process_queue.rank_candidates",
+            return_value=[RankCandidate(id=f"id{i}", title=f"T{i}") for i in range(3)],
+        )
+        from src.process_queue import _rank_select
+        assert _rank_select(rows, 2, client=object()) is None
+
+    def test_single_row_needs_no_ranking(self, monkeypatch):
+        from src.process_queue import _rank_select
+        monkeypatch.setenv("RANKING_MODE_STAGE5", "listwise")
+        assert _rank_select(self._rows(1), 1, client=object()) is None
+
+
+class TestNoiseFloor:
+    def test_defaults_to_confidence_threshold(self, monkeypatch):
+        from src.triage import noise_floor_pct
+        monkeypatch.delenv("NOISE_FLOOR_PCT", raising=False)
+        monkeypatch.setenv("CONFIDENCE_THRESHOLD", "0.75")
+        assert noise_floor_pct() == 75
+
+    def test_explicit_floor_wins(self, monkeypatch):
+        from src.triage import noise_floor_pct
+        monkeypatch.setenv("CONFIDENCE_THRESHOLD", "0.85")
+        monkeypatch.setenv("NOISE_FLOOR_PCT", "55")
+        assert noise_floor_pct() == 55
+
+    def test_garbage_falls_back(self, monkeypatch):
+        from src.triage import noise_floor_pct
+        monkeypatch.setenv("CONFIDENCE_THRESHOLD", "0.6")
+        monkeypatch.setenv("NOISE_FLOOR_PCT", "loads")
+        assert noise_floor_pct() == 60
