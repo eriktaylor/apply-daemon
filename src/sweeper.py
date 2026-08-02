@@ -35,10 +35,11 @@ from slack_sdk.errors import SlackApiError
 
 load_dotenv()
 
-from src.db import Database
+from src.db import REVIEW_STATUSES, Database
 from src.decisions import is_allowed, target_status
 from src.human_labels import SURFACE_SLACK, append_human_label
 from src.model_usage import log_response_usage
+from src.models import FULL_JOB_DESCRIPTION_CHARS, job_description_text
 from src.notifications import _get_slack_config, _import_slack_app
 
 logger = logging.getLogger(__name__)
@@ -891,12 +892,16 @@ def _handle_update(
         dedup_window = settings.get("dedup_window_days", 30)
         pass_window = settings.get("pass_window_days", 180)
 
-        # Merge existing description with new text — preserves historical context
-        existing_text = (parent_row["raw_email_text"] or parent_row["job_summary"] or "").strip()
+        # Merge existing description with new text — preserves historical
+        # context. The existing body yields room to the payload: description
+        # below slices to FULL_JOB_DESCRIPTION_CHARS, and an existing body
+        # at or over that width would otherwise silently truncate the user's
+        # added context to nothing — the one thing !update exists to add.
+        delim = "\n\n--- ADDITIONAL MANUAL CONTEXT ---\n\n"
+        room = max(0, FULL_JOB_DESCRIPTION_CHARS - len(delim) - len(payload))
+        existing_text = job_description_text(parent_row, limit=room)
         if existing_text:
-            combined_text = (
-                f"{existing_text}\n\n--- ADDITIONAL MANUAL CONTEXT ---\n\n{payload}"
-            )
+            combined_text = f"{existing_text}{delim}{payload}"
         else:
             combined_text = payload
 
@@ -914,7 +919,7 @@ def _handle_update(
             location=parent_row["location"] or "",
             salary=parent_row["salary"] or "not listed",
             job_summary=combined_text[:300].strip(),
-            description=combined_text[:4000],
+            description=combined_text[:FULL_JOB_DESCRIPTION_CHARS],
             links=existing_links,
         )
 
@@ -2065,12 +2070,19 @@ def _classify_trend_cohort(row) -> str | None:
     """Assign a DB row to a trend cohort.
 
     Returns 'high_intent', 'pipeline', 'rejected', or None to skip.
+
+    'pipeline' means awaiting a human decision, which is exactly what
+    REVIEW_STATUSES enumerates — importing it is what keeps this in step.
+    Hard-coding 'triaged' here is what made !trend go quietly blind: once
+    autopilot became the default path, rows landed in 'auto_queued'/'auto'
+    instead, and the report classified 0 of its most recent 100 rows while
+    still posting as though it had summarized them.
     """
     status = (row["pipeline_status"] or "").lower()
     verdict = (row["verdict"] or "").upper()
     if status in ("saved", "tailored", "applied", "interviewing"):
         return "high_intent"
-    if verdict in ("YES", "MAYBE") and status == "triaged":
+    if verdict in ("YES", "MAYBE") and status in REVIEW_STATUSES:
         return "pipeline"
     if verdict == "NO" or status in ("passed", "rejected"):
         return "rejected"
@@ -2297,7 +2309,8 @@ def _handle_trend(
 ) -> None:
     """Handle !trend: query skill data, canonicalize via LLM, post monospace report.
 
-    ``limit`` controls how many recent jobs are scanned (default 100). When
+    ``limit`` is per ``pipeline_status`` (default 100) — see
+    ``db.get_trend_skills`` for why a global window starves the report. When
     invoked as ``!trend --deep N`` the caller passes the parsed N here.
     """
     import asyncio

@@ -9,6 +9,7 @@ import pytest
 
 from src.process_queue import (
     _band,
+    _build_prompt,
     _composite_score,
     _compute_distance_bucket,
     _resolve_bucket,
@@ -180,3 +181,51 @@ def test_select_top_n_empty_inputs():
     db = MagicMock()
     assert _select_top_n([], top_n=10, db=db) == []
     assert _select_top_n([_row()], top_n=0, db=db) == []
+
+
+# ---------------------------------------------------------------------------
+# What the post-research re-score is allowed to see
+# ---------------------------------------------------------------------------
+
+
+def _queued_listing(**overrides) -> dict:
+    listing = {
+        "title": "Applied AI Engineer",
+        "company": "Acme",
+        "location": "Oakland, CA",
+        "salary": "not listed",
+        "raw_email_text": "Owns evaluation harnesses. Requires Rust and CUDA.",
+        "job_summary": "Acme is a Series B lab. The role owns evaluation.",
+        "reason": "Strong match on agentic AI experience.",
+    }
+    listing.update(overrides)
+    return listing
+
+
+class TestAutoPromptGrounding:
+    """The re-score exists to second-guess Stage 5. It cannot do that while
+    reading Stage 5's own reasoning, and it cannot do it at all from a
+    ~290-char summary of a posting it never sees."""
+
+    def test_sends_the_job_description(self):
+        prompt = _build_prompt(_queued_listing(), "research", "profile", "resume")
+        assert "Requires Rust and CUDA." in prompt
+
+    def test_never_sends_the_incumbent_models_reasoning(self):
+        prompt = _build_prompt(_queued_listing(), "research", "profile", "resume")
+        assert "Strong match on agentic AI experience." not in prompt
+        assert "Initial Reasoning" not in prompt
+
+    def test_falls_back_to_summary_without_a_description(self):
+        prompt = _build_prompt(
+            _queued_listing(raw_email_text=""), "research", "profile", "resume",
+        )
+        assert "Acme is a Series B lab." in prompt
+        assert "Strong match on agentic AI experience." not in prompt
+
+    def test_missing_body_is_a_stated_absence(self):
+        prompt = _build_prompt(
+            _queued_listing(raw_email_text="", job_summary=""),
+            "research", "profile", "resume",
+        )
+        assert "(No job description was stored.)" in prompt

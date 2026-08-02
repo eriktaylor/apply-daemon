@@ -8,6 +8,7 @@ from src.triage import (
     _consensus_label,
     _is_aggregator_url,
     _is_tracking_url,
+    _ordering_score,
     _parse_block_fields,
     _parse_evaluation_json,
     _parse_extraction_response,
@@ -1636,6 +1637,54 @@ class TestListwisePrescoring:
             assert call.call_args.kwargs["stage"] == "stage5_listwise_retry"
         assert s._listwise_scores["a|x"]["confidence"] == 88  # retry's value
 
+    def test_confident_no_on_the_weak_reference_does_not_reject(
+        self, monkeypatch, tmp_path,
+    ):
+        """Production regression, 2026-08-02.
+
+        A deliberately-absurd listing is an *obvious* NO, so a good model
+        returns NO at 95-100 — `confidence` is certainty in the verdict, not
+        desirability. The check compared raw confidence, so a confident NO
+        always outscored a merely-strong YES and every batch was rejected:
+        four batches, four retries, 40 listings billed for listwise *and*
+        pointwise, nothing cached.
+
+        Every fixture above scored the weak listing NO at 5, which encodes the
+        same misconception the code had — which is why the suite was green
+        while production was failing on every batch.
+        """
+        s, _ = self._anchored(monkeypatch, tmp_path)
+        with patch("src.triage._call_openrouter") as call:
+            call.return_value = self._batch_response([
+                ("A", "X", "YES", 90),
+                ("Anchor Role", "AnchorCo", "YES", 85),
+                ("Line Cook (Seasonal)", "Harbourside Grill", "NO", 98),
+            ])
+            assert s.prescore_batch([(self._anchor("A", "X"), "d")]) == 1
+            assert call.call_count == 1                       # accepted, no retry
+
+    def test_anchor_switches_off_after_consecutive_rejections(
+        self, monkeypatch, tmp_path, caplog,
+    ):
+        """A reshuffle only recovers composition-dependent drift. Rejecting
+        every batch means the retry cannot reach the cause, and each further
+        anchored batch bills listwise + retry + pointwise to learn nothing."""
+        import logging
+        s, _ = self._anchored(monkeypatch, tmp_path)
+        monkeypatch.setenv("STAGE5_LISTWISE_BATCH", "2")   # 8 items -> 4 batches
+        items = [(self._anchor(c, c), "d") for c in "ABCDEFGH"]
+        bad = self._batch_response([
+            ("Anchor Role", "AnchorCo", "YES", 10),
+            ("Line Cook (Seasonal)", "Harbourside Grill", "YES", 99),
+        ])
+        with caplog.at_level(logging.ERROR, logger="src.triage"):
+            with patch("src.triage._call_openrouter", return_value=bad) as call:
+                s.prescore_batch(items)
+        assert "disabling the anchor" in caplog.text
+        # Once tripped, later batches go out without the anchor listing.
+        later = [c.args[2] for c in call.call_args_list]
+        assert any("AnchorCo" not in p for p in later)
+
     def test_good_ordering_accepts_the_batch(self, monkeypatch, tmp_path):
         s, _ = self._anchored(monkeypatch, tmp_path)
         with patch("src.triage._call_openrouter") as call:
@@ -1658,3 +1707,30 @@ class TestListwisePrescoring:
         with patch("src.triage._call_openrouter", return_value=bad) as call:
             s.prescore_batch([(self._anchor("A", "X"), "d")])
             assert call.call_count == 2                       # initial + 1 retry
+
+
+class TestOrderingScore:
+    """`confidence` is certainty in the verdict, not desirability. Ordering
+    across verdicts therefore needs a signed scale — comparing raw confidence
+    ranks a confident NO above a strong YES."""
+
+    def test_no_is_negative(self):
+        assert _ordering_score({"verdict": "NO", "confidence": 98}) == -98
+
+    def test_yes_is_positive(self):
+        assert _ordering_score({"verdict": "YES", "confidence": 85}) == 85
+
+    def test_maybe_sits_between(self):
+        assert _ordering_score({"verdict": "MAYBE", "confidence": 99}) == 0
+
+    def test_confident_no_ranks_below_weak_yes(self):
+        """The production failure, as a one-line property."""
+        assert (_ordering_score({"verdict": "NO", "confidence": 99})
+                < _ordering_score({"verdict": "YES", "confidence": 40}))
+
+    def test_case_and_whitespace_tolerated(self):
+        assert _ordering_score({"verdict": " no ", "confidence": 50}) == -50
+
+    def test_garbage_is_neutral_not_endorsed(self):
+        assert _ordering_score({"verdict": "", "confidence": "x"}) == 0
+        assert _ordering_score({}) == 0

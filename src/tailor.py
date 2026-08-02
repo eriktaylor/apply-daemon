@@ -21,6 +21,7 @@ import os
 import re
 import sys
 import time
+from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
 
@@ -34,6 +35,11 @@ from src.db import Database
 from src.decisions import target_status
 from src.file_utils import find_output_folder, read_dropzone_file
 from src.model_usage import log_response_usage
+from src.models import (
+    FULL_JOB_DESCRIPTION_CHARS,
+    NO_DESCRIPTION_PLACEHOLDER,
+    job_description_text,
+)
 from src.profile_loader import load_profile
 from src.research import run_deep_research
 
@@ -55,8 +61,7 @@ Title: {title}
 Company: {company}
 Location: {location}
 Salary: {salary}
-Job Summary: {job_summary}
-Full Description / Reasoning: {reason}
+Description: {job_description}
 {research_section}{questions_section}
 ## Instructions
 Analyze the match between this candidate and role, then generate tailored application assets.
@@ -257,7 +262,7 @@ def build_prompt(
         research_context = research_context_override
         logger.info("Tailor: using cached research context for %s (checkpoint resume)", company)
     elif company:
-        job_desc = listing.get("job_summary", "") or listing.get("reason", "")
+        job_desc = job_description_text(listing)
         if status_callback:
             status_callback("researching")
         logger.info("Running deep research for %s", company)
@@ -358,8 +363,10 @@ def build_prompt(
         company=listing.get("company", "Unknown"),
         location=listing.get("location", "not specified"),
         salary=listing.get("salary", "not listed"),
-        job_summary=listing.get("job_summary", ""),
-        reason=listing.get("reason", ""),
+        job_description=(
+            job_description_text(listing, limit=FULL_JOB_DESCRIPTION_CHARS)
+            or NO_DESCRIPTION_PLACEHOLDER
+        ),
         research_section=research_section,
         questions_section=questions_section,
         asset_instructions=asset_instructions,
@@ -463,68 +470,9 @@ Respond with ONLY a valid JSON object:
 
 
 def generate_answers_only(job_id: str, custom_questions: str) -> tuple[Path, dict]:
-    """Lightweight fast-path: answer application questions without full tailoring.
-
-    Loads cached deep_research_context.txt from the existing output directory
-    to provide grounded answers without re-running research or regenerating assets.
-
-    Args:
-        job_id: The listing ID (must already be tailored).
-        custom_questions: Free-text questions from the user.
-
-    Returns:
-        (output_directory, parsed_answers_json)
-    """
-    client = _get_openrouter_client()
-
-    with Database() as db:
-        row = db.get_listing_by_id(job_id)
-        if row is None:
-            raise ValueError(f"Listing not found: {job_id}")
-        listing = dict(row)
-
-    profile = load_profile()
-    profile_text = profile["llm_context"]
-    resume_text = read_dropzone_file("base_resume") or ""
-
-    # Find existing output directory and load cached research
-    research_context = ""
-    output_path = _find_existing_output(job_id)
-    if output_path:
-        research_file = output_path / "deep_research_context.txt"
-        if research_file.exists():
-            research_context = research_file.read_text(encoding="utf-8")
-
-    prompt = _ANSWER_PROMPT.format(
-        profile=profile_text,
-        resume=resume_text,
-        title=listing.get("title", "Unknown"),
-        company=listing.get("company", "Unknown"),
-        location=listing.get("location", "not specified"),
-        research_context=research_context or "(No research context available)",
-        custom_questions=custom_questions,
-    )
-
-    logger.info("Calling OpenRouter API (answers-only) for listing %s...", job_id[:8])
-    response_text = _call_openrouter(client, prompt, max_tokens=1024, stage="tailor_answers")
-    answers_json = _parse_answers_response(response_text)
-
-    # Save answers to the existing output directory
-    if not output_path:
-        title = listing.get("title", "role")
-        company = listing.get("company", "company")
-        company_slug = re.sub(r"[^\w]+", "_", company).strip("_")
-        title_slug = re.sub(r"[^\w]+", "_", title).strip("_")[:30]
-        dir_name = f"{company_slug}_{title_slug}_{job_id[:8]}"
-        output_path = OUTPUT_DIR / dir_name
-        output_path.mkdir(parents=True, exist_ok=True)
-
-    company = listing.get("company", "company")
-    company_slug = re.sub(r"[^\w]+", "_", company).strip("_")
-    _save_custom_answers(output_path, company_slug, answers_json)
-
-    logger.info("Answers-only complete: %s → %s", job_id[:8], output_path)
-    return output_path, answers_json
+    """Answer application questions without a full tailor (metered)."""
+    return generate_asset_via_api(
+        job_id, "answers", custom_questions=custom_questions)
 
 
 def _find_existing_output(job_id: str) -> Path | None:
@@ -692,179 +640,21 @@ Respond with ONLY a valid JSON object:
 
 
 def generate_cover_letter_only(job_id: str) -> tuple[Path, dict]:
-    """On-demand cover letter generation using cached research + tailor context.
-
-    Loads deep_research_context.txt and assets.json from the existing output
-    directory. Saves a versioned Cover_Letter_{Company}[_vN].docx.
-
-    Returns:
-        (output_directory, parsed_json)
-    """
-    client = _get_openrouter_client()
-    listing, profile_text, resume_text, research_context, output_path, assets_json = (
-        _load_ondemand_context(job_id)
-    )
-
-    cover_letter_template = read_dropzone_file("cover_letter") or ""
-    cover_letter_style = ""
-    if cover_letter_template:
-        cover_letter_style = (
-            "\n## Cover Letter Style Reference\n"
-            + cover_letter_template + "\n"
-        )
-
-    prompt = _COVER_LETTER_PROMPT.format(
-        profile=profile_text,
-        resume=resume_text,
-        cover_letter_style=cover_letter_style,
-        title=listing.get("title", "Unknown"),
-        company=listing.get("company", "Unknown"),
-        location=listing.get("location", "not specified"),
-        research_context=research_context or "(No research context available)",
-        tailor_context=_format_tailor_context(assets_json),
-    )
-
-    logger.info("Calling OpenRouter API (cover letter only) for listing %s...", job_id[:8])
-    response_text = _call_openrouter(client, prompt, max_tokens=2048, stage="tailor_coverletter")
-    cl_json = _parse_single_asset_response(response_text, "clean_cover_letter_text")
-
-    # Compile cover letter .docx — versioned so repeat calls produce _v2, _v3, …
-    company = listing.get("company", "company")
-    company_slug = re.sub(r"[^\w]+", "_", company).strip("_")
-    title = listing.get("title", "role")
-    cover_letter_text = cl_json.get("clean_cover_letter_text", "")
-    if cover_letter_text:
-        from src.compile import _generate_cover_letter
-        dest = _next_version_path(output_path, f"Cover_Letter_{company_slug}", ".docx")
-        _generate_cover_letter(dest, cover_letter_text, title, company)
-
-    # Save JSON (always overwrite — the latest JSON is canonical)
-    (output_path / "cover_letter.json").write_text(
-        json.dumps(cl_json, indent=2), encoding="utf-8",
-    )
-
-    logger.info("Cover letter generated: %s → %s", job_id[:8], output_path)
-    return output_path, cl_json
+    """On-demand cover letter (metered). See generate_asset_via_api."""
+    return generate_asset_via_api(job_id, "cover_letter")
 
 
 def generate_interview_prep_only(job_id: str) -> tuple[Path, dict]:
-    """On-demand interview prep generation using cached research + tailor context.
-
-    Returns:
-        (output_directory, parsed_json)
-    """
-    client = _get_openrouter_client()
-    listing, profile_text, resume_text, research_context, output_path, assets_json = (
-        _load_ondemand_context(job_id)
-    )
-
-    prompt = _INTERVIEW_PREP_PROMPT.format(
-        profile=profile_text,
-        resume=resume_text,
-        title=listing.get("title", "Unknown"),
-        company=listing.get("company", "Unknown"),
-        location=listing.get("location", "not specified"),
-        research_context=research_context or "(No research context available)",
-        tailor_context=_format_tailor_context(assets_json),
-    )
-
-    logger.info("Calling OpenRouter API (interview prep only) for listing %s...", job_id[:8])
-    response_text = _call_openrouter(client, prompt, max_tokens=2048, stage="tailor_prep")
-    prep_json = _parse_single_asset_response(response_text, "interview_prep_guide")
-
-    # Save interview prep as Markdown — versioned so repeat calls produce _v2, _v3, …
-    company = listing.get("company", "company")
-    company_slug = re.sub(r"[^\w]+", "_", company).strip("_")
-    title = listing.get("title", "role")
-    prep_text = prep_json.get("interview_prep_guide", "")
-    if prep_text:
-        dest = _next_version_path(output_path, f"Interview_Prep_{company_slug}", ".md")
-        dest.write_text(
-            f"# Interview Prep: {title} at {company}\n\n{prep_text}\n",
-            encoding="utf-8",
-        )
-
-    (output_path / "interview_prep.json").write_text(
-        json.dumps(prep_json, indent=2), encoding="utf-8",
-    )
-
-    logger.info("Interview prep generated: %s → %s", job_id[:8], output_path)
-    return output_path, prep_json
+    """On-demand interview prep (metered). See generate_asset_via_api."""
+    return generate_asset_via_api(job_id, "interview_prep")
 
 
 def generate_polish_resume(job_id: str) -> tuple[Path, dict]:
-    """On-demand polished resume generation — integrates tailor edits into a final document.
+    """On-demand polished resume (metered). See generate_asset_via_api.
 
-    Loads the executive summary rewrite, bullet edits, other_suggestions, and
-    research context from the existing output directory, then asks the LLM to
-    produce a single coherent polished resume.
-
-    Returns:
-        (output_directory, parsed_json)
-
-    Raises:
-        RuntimeError: If no tailor assets (assets.json) are found for this job.
+    Raises RuntimeError when no prior tailor pass has produced assets.json.
     """
-    client = _get_openrouter_client()
-    listing, profile_text, resume_text, research_context, output_path, assets_json = (
-        _load_ondemand_context(job_id)
-    )
-
-    if not assets_json:
-        raise RuntimeError(
-            f"No tailor assets found for {job_id[:8]}. "
-            "Run a tailor pass first (add ✏️ to the card), then use !polish."
-        )
-
-    executive_summary = assets_json.get("executive_summary_rewrite", "").strip()
-    bullet_edits_raw = assets_json.get("resume_bullet_edits", [])
-    other_suggestions = assets_json.get("other_suggestions", "").strip()
-
-    # Format bullet edits as readable text for the prompt
-    if isinstance(bullet_edits_raw, list):
-        bullet_lines = []
-        for edit in bullet_edits_raw:
-            if isinstance(edit, dict):
-                orig = edit.get("original_bullet", "")
-                diff = edit.get("slack_diff", "")
-                clean = edit.get("clean_bullet", "")
-                bullet_lines.append(
-                    f"- Original: {orig}\n  Edit:     {diff}\n  Final:    {clean}"
-                )
-        bullet_edits_text = "\n".join(bullet_lines) if bullet_lines else "(none)"
-    else:
-        bullet_edits_text = str(bullet_edits_raw) if bullet_edits_raw else "(none)"
-
-    prompt = _POLISH_RESUME_PROMPT.format(
-        profile=profile_text,
-        resume=resume_text,
-        title=listing.get("title", "Unknown"),
-        company=listing.get("company", "Unknown"),
-        executive_summary=executive_summary or "(none)",
-        bullet_edits=bullet_edits_text,
-        other_suggestions=other_suggestions or "(none)",
-        research_context=research_context or "(No research context available)",
-    )
-
-    logger.info("Calling OpenRouter API (polish resume) for listing %s...", job_id[:8])
-    response_text = _call_openrouter(client, prompt, max_tokens=4096, stage="tailor_polish")
-    polish_json = _parse_single_asset_response(response_text, "polished_resume_text")
-
-    # Write polished resume .docx — versioned so repeat calls produce _v2, _v3, …
-    company = listing.get("company", "company")
-    company_slug = re.sub(r"[^\w]+", "_", company).strip("_")
-    polished_text = polish_json.get("polished_resume_text", "")
-    if polished_text:
-        from src.compile import _write_polished_resume_docx
-        dest = _next_version_path(output_path, f"Polished_Resume_{company_slug}", ".docx")
-        _write_polished_resume_docx(dest, polished_text)
-
-    (output_path / "polished_resume.json").write_text(
-        json.dumps(polish_json, indent=2), encoding="utf-8",
-    )
-
-    logger.info("Polished resume generated: %s → %s", job_id[:8], output_path)
-    return output_path, polish_json
+    return generate_asset_via_api(job_id, "polish")
 
 
 def _next_version_path(folder: Path, stem: str, suffix: str) -> Path:
@@ -945,6 +735,208 @@ def _load_ondemand_context(job_id: str) -> tuple[dict, str, str, str, Path, dict
         output_path.mkdir(parents=True, exist_ok=True)
 
     return listing, profile_text, resume_text, research_context, output_path, assets_json
+
+
+# ---------------------------------------------------------------------------
+# On-demand asset registry
+# ---------------------------------------------------------------------------
+#
+# The four secondary generators are the same three steps in different
+# costumes: load context -> build a prompt -> parse one JSON key -> write
+# artifacts. Splitting build from write is what lets a caller serve the middle
+# step from somewhere other than OpenRouter — the in-session route the CLI
+# already uses for the full tailor. Registering them as data rather than
+# forking each function keeps one implementation for four assets, so a new
+# asset is an entry, not a new code path.
+#
+# Names match the `generate_assets` vocabulary (profile.md Pipeline Settings,
+# GENERATE_ASSETS) rather than minting a second set.
+
+
+@dataclass(frozen=True)
+class AssetSpec:
+    """One on-demand asset: how to prompt for it, and what to do with it."""
+
+    name: str
+    stage: str                       # metering stage (src/model_usage.py)
+    max_tokens: int
+    response_key: str                # the JSON key the model must return
+    needs_tailor_first: bool = False  # polish integrates a prior tailor's edits
+    takes_questions: bool = False     # answers is the only parameterised one
+
+
+ASSET_SPECS: dict[str, AssetSpec] = {
+    "polish": AssetSpec(
+        name="polish", stage="tailor_polish", max_tokens=4096,
+        response_key="polished_resume_text", needs_tailor_first=True,
+    ),
+    "cover_letter": AssetSpec(
+        name="cover_letter", stage="tailor_coverletter", max_tokens=2048,
+        response_key="clean_cover_letter_text",
+    ),
+    "interview_prep": AssetSpec(
+        name="interview_prep", stage="tailor_prep", max_tokens=2048,
+        response_key="interview_prep_guide",
+    ),
+    "answers": AssetSpec(
+        name="answers", stage="tailor_answers", max_tokens=1024,
+        response_key="custom_question_answers", takes_questions=True,
+    ),
+}
+
+
+def build_asset_prompt(
+    job_id: str, asset: str, *, custom_questions: str = "",
+) -> tuple[str, dict]:
+    """Build the prompt for one on-demand asset. No network, no spend.
+
+    Returns ``(prompt, listing)``. Research is read from cache only — an
+    on-demand asset never runs Deep Research, so a missing dossier becomes a
+    stated absence in the prompt rather than a live search.
+
+    Raises:
+        KeyError: unknown asset name.
+        ValueError: listing not found.
+        RuntimeError: asset requires a prior tailor pass that has not run.
+    """
+    spec = ASSET_SPECS[asset]
+    listing, profile_text, resume_text, research, _out, assets_json = (
+        _load_ondemand_context(job_id)
+    )
+    if spec.needs_tailor_first and not assets_json:
+        raise RuntimeError(
+            f"No tailor assets found for {job_id[:8]}. Run a tailor pass first."
+        )
+    research = research or "(No research context available)"
+    common = {
+        "profile": profile_text,
+        "resume": resume_text,
+        "title": listing.get("title", "Unknown"),
+        "company": listing.get("company", "Unknown"),
+        "location": listing.get("location", "not specified"),
+        "research_context": research,
+    }
+
+    if asset == "cover_letter":
+        template = read_dropzone_file("cover_letter") or ""
+        style = (
+            "\n## Cover Letter Style Reference\n" + template + "\n"
+            if template else ""
+        )
+        prompt = _COVER_LETTER_PROMPT.format(
+            cover_letter_style=style,
+            tailor_context=_format_tailor_context(assets_json),
+            **common,
+        )
+    elif asset == "interview_prep":
+        prompt = _INTERVIEW_PREP_PROMPT.format(
+            tailor_context=_format_tailor_context(assets_json), **common,
+        )
+    elif asset == "answers":
+        prompt = _ANSWER_PROMPT.format(
+            custom_questions=custom_questions, **common,
+        )
+    else:  # polish
+        prompt = _POLISH_RESUME_PROMPT.format(
+            profile=profile_text, resume=resume_text,
+            title=common["title"], company=common["company"],
+            executive_summary=(
+                assets_json.get("executive_summary_rewrite", "").strip() or "(none)"
+            ),
+            bullet_edits=_format_bullet_edits(
+                assets_json.get("resume_bullet_edits", [])
+            ),
+            other_suggestions=(
+                assets_json.get("other_suggestions", "").strip() or "(none)"
+            ),
+            research_context=research,
+        )
+    return prompt, listing
+
+
+def parse_asset_response(asset: str, text: str) -> dict:
+    """Parse a model response for one asset into its JSON payload."""
+    spec = ASSET_SPECS[asset]
+    if asset == "answers":
+        return _parse_answers_response(text)
+    return _parse_single_asset_response(text, spec.response_key)
+
+
+def write_asset(job_id: str, asset: str, parsed: dict) -> Path:
+    """Write one asset's artifacts to the job's output folder. No spend.
+
+    Document files are versioned (``_v2``, ``_v3``, …) so a re-run never
+    overwrites a copy you may already have sent; the JSON sidecar is always
+    overwritten because the latest parse is canonical.
+    """
+    listing, _p, _r, _rc, output_path, _a = _load_ondemand_context(job_id)
+    company = listing.get("company", "company")
+    title = listing.get("title", "role")
+    company_slug = re.sub(r"[^\w]+", "_", company).strip("_")
+
+    if asset == "cover_letter":
+        text = parsed.get("clean_cover_letter_text", "")
+        if text:
+            from src.compile import _generate_cover_letter
+            dest = _next_version_path(
+                output_path, f"Cover_Letter_{company_slug}", ".docx")
+            _generate_cover_letter(dest, text, title, company)
+        (output_path / "cover_letter.json").write_text(
+            json.dumps(parsed, indent=2), encoding="utf-8")
+    elif asset == "interview_prep":
+        text = parsed.get("interview_prep_guide", "")
+        if text:
+            dest = _next_version_path(
+                output_path, f"Interview_Prep_{company_slug}", ".md")
+            dest.write_text(
+                f"# Interview Prep: {title} at {company}\n\n{text}\n",
+                encoding="utf-8")
+        (output_path / "interview_prep.json").write_text(
+            json.dumps(parsed, indent=2), encoding="utf-8")
+    elif asset == "answers":
+        _save_custom_answers(output_path, company_slug, parsed)
+    else:  # polish
+        text = parsed.get("polished_resume_text", "")
+        if text:
+            from src.compile import _write_polished_resume_docx
+            dest = _next_version_path(
+                output_path, f"Polished_Resume_{company_slug}", ".docx")
+            _write_polished_resume_docx(dest, text)
+        (output_path / "polished_resume.json").write_text(
+            json.dumps(parsed, indent=2), encoding="utf-8")
+    return output_path
+
+
+def generate_asset_via_api(
+    job_id: str, asset: str, *, custom_questions: str = "",
+) -> tuple[Path, dict]:
+    """Metered route: build -> OpenRouter -> parse -> write."""
+    spec = ASSET_SPECS[asset]
+    prompt, _listing = build_asset_prompt(
+        job_id, asset, custom_questions=custom_questions)
+    client = _get_openrouter_client()
+    logger.info("Calling OpenRouter API (%s) for listing %s...", asset, job_id[:8])
+    response_text = _call_openrouter(
+        client, prompt, max_tokens=spec.max_tokens, stage=spec.stage)
+    parsed = parse_asset_response(asset, response_text)
+    output_path = write_asset(job_id, asset, parsed)
+    logger.info("%s generated: %s → %s", asset, job_id[:8], output_path)
+    return output_path, parsed
+
+
+def _format_bullet_edits(bullet_edits_raw) -> str:
+    """Render a prior tailor's bullet edits as prompt text."""
+    if not isinstance(bullet_edits_raw, list):
+        return str(bullet_edits_raw) if bullet_edits_raw else "(none)"
+    lines = []
+    for edit in bullet_edits_raw:
+        if isinstance(edit, dict):
+            lines.append(
+                f"- Original: {edit.get('original_bullet', '')}\n"
+                f"  Edit:     {edit.get('slack_diff', '')}\n"
+                f"  Final:    {edit.get('clean_bullet', '')}"
+            )
+    return "\n".join(lines) if lines else "(none)"
 
 
 def _strip_code_fence(text: str) -> str:

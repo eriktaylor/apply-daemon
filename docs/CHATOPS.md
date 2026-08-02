@@ -200,19 +200,24 @@ After processing in either context, the sweeper places a ✅ reaction on the rep
 
 ## Labor Market Intelligence (`!trend`)
 
-Post `!trend` in the main channel to get a skill frequency report across your most recent scored jobs:
+Post `!trend` in the main channel to get a skill frequency report across your recent scored jobs:
 
 ```
-!trend                # default: last 100 jobs
+!trend                # default: 100 jobs per pipeline_status
 !trend --deep 250     # widen the window (10 ≤ N ≤ 500)
 ```
 
-The bot splits the last *N* scored jobs into three cohorts and posts a monospace trend report as a thread reply:
+*N* is **per `pipeline_status`, not a global window.** Ingestion outruns
+decisions by orders of magnitude, so a global "most recent N" is all fresh
+intake — the decided rows carrying the signal fall outside it and the report
+quietly covers one cohort while looking like it covered three.
+
+The bot splits the sampled jobs into three cohorts and posts a monospace trend report as a thread reply:
 
 | Cohort | Definition |
 |--------|-----------|
 | **High Intent** | `pipeline_status` in `saved / tailored / applied / interviewing` |
-| **Pipeline** | Scored YES or MAYBE but not yet saved (`triaged`) |
+| **Pipeline** | Scored YES or MAYBE and awaiting a decision (`db.REVIEW_STATUSES`) |
 | **Rejected** | Scored NO or user-passed (`passed / rejected`) |
 
 For each cohort, the report shows **top 10 matched skills** (skills you have that the role requires) and **top 10 missing skills** (skill gaps). Each row also shows the share of that cohort that mentioned the skill, so you can compare across cohorts of different sizes (e.g. "Python in High Intent at 60%" vs. "Python in Rejected at 18%").
@@ -221,7 +226,8 @@ Before counting, the bot sends each cohort's raw skill arrays to `OPENROUTER_TRE
 
 ### When to use `--deep`
 
-The default 100-job window is roughly one busy day's worth of agent output. Reach for `--deep N` when:
+The default samples 100 rows per status — roughly one busy day of intake, and
+usually every decided row you have. Reach for `--deep N` when:
 
 - The agent posted a heavy batch (100+ jobs in a single push) and you want trends across multiple days.
 - You want to see how the gap distribution evolves with more samples (smaller cohorts can be noisy).

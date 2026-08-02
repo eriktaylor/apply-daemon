@@ -24,7 +24,8 @@ python -m src.jobspy_ingest     # Track A: proactive JobSpy scrape
 python -m src.pipeline          # Track B: email ingestion
 python -m src.digest            # Post Slack digest cards
 python -m src.sweeper           # Process Slack reactions + ChatOps commands
-python -m src.cli status        # CLI review surface (also: refresh/next/show/deep-dive/save/pass/tailor)
+python -m src.cli status        # CLI review surface (also: refresh/next/show/deep-dive/save/pass)
+                                # tailor + polish/cover-letter/interview-prep/answers: in-session by default
 python -m src.batch_process     # Concurrent tailor for all saved listings
 python -m src.process_queue     # Autopilot Speculative Agent (no-op unless AUTOPILOT_ENABLED=true)
 python -m src.process_queue --backfill        # Promote existing YES/MAYBE into autopilot queue
@@ -67,7 +68,7 @@ apply-daemon/
 │   ├── sweeper.py               # Reaction sweeper + ChatOps parser. Priority: pass > tailor > save. Idempotent.
 │   │                            # THREAD COMMANDS ARE FROZEN — see Conventions.
 │   ├── human_labels.py          # Shared human-feedback ledger writer (data/human_labels.jsonl)
-│   ├── cli.py                   # CLI review surface (status/next/show/deep-dive/save/pass/tailor). Local-only except tailor --via api.
+│   ├── cli.py                   # CLI review surface (status/next/show/deep-dive/save/pass/tailor + 4 asset verbs). Local-only except --via api.
 │   ├── decisions.py             # Shared decision policy (verb→status, guard) for every surface
 │   ├── listing_card.py          # Card contract: the one field set every review surface renders
 │   ├── budget.py                # Spend ceilings: daily USD cap, run cooldown, projection (refuse-and-report)
@@ -129,8 +130,11 @@ straight into the first page (`page` in its JSON), so "anything good today?"
 is a single call, not a sequence. Any new verb that produces listings should
 chain the same way rather than telling the user to run something else.
 
-**Reviewing is free; only `refresh` and `tailor --via api` spend metered
-money.**
+**Reviewing is free; only `refresh` and `--via api` spend metered money.**
+The four on-demand assets (`polish`, `cover-letter`, `interview-prep`,
+`answers`) share `tailor`'s emit/apply handshake and `src/tailor.py`'s
+`ASSET_SPECS` registry — a new asset is an entry there plus a row in
+`cli._ASSET_VERBS`, never a new code path.
 Enrichment is pre-cached by autopilot, and tailoring runs in-session. Keep it
 that way: a read verb that makes a network call breaks the conversational
 loop's latency and its cost story at once.

@@ -33,6 +33,26 @@ class PipelineSummary:
     auto_match_listings: list[dict] | None = None
 
 
+# Slack rejects the whole message when any section's text exceeds 3000 chars,
+# so an over-long field does not degrade — it drops the post. Leave headroom
+# for the surrounding formatting each caller adds.
+SLACK_SECTION_TEXT_MAX = 2900
+
+
+def fit_section_text(text: str, *, limit: int = SLACK_SECTION_TEXT_MAX) -> str:
+    """Trim *text* to fit one Slack section block, marking the cut.
+
+    Every caller building a section from model output needs this: LLM output
+    length is unbounded, and the failure is a rejected message rather than a
+    clipped one.
+    """
+    text = text or ""
+    if len(text) <= limit:
+        return text
+    marker = "\n_(truncated)_"
+    return text[: limit - len(marker)].rstrip() + marker
+
+
 def _get_slack_config() -> tuple[str | None, str | None]:
     """Load Slack configuration from environment."""
     load_dotenv()

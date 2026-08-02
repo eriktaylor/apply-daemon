@@ -87,6 +87,17 @@ _PAST_TENSE = {"save": "Saved", "pass": "Passed"}
 # argument-parsing concern, deliberately not derived from DECISIONS.
 _BULK_CAPABLE_VERBS = ("save", "pass")
 
+# On-demand asset verbs: (wire name, help). The asset key each maps to is the
+# `generate_assets` vocabulary — src/tailor.py::ASSET_SPECS owns the specs, so
+# this table carries presentation only.
+_ASSET_VERBS = (
+    ("polish", "Polish the resume into a final document (needs a prior tailor)"),
+    ("cover-letter", "Write a cover letter from profile + resume + research"),
+    ("interview-prep", "Build an interview prep guide"),
+    ("answers", "Answer application questions (--questions)"),
+)
+_ASSET_VERB_NAMES = {verb: verb.replace("-", "_") for verb, _ in _ASSET_VERBS}
+
 # The ingestion sequence, in order. THE definition — script.sh wraps this
 # verb rather than repeating the chain (R-1). digest runs twice on purpose:
 # once after each track, so Slack sees Track A's listings without waiting on
@@ -726,6 +737,87 @@ def cmd_deep_dive(db: Database, job_id: str, as_json: bool) -> int:
     return 0
 
 
+def cmd_asset(db: Database, job_id: str, asset: str, *, apply_from: str | None,
+              via_api: bool, questions: str, as_json: bool) -> int:
+    """Generate one on-demand asset — same handshake as the full tailor.
+
+    polish / cover_letter / interview_prep / answers were previously
+    reachable only through Slack ChatOps, which is unattended and therefore
+    metered. They are the expensive half of a listing's cost, so the route
+    that matters is the in-session one; ``src/tailor.py``'s asset registry
+    owns everything except which side answers the prompt.
+    """
+    from src.tailor import (
+        ASSET_SPECS,
+        build_asset_prompt,
+        generate_asset_via_api,
+        parse_asset_response,
+        write_asset,
+    )
+
+    spec = ASSET_SPECS[asset]
+    if db.get_listing_by_id(job_id) is None:
+        _emit({"verb": asset, "ok": False, "error": "not_found", "id": job_id},
+              as_json, f"No listing with id {job_id}")
+        return 1
+    if spec.takes_questions and not questions and apply_from is None:
+        _emit({"verb": asset, "ok": False, "error": "questions_required",
+               "id": job_id},
+              as_json, "This asset needs --questions '<the application questions>'")
+        return 1
+
+    def _fail(error: str, exc: Exception) -> int:
+        _emit({"verb": asset, "ok": False, "error": error, "id": job_id,
+               "detail": str(exc)},
+              as_json, f"{asset} failed: {exc}")
+        return 1
+
+    if via_api:
+        try:
+            folder, _ = generate_asset_via_api(
+                job_id, asset, custom_questions=questions)
+        except Exception as exc:
+            logger.error("%s via API failed for %s: %s", asset, job_id[:8], exc)
+            return _fail("api_failed", exc)
+        _emit({"verb": asset, "ok": True, "id": job_id, "route": "api",
+               "folder": str(folder)},
+              as_json, f"{asset} via OpenRouter → {folder}")
+        return 0
+
+    if apply_from is not None:
+        raw = sys.stdin.read() if apply_from == "-" else _read_text(Path(apply_from))
+        if not raw:
+            _emit({"verb": asset, "ok": False, "error": "empty_input",
+                   "id": job_id},
+                  as_json, "No JSON received to apply.")
+            return 1
+        try:
+            parsed = parse_asset_response(asset, raw)
+            folder = write_asset(job_id, asset, parsed)
+        except (RuntimeError, ValueError) as exc:
+            return _fail("invalid_response", exc)
+        _emit({"verb": asset, "ok": True, "id": job_id, "route": "in_session",
+               "folder": str(folder)},
+              as_json, f"{asset} written in-session → {folder}")
+        return 0
+
+    try:
+        prompt, _listing = build_asset_prompt(
+            job_id, asset, custom_questions=questions)
+    except (RuntimeError, ValueError) as exc:
+        return _fail("unavailable", exc)
+    apply_cmd = f"python -m src.cli {asset.replace('_', '-')} {job_id} --apply -"
+    _emit(
+        {"verb": asset, "ok": True, "id": job_id, "route": "in_session",
+         "stage": "prompt", "prompt": prompt,
+         "research_cached": bool(_cached_research(job_id)),
+         "apply_with": apply_cmd},
+        as_json,
+        f"{prompt}\n\n---\nAnswer the above as JSON, then pipe it to:\n  {apply_cmd}",
+    )
+    return 0
+
+
 def cmd_tailor(db: Database, job_id: str, *, apply_from: str | None,
                via_api: bool, as_json: bool) -> int:
     """Tailor a resume — in-session by default, via OpenRouter on request.
@@ -940,6 +1032,24 @@ def build_parser() -> argparse.ArgumentParser:
         "--via", choices=("session", "api"), default="session",
         help="session (default, subscription-billed) or api (OpenRouter)")
 
+    # On-demand assets. Same three flags as `tailor` because they are the same
+    # handshake — a verb that is correct alone but tells a different story
+    # than its neighbours is a defect. Hyphens on the wire, underscores
+    # internally (the generate_assets vocabulary).
+    for verb, helptext in _ASSET_VERBS:
+        p = sub.add_parser(verb, parents=[common], help=helptext)
+        p.add_argument("id")
+        p.add_argument(
+            "--apply", dest="apply_from", metavar="PATH",
+            help="Apply model JSON from PATH ('-' for stdin) and write assets")
+        p.add_argument(
+            "--via", choices=("session", "api"), default="session",
+            help="session (default, subscription-billed) or api (OpenRouter)")
+        if verb == "answers":
+            p.add_argument(
+                "--questions", default="",
+                help="The application questions to answer")
+
     for verb, helptext in (("save", "Mark a listing saved"),
                            ("pass", "Mark a listing passed")):
         p = sub.add_parser(verb, parents=[common], help=helptext)
@@ -978,6 +1088,14 @@ def main(argv: list[str] | None = None) -> int:
             return cmd_show(db, args.id, args.json)
         if args.verb == "deep-dive":
             return cmd_deep_dive(db, args.id, args.json)
+        if args.verb in _ASSET_VERB_NAMES:
+            return cmd_asset(
+                db, args.id, _ASSET_VERB_NAMES[args.verb],
+                apply_from=args.apply_from,
+                via_api=(args.via == "api"),
+                questions=getattr(args, "questions", ""),
+                as_json=args.json,
+            )
         if args.verb == "tailor":
             return cmd_tailor(db, args.id, apply_from=args.apply_from,
                               via_api=args.via == "api", as_json=args.json)

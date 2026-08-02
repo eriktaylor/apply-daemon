@@ -31,6 +31,7 @@ from pathlib import Path
 import pytest
 
 SRC = Path(__file__).resolve().parent.parent / "src"
+EVAL = Path(__file__).resolve().parent.parent / "eval"
 
 # (concept, owning module, regex that betrays an implementation of it)
 OWNERSHIP: list[tuple[str, str, str]] = [
@@ -74,15 +75,33 @@ OWNERSHIP: list[tuple[str, str, str]] = [
         "listing_card.py",
         r"len\(matching\)\s*[/+]|matched\s*/\s*total",
     ),
+    (
+        "which stored field is the job description",
+        "models.py",
+        r'"raw_email_text",\s*"job_summary"',
+    ),
+]
+
+# Patterns no module may contain, with the reason. Distinct from OWNERSHIP:
+# these have no owner — the shape itself is the defect.
+BANNED: list[tuple[str, str]] = [
+    (
+        r'job_summary"[^\n]*\bor\b[^\n]*"reason"',
+        "Reading the job description as `job_summary or reason` falls back to "
+        "the Stage 5 model's own justification, so a downstream consumer ends "
+        "up scoring the incumbent's reasoning instead of the job. Use "
+        "models.job_description_text().",
+    ),
 ]
 
 
-def _modules_matching(pattern: str) -> set[str]:
+def _modules_matching(pattern: str, roots: tuple[Path, ...] = (SRC,)) -> set[str]:
     rx = re.compile(pattern)
     hits = set()
-    for path in sorted(SRC.glob("*.py")):
-        if rx.search(path.read_text(encoding="utf-8")):
-            hits.add(path.name)
+    for root in roots:
+        for path in sorted(root.glob("*.py")):
+            if rx.search(path.read_text(encoding="utf-8")):
+                hits.add(path.name)
     return hits
 
 
@@ -111,3 +130,10 @@ def test_owner_still_implements_it(concept: str, owner: str, pattern: str) -> No
         f"Pattern for {concept!r} no longer matches its owner src/{owner} — "
         f"the registry entry is stale and is now protecting nothing."
     )
+
+
+@pytest.mark.parametrize("pattern,why", BANNED, ids=[row[0][:32] for row in BANNED])
+def test_banned_pattern_absent(pattern: str, why: str) -> None:
+    # eval/ is in scope: the original offender for the first entry lived there.
+    offenders = _modules_matching(pattern, roots=(SRC, EVAL))
+    assert not offenders, f"{', '.join(sorted(offenders))}: {why}"

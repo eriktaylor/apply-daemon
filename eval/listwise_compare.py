@@ -39,6 +39,7 @@ load_dotenv()
 from src.db import Database
 from src.listing_card import parse_skill_list
 from src.model_usage import log_response_usage
+from src.models import job_description_text
 from src.triage import get_confidence_threshold, get_openrouter_config
 
 logger = logging.getLogger(__name__)
@@ -133,7 +134,11 @@ def _post_research_verdict(job_id: str) -> str | None:
 
 
 def _format_listing(row) -> str:
-    desc = (row["job_summary"] or row["reason"] or "")[:1200]
+    # Same text and width production sends (triage.prescore_batch). Before,
+    # this fed the ~290-char job_summary, so every recorded listwise number
+    # measured a handicapped arm against pointwise verdicts produced from the
+    # full description.
+    desc = job_description_text(row)
     return (
         f"### id: {row['id']}\n"
         f"Title: {row['title']}\n"
@@ -296,9 +301,12 @@ def run(limit: int, batch: int, dry_run: bool, gold_only: bool = False,
     with Database() as db:
         rows = db.conn.execute(
             "SELECT * FROM listings WHERE verdict IS NOT NULL "
-            "AND job_summary IS NOT NULL AND job_summary != '' "
             "ORDER BY date_ingested DESC",
         ).fetchall()
+    # Eligibility is "has a body we can score", which is the same question
+    # _format_listing answers — asking it in SQL against one column drifts the
+    # moment the answer changes.
+    rows = [r for r in rows if job_description_text(r)]
     if gold_only or emit or apply_dir:
         rows = [r for r in rows if r["id"][:8] in gold]
     rows = rows[:limit]

@@ -763,18 +763,31 @@ class Database:
         ).fetchall()
 
     def get_trend_skills(self, limit: int = 100) -> list[sqlite3.Row]:
-        """Fetch the most recent processed jobs for skill trend analysis.
+        """Fetch recent processed jobs for skill trend analysis.
 
-        Returns rows with verdict, pipeline_status, matching_skills, missing_skills.
-        Only includes rows where at least one skills field is populated.
+        ``limit`` is per ``pipeline_status``, not global. A global recency
+        window silently starves the report: ingestion outpaces decisions by
+        two orders of magnitude, so the newest N rows are entirely fresh
+        intake and the decided rows that carry the human signal — the whole
+        point of the high_intent/rejected contrast — never appear. Sampling
+        per status keeps every cohort represented however lopsided intake is.
+
+        Returns rows with verdict, pipeline_status, matching_skills,
+        missing_skills. Only includes rows where at least one skills field is
+        populated.
         """
         return self.conn.execute(
             """
             SELECT verdict, pipeline_status, matching_skills, missing_skills
-            FROM listings
-            WHERE matching_skills IS NOT NULL OR missing_skills IS NOT NULL
-            ORDER BY date_ingested DESC
-            LIMIT ?
+            FROM (
+                SELECT verdict, pipeline_status, matching_skills, missing_skills,
+                       ROW_NUMBER() OVER (
+                           PARTITION BY pipeline_status ORDER BY date_ingested DESC
+                       ) AS rn
+                FROM listings
+                WHERE matching_skills IS NOT NULL OR missing_skills IS NOT NULL
+            )
+            WHERE rn <= ?
             """,
             (limit,),
         ).fetchall()

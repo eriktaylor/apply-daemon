@@ -20,7 +20,12 @@ import openai
 from dotenv import load_dotenv
 
 from src.model_usage import log_model_usage
-from src.models import JobListing
+from src.models import (
+    FULL_JOB_DESCRIPTION_CHARS,
+    JOB_DESCRIPTION_CHARS,
+    JobListing,
+    job_description_text,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -312,6 +317,33 @@ _NULL_LOCATION_VALUES = frozenset({
 # ---------------------------------------------------------------------------
 # Config helpers
 # ---------------------------------------------------------------------------
+
+# Consecutive anchor rejections before the anchor is switched off for the rest
+# of a run. A reshuffle only recovers composition-dependent drift; past this,
+# the run is paying listwise + retry + pointwise per listing to learn nothing.
+_MAX_CONSECUTIVE_REJECTIONS = 2
+
+
+def _ordering_score(item: dict) -> int:
+    """Collapse (verdict, confidence) into one signed desirability scale.
+
+    `confidence` alone cannot be ordered across verdicts: it measures
+    certainty in the verdict given, so a confident NO and a confident YES both
+    score ~95 while sitting at opposite ends of desirability. NO maps negative,
+    MAYBE to the middle, YES positive — the ordering the ranking surfaces
+    actually care about.
+    """
+    try:
+        conf = int(item.get("confidence", 0) or 0)
+    except (TypeError, ValueError):
+        conf = 0
+    verdict = str(item.get("verdict", "") or "").strip().upper()
+    if verdict == "NO":
+        return -conf
+    if verdict == "YES":
+        return conf
+    return 0  # MAYBE, or anything unparseable: neither endorsed nor rejected
+
 
 def get_openrouter_config() -> tuple[str, str]:
     """Load OpenRouter configuration from environment.
@@ -1192,7 +1224,7 @@ class TriageSession:
         """
         # Choose the richest description available for the evaluation prompt
         if job_text and len(job_text) > len(anchor.description or "") + 100:
-            description = job_text[:4000].strip()
+            description = job_text[:FULL_JOB_DESCRIPTION_CHARS].strip()
         else:
             description = (anchor.description or job_text[:1000]).strip()
 
@@ -1258,12 +1290,33 @@ class TriageSession:
 
     # M-5.1: a synthetic anchor that needs no trust and no ledger. Deliberately
     # absurd for this profile, so any competent scorer ranks it last — which is
-    # what makes it a usable *ordering* reference from a cold start.
+    # what makes it a usable *ordering* reference from a cold start. Its
+    # description is deliberately as long as a real listing's: a scorer that
+    # discounts thin evidence would rank a one-liner last for a reason that has
+    # nothing to do with the match, and the ordering check would pass without
+    # testing anything.
     _SYNTHETIC_WEAK = (
         "Line Cook (Seasonal)",
         "Harbourside Grill",
-        "Prepare short-order breakfast dishes on a seasonal beachfront rota. "
-        "No computer work. Must lift 20kg and stand for eight-hour shifts.",
+        "Harbourside Grill is a family-owned beachfront restaurant serving classic "
+        "short-order breakfast and lunch from May through September. We are hiring a "
+        "seasonal line cook to join our back-of-house team for the summer rush. You "
+        "will work the flat-top and fryer stations, plate short-order breakfast "
+        "dishes to spec, and keep your station stocked, clean, and inspection-ready "
+        "through double-shift weekends. Responsibilities include prepping mise en "
+        "place before service, executing tickets quickly and consistently during "
+        "peak hours, rotating and labeling stock, following food-safety and allergen "
+        "procedures, breaking down and deep-cleaning stations at close, and "
+        "assisting with weekly inventory counts. Requirements: two or more summers "
+        "of line experience in a high-volume kitchen; comfort working a busy "
+        "flat-top; a current food-handler card or willingness to obtain one in the "
+        "first week; ability to lift 20 kg, stand for eight-hour shifts, and work "
+        "weekends and holidays without exception. No computer work is involved in "
+        "this role. Pay is hourly plus a share of pooled tips, with a "
+        "season-completion bonus paid after Labor Day. Housing is not provided; "
+        "reliable transportation to the waterfront is required. This posting is for "
+        "on-site work only. To apply, drop off a resume between 2 and 4 pm on "
+        "weekdays or email the kitchen manager.",
     )
 
     def _select_anchor(self) -> tuple["ExtractedListing", str, str] | None:
@@ -1314,7 +1367,15 @@ class TriageSession:
             with Database() as db:
                 for job_id, expected in reversed(decisions):   # most recent first
                     row = db.get_listing_by_id(job_id)
-                    if row is None or not (row["job_summary"] or ""):
+                    if row is None:
+                        continue
+                    # Full description, not job_summary. The anchor is scored
+                    # alongside listings carrying ~2000 chars each; a ~290-char
+                    # TL;DR is thin by a factor of seven, and a model that
+                    # reads evidence density would discount the anchor for a
+                    # reason that has nothing to do with the match.
+                    description = job_description_text(row)
+                    if not description:
                         continue
                     return (
                         ExtractedListing(
@@ -1322,7 +1383,7 @@ class TriageSession:
                             location=row["location"] or "",
                             salary=row["salary"] or "",
                         ),
-                        row["job_summary"],
+                        description,
                         expected,
                     )
         except Exception:
@@ -1360,17 +1421,19 @@ class TriageSession:
         batches = 0
         incomplete = 0
         rejected = 0
+        consecutive_rejections = 0
         retry: list[list] = []
         anchor_confidences: list[int] = []
         for start in range(0, len(items), size):
             chunk = items[start:start + size]
             batches += 1
             before = scored
-            # The anchor rides in every batch, formatted identically to the
-            # real listings so the model cannot treat it specially. It costs
-            # one slot (~10% at batch 10) and buys a per-batch calibration
-            # check: confidence is meaningful *within* a batch, and without a
-            # fixed reference nothing detects drift across batches.
+            # The anchor and its weak counterpart ride in every batch,
+            # formatted identically to the real listings so the model cannot
+            # treat them specially. Together they cost two slots (~17% at
+            # batch 10) and buy a per-batch calibration check: confidence is
+            # meaningful *within* a batch, and without a fixed reference
+            # nothing detects drift across batches.
             scoring = list(chunk)
             if anchor:
                 scoring.append((anchor[0], anchor[1]))
@@ -1380,7 +1443,7 @@ class TriageSession:
                 f"### id: {self._batch_key(a)}\n"
                 f"Title: {a.title}\nCompany: {a.company}\n"
                 f"Location: {a.location}\nSalary: {a.salary}\n"
-                f"Description: {(desc or '')[:2000]}\n"
+                f"Description: {(desc or '')[:JOB_DESCRIPTION_CHARS]}\n"
                 for a, desc in scoring
             )
             prompt = _LISTWISE_EVAL_PROMPT.format(
@@ -1437,24 +1500,51 @@ class TriageSession:
                     # listing above one the user actually saved is
                     # miscalibrated in the only way that matters for
                     # rank-based selection.
+                    #
+                    # Compare on the SIGNED scale. `confidence` is certainty in
+                    # whatever verdict was given, not desirability: a line-cook
+                    # posting is an obvious NO and scores 95-100 on it. Comparing
+                    # raw confidence therefore rejected every batch — a
+                    # confident NO always outscores a merely-strong YES — which
+                    # is exactly what happened in production on 2026-08-02: four
+                    # batches, four rejections, four retries into the same wall,
+                    # and 40 listings paying for listwise *and* pointwise.
                     bad_order = False
                     if wgot is not None:
-                        try:
-                            wconf = int(wgot.get("confidence", 0) or 0)
-                        except (TypeError, ValueError):
-                            wconf = 0
-                        if anchor[2] == "YES" and wconf >= aconf:
+                        wscore = _ordering_score(wgot)
+                        ascore = _ordering_score(got)
+                        if anchor[2] == "YES" and wscore >= ascore:
                             bad_order = True
-                            reason = (f"weak reference scored {wconf} >= "
-                                      f"anchor {aconf}")
+                            reason = (f"weak reference ranked {wscore:+d} >= "
+                                      f"anchor {ascore:+d}")
                     if bad_order:
                         rejected += 1
+                        consecutive_rejections += 1
                         logger.warning(
                             "Listwise batch %d REJECTED — %s. Retrying with a "
                             "reshuffled composition.", batches, reason,
                         )
                         retry.append(chunk)
+                        # A reshuffle varies composition, which only helps when
+                        # the miscalibration is composition-dependent. A run
+                        # that rejects this consistently is failing for a
+                        # reason the retry cannot reach, and every further
+                        # anchored batch bills listwise + retry + pointwise for
+                        # the same listings. Stop anchoring and let the rest of
+                        # the run proceed unanchored — the documented
+                        # no-usable-label behaviour.
+                        if consecutive_rejections >= _MAX_CONSECUTIVE_REJECTIONS:
+                            logger.error(
+                                "Listwise anchor rejected %d batches in a row — "
+                                "disabling the anchor for the rest of this run. "
+                                "Calibration is unverified from here; check the "
+                                "anchor listing and the ordering check.",
+                                consecutive_rejections,
+                            )
+                            anchor = None
+                            weak = None
                         continue
+                    consecutive_rejections = 0
 
             for item in parsed.values():
                 key = str(item["id"]).strip().lower()
@@ -1498,14 +1588,19 @@ class TriageSession:
             for chunk in retry:
                 shuffled = list(chunk)
                 random.shuffle(shuffled)
-                scoring = shuffled + [(anchor[0], anchor[1])]
+                scoring = list(shuffled)
+                # anchor/weak may have been switched off by the circuit
+                # breaker after this chunk was queued; retry unanchored rather
+                # than not at all.
+                if anchor:
+                    scoring.append((anchor[0], anchor[1]))
                 if weak:
                     scoring.append(weak)
                 block = "\n".join(
                     f"### id: {self._batch_key(a)}\n"
                     f"Title: {a.title}\nCompany: {a.company}\n"
                     f"Location: {a.location}\nSalary: {a.salary}\n"
-                    f"Description: {(desc or '')[:2000]}\n"
+                    f"Description: {(desc or '')[:JOB_DESCRIPTION_CHARS]}\n"
                     for a, desc in scoring
                 )
                 try:

@@ -229,6 +229,21 @@ class TestClassifyTrendCohort:
         assert _classify_trend_cohort(_row("triaged", "YES")) == "pipeline"
         assert _classify_trend_cohort(_row("triaged", "MAYBE")) == "pipeline"
 
+    @pytest.mark.parametrize("status", ["auto_queued", "auto"])
+    def test_pipeline_covers_autopilot_statuses(self, status):
+        """Regression: these two are ~92% of a live table and used to return
+        None, so !trend classified 0 of its most recent 100 rows while still
+        posting a report."""
+        assert _classify_trend_cohort(_row(status, "YES")) == "pipeline"
+        assert _classify_trend_cohort(_row(status, "MAYBE")) == "pipeline"
+
+    def test_pipeline_tracks_review_statuses(self):
+        """Awaiting-a-decision is REVIEW_STATUSES; drift between the two is
+        what broke the report last time."""
+        from src.db import REVIEW_STATUSES
+        for status in REVIEW_STATUSES:
+            assert _classify_trend_cohort(_row(status, "YES")) == "pipeline"
+
     def test_rejected_by_no_verdict(self):
         assert _classify_trend_cohort(_row("triaged", "NO")) == "rejected"
 

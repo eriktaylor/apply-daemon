@@ -4,7 +4,8 @@ import json
 
 import pytest
 
-from src.tailor import _parse_tailor_response, _save_assets
+from src.models import job_description_text
+from src.tailor import _TAILOR_PROMPT, _parse_tailor_response, _save_assets
 
 
 class TestParseTailorResponse:
@@ -137,3 +138,44 @@ class TestSaveAssets:
         assert "big_corp" in output.name
         assert "staff_engineer" in output.name
         assert "job12345" in output.name
+
+
+class TestTailorPromptGrounding:
+    """The tailored resume is written against whatever this prompt carries.
+    It used to carry a ~290-char summary under a field labelled 'Full
+    Description', so bullets were rewritten against requirements the model
+    never read."""
+
+    @staticmethod
+    def _listing(**overrides) -> dict:
+        listing = {
+            "title": "Applied AI Engineer",
+            "company": "Acme",
+            "location": "Oakland, CA",
+            "salary": "not listed",
+            "raw_email_text": "Owns evaluation harnesses. Requires Rust and CUDA.",
+            "job_summary": "Acme is a Series B lab. The role owns evaluation.",
+            "reason": "Strong match on agentic AI experience.",
+        }
+        listing.update(overrides)
+        return listing
+
+    def _render(self, listing: dict) -> str:
+        return _TAILOR_PROMPT.format(
+            profile="profile", resume="resume", cover_letter_style="",
+            title=listing["title"], company=listing["company"],
+            location=listing["location"], salary=listing["salary"],
+            job_description=job_description_text(listing) or "(No job description was stored.)",
+            research_section="", questions_section="", asset_instructions="",
+        )
+
+    def test_sends_the_job_description(self):
+        assert "Requires Rust and CUDA." in self._render(self._listing())
+
+    def test_never_sends_the_incumbent_models_reasoning(self):
+        prompt = self._render(self._listing())
+        assert "Strong match on agentic AI experience." not in prompt
+
+    def test_no_field_promises_more_than_it_carries(self):
+        """The old label claimed 'Full Description' over a one-line reason."""
+        assert "Full Description / Reasoning" not in _TAILOR_PROMPT

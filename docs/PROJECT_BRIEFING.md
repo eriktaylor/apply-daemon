@@ -54,7 +54,8 @@ listings
 ├── links               TEXT (JSON array of URLs)
 ├── recruiter_name      TEXT (nullable)
 ├── recruiter_title     TEXT (nullable)
-├── raw_email_text      TEXT (full extracted text for debugging)
+├── raw_email_text      TEXT (the Stage 3 job-description body, despite the
+│                             name — read via models.job_description_text())
 ├── model_used          TEXT (e.g. "gemma3:4b")
 ├── tokens_used         INTEGER
 ├── latency_ms          INTEGER

@@ -48,7 +48,12 @@ from src.geo import get_distance
 from src.listing_card import parse_skill_list, skills_match
 from src.mismatch_gate import check_mismatch
 from src.model_usage import log_response_usage
-from src.notifications import _get_slack_config, _import_slack_app
+from src.models import (
+    FULL_JOB_DESCRIPTION_CHARS,
+    NO_DESCRIPTION_PLACEHOLDER,
+    job_description_text,
+)
+from src.notifications import _get_slack_config, _import_slack_app, fit_section_text
 from src.profile_loader import load_profile
 from src.ranking import SURFACE_STAGE5, RankCandidate, rank_candidates, ranking_mode
 from src.research import run_deep_research
@@ -96,8 +101,7 @@ Title: {title}
 Company: {company}
 Location: {location}
 Salary: {salary}
-Job Summary: {job_summary}
-Initial Reasoning: {reason}
+Description: {job_description}
 
 ## Company Research (Deep Research)
 {research_context}
@@ -478,7 +482,10 @@ def _build_slack_blocks(listing: dict, auto_json: dict, folder: Path) -> tuple[l
         },
         {
             "type": "section",
-            "text": {"type": "mrkdwn", "text": f"*Match Analysis:*\n{match_analysis}"},
+            "text": {
+                "type": "mrkdwn",
+                "text": fit_section_text(f"*Match Analysis:*\n{match_analysis}"),
+            },
         },
     ]
     skills_parts = []
@@ -489,7 +496,7 @@ def _build_slack_blocks(listing: dict, auto_json: dict, folder: Path) -> tuple[l
     if skills_parts:
         thread_blocks.append({
             "type": "section",
-            "text": {"type": "mrkdwn", "text": "\n".join(skills_parts)},
+            "text": {"type": "mrkdwn", "text": fit_section_text("\n".join(skills_parts))},
         })
     thread_blocks.append({
         "type": "context",
@@ -598,8 +605,10 @@ def _build_prompt(
         company=listing.get("company", "Unknown"),
         location=listing.get("location", "not specified"),
         salary=listing.get("salary", "not listed"),
-        job_summary=listing.get("job_summary", ""),
-        reason=listing.get("reason", ""),
+        job_description=(
+            job_description_text(listing, limit=FULL_JOB_DESCRIPTION_CHARS)
+            or NO_DESCRIPTION_PLACEHOLDER
+        ),
         research_context=research_context or "(No research context available)",
         match_analysis_schema=_MATCH_ANALYSIS_SCHEMA,
     )
@@ -662,7 +671,10 @@ async def _process_one(
             listing_id=job_id,
             source=listing.get("source", ""),
             anchor_company=company,
-            job_summary=listing.get("job_summary", "") or "",
+            # Full stored body, not the TL;DR — the company token is far
+            # likelier present in 2000 chars than 290, so the free substring
+            # pass fires more and the LLM fallback (and its false drops) less.
+            job_summary=job_description_text(listing) or "",
             url=first_link,
         )
         if drop:
@@ -711,7 +723,7 @@ async def _process_one(
             return "expired_dropped"
 
         # 2) Deep research (cached if present)
-        job_desc = listing.get("job_summary", "") or listing.get("reason", "")
+        job_desc = job_description_text(listing)
         try:
             research_context = await asyncio.to_thread(
                 _load_or_run_research, company, job_desc, folder,
@@ -775,7 +787,14 @@ async def _process_one(
         # 5) Edit the existing card (or post fresh if digest never ran) + threaded
         # reply. Idempotent re-runs find pipeline_status != 'auto_queued' on the
         # second pass and skip.
+        # Slack delivery is a notification, not the transition. The research
+        # and the re-score are already paid for and on disk; stranding the row
+        # in auto_queued on a failed post discards both, hides the listing from
+        # the CLI review queue (which shows 'auto' only), and re-buys the work
+        # next run. The CLI is the primary surface — it must not be gated on
+        # the secondary one.
         new_ts: str | None = None
+        posted = False
         if slack_ctx is not None:
             app, channel = slack_ctx
             posted, new_ts = await asyncio.to_thread(
@@ -783,14 +802,19 @@ async def _process_one(
                 app, channel, listing, auto_json, folder, existing_ts,
             )
             if not posted:
-                logger.warning("Autopilot: leaving %s in auto_queued for retry", short)
-                return "retry"
+                logger.warning(
+                    "Autopilot: Slack post failed for %s — promoting to 'auto' "
+                    "anyway; it is reviewable in the CLI", short,
+                )
 
         with Database() as db:
             if new_ts and not existing_ts:
                 db.set_slack_message_ts(job_id, new_ts)
             db.update_pipeline_status(job_id, "auto")
-            db.mark_slack_notified(job_id)
+            # Only claim notified when Slack actually took it, so a later
+            # digest can still surface the card.
+            if slack_ctx is None or posted:
+                db.mark_slack_notified(job_id)
             db.mark_autopilot_processed(job_id)
         logger.info(
             "Autopilot: %s ('%s' at '%s') → auto (post-research %s)",

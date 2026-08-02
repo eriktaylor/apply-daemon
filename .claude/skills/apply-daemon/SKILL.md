@@ -81,8 +81,8 @@ work or a refresh is the right move.
 - `count: 0` with `hidden_stale > 0` means the queue is stale, not empty —
   say a refresh would bring new listings rather than "nothing to review".
 
-**`refresh`** runs the pipeline and returns the first page. It and
-`tailor --via api` are the only verbs that spend metered money.
+**`refresh`** runs the pipeline and returns the first page. It, and any verb
+given `--via api`, are the only ways to spend metered money.
 
 - `page` holds the first page of results; render it rather than calling
   `next` again, which would skip past those listings.
@@ -162,8 +162,25 @@ retry — nothing was written.
 
 ## Beyond triage
 
-Cover letters, interview prep, and `!polish` are still Slack-only: react ✏️
-on the card, or run `python -m src.batch_process` for everything saved.
+Four more assets use the identical two-step handshake — emit, answer as
+JSON, `--apply` it back — and are free the same way:
+
+```bash
+python -m src.cli polish <id>          # final document; needs a prior tailor
+python -m src.cli cover-letter <id>
+python -m src.cli interview-prep <id>
+python -m src.cli answers <id> --questions "Why this company? ..."
+```
+
+Each accepts `--apply` and `--via api` exactly as `tailor` does, so read the
+tailor section above and substitute the verb. `polish` integrates a previous
+tailor's edits, so it errors with `unavailable` if none has run — tailor
+first, then polish.
+
+Prefer these over the Slack equivalents (`!polish`, `!coverletter`): the
+reaction path is unattended, so it spends metered money for the same output.
+`python -m src.batch_process` also spends — it exists for tailoring
+everything saved at once, headless.
 
 Slack thread commands (`!applied`, `!trend`, …) still work but are frozen —
 see `docs/CHATOPS.md`. Don't build new workflows on them.

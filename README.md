@@ -322,6 +322,7 @@ python -m src.cli next --top 3   # Next page of candidates
 python -m src.cli deep-dive <id> # Stage 5 vs post-research verdict + dossier
 python -m src.cli save <id>      # or: pass <id> / pass --all
 python -m src.cli tailor <id>    # Tailor in-session (--via api to spend)
+python -m src.cli polish <id>    # Also: cover-letter / interview-prep / answers
 
 # One-time: geocode locations so the queue can sort by distance
 python -m src.geo_backfill --dry-run
@@ -339,13 +340,14 @@ Post-triage work happens on two surfaces.
 
 **The CLI** (`python -m src.cli`, command list in step H) is where new work goes. A bundled Claude Code skill (`.claude/skills/apply-daemon/`) drives it conversationally: ask Claude "what's new?" and it walks you through the top matches, deep-dives whichever you pick, and records your decisions. Reviewing never spends tokens — enrichment is pre-cached by autopilot, and in-session tailoring is billed to your Claude session, not an API.
 
-**Slack** is the ambient surface: the digest plus four reactions, processed by `python -m src.sweeper`. Thread commands are **frozen** — new verbs land in the CLI — but three things are still Slack-only today, so a full application often ends there:
+**Slack** is the ambient surface: the digest plus four reactions, processed by `python -m src.sweeper`. Thread commands are **frozen** — new verbs land in the CLI — and every asset they produce now has a CLI equivalent that runs in-session instead of on the API:
 
-| Still Slack-only | Command |
-|---|---|
-| Polish a tailor run you didn't like | `!polish` |
-| Cover letter | `!coverletter` |
-| Answer custom application questions | `!answer` |
+| Asset | CLI (free, in-session) | Slack (metered) |
+|---|---|---|
+| Polish a tailor run into a final document | `cli polish <id>` | `!polish` |
+| Cover letter | `cli cover-letter <id>` | `!coverletter` |
+| Interview prep | `cli interview-prep <id>` | `!prep` |
+| Answer custom application questions | `cli answers <id> --questions "…"` | `!answer` |
 
 Full reference: [`docs/CHATOPS.md`](docs/CHATOPS.md).
 

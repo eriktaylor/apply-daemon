@@ -780,3 +780,42 @@ class TestReviewQueue:
         db.update_pipeline_status(job_id, "auto")
         # The CLI surfaces the tier so the skill knows a deep-dive is free.
         assert db.get_review_queue(limit=1)[0]["tier_rank"] == 0
+
+
+class TestTrendSkillSampling:
+    """`limit` is per pipeline_status, not global.
+
+    Ingestion outruns decisions by two orders of magnitude in production, so
+    a global recency window returns nothing but fresh intake — the decided
+    rows carrying the human signal fall outside it, and !trend reported on a
+    single cohort while looking like it had covered them all.
+    """
+
+    def _seed(self, db, status: str, n: int) -> None:
+        for i in range(n):
+            listing = _make_listing(
+                title=f"{status} role {i}",
+                company=f"Co {i}",
+                matching_skills='["Python"]',
+            )
+            db.insert_listing(listing)
+            db.update_pipeline_status(listing.id, status)
+
+    def test_lopsided_intake_does_not_starve_decided_rows(self, db):
+        self._seed(db, "auto_queued", 40)
+        self._seed(db, "tailored", 2)
+        self._seed(db, "passed", 3)
+
+        rows = db.get_trend_skills(limit=10)
+        by_status = {}
+        for row in rows:
+            by_status[row["pipeline_status"]] = by_status.get(row["pipeline_status"], 0) + 1
+
+        assert by_status["auto_queued"] == 10   # capped
+        assert by_status["tailored"] == 2       # kept whole
+        assert by_status["passed"] == 3
+
+    def test_skips_rows_with_no_skills_at_all(self, db):
+        listing = _make_listing(matching_skills="", missing_skills="")
+        db.insert_listing(listing)
+        assert db.get_trend_skills(limit=10) == []

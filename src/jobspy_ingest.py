@@ -32,6 +32,7 @@ from dotenv import load_dotenv
 load_dotenv()
 
 from src.db import Database
+from src.models import JOB_DESCRIPTION_CHARS
 from src.pipeline import setup_logging
 from src.profile_loader import load_profile
 from src.proxy_manager import get_default_proxy_manager
@@ -264,7 +265,7 @@ def _row_to_extracted_listing(row) -> ExtractedListing:
         location=location,
         salary=salary,
         job_summary=job_summary,
-        description=description[:2000],  # Stage 5 sees up to 2000 chars
+        description=description[:JOB_DESCRIPTION_CHARS],  # what Stage 5 sees
         links=[job_url] if job_url else [],
         date_posted=date_posted,
     )
@@ -563,7 +564,7 @@ def run_jobspy_ingest() -> None:
                         if full_text:
                             anchor = replace(
                                 anchor,
-                                description=full_text[:2000],
+                                description=full_text[:JOB_DESCRIPTION_CHARS],
                                 job_summary=full_text[:300].strip(),
                             )
                         else:

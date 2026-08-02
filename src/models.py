@@ -4,7 +4,20 @@ from __future__ import annotations
 
 from dataclasses import dataclass, field
 from datetime import datetime, timezone
+from typing import Any
 from uuid import uuid4
+
+# The width batch-scoring paths send to a model. Track A caps stored
+# descriptions here at ingest; Track B rows store the full Stage 3 scrape
+# (live table: 140 rows over 2000 chars, max 31k), which is why the
+# expensive one-shot consumers — tailor, autopilot re-score, pointwise
+# Stage 5 — read at FULL_JOB_DESCRIPTION_CHARS instead.
+JOB_DESCRIPTION_CHARS = 2000
+FULL_JOB_DESCRIPTION_CHARS = 4000
+
+# What a prompt states when a listing has no stored body at all. One
+# definition — a stated absence, never a silent omission (card contract).
+NO_DESCRIPTION_PLACEHOLDER = "(No job description was stored.)"
 
 
 @dataclass
@@ -25,7 +38,9 @@ class JobListing:
     links: list[str] = field(default_factory=list)
     recruiter_name: str | None = None
     recruiter_title: str | None = None
-    raw_email_text: str = ""  # Full extracted text for debugging
+    # The Stage 3 job-description body — despite the name, not an email. Read
+    # it through job_description_text() rather than directly.
+    raw_email_text: str = ""
     model_used: str = ""
     # JSON: per-model verdict/confidence, e.g.
     # [{"model":"gemma3:4b","verdict":"YES","confidence":85,"reasoning":"..."}]
@@ -44,3 +59,37 @@ class JobListing:
     # (max_listing_age_days in profile.md Pipeline Settings).
     date_posted: str = ""
     final_status: str = "triaged"  # triaged / saved / passed / tailored / applied
+
+
+def _field(listing: Any, key: str) -> Any:
+    """Read *key* from a dict, sqlite3.Row, or attribute-style object
+    (JobListing), missing keys included."""
+    try:
+        return listing[key]
+    except (KeyError, IndexError, TypeError):
+        return getattr(listing, key, None)
+
+
+def job_description_text(
+    listing: Any, *, limit: int = JOB_DESCRIPTION_CHARS,
+) -> str:
+    """Return the fullest description of the role stored for *listing*.
+
+    ``raw_email_text`` holds the Stage 3 job-description body for every row
+    written by a production path — ``_stage5_evaluate_anchor`` stores
+    ``job_text`` there. (The email-level ``_SINGLE_PROMPT`` writer, the one
+    path that would store a whole multi-job email, is reachable only from
+    tests.) It is the only stored field carrying the listing's actual stated
+    requirements; ``job_summary`` is a ~290-char LLM TL;DR *of* it.
+
+    Never falls back to ``reason``. That is the Stage 5 model's own
+    justification for its verdict, and a downstream re-scorer that reads it
+    is grading the incumbent's reasoning rather than the job — the
+    contamination that made autopilot's post-research verdict unusable as an
+    eval gold standard.
+    """
+    for key in ("raw_email_text", "job_summary"):
+        text = str(_field(listing, key) or "").strip()
+        if text:
+            return text[:limit]
+    return ""
