@@ -140,3 +140,20 @@ class TestRankCandidates:
         )
         assert [c.id for c in out] == ["a", "b"]
         client.chat.completions.create.assert_not_called()
+
+
+def test_output_budget_scales_with_candidates():
+    """Regression: a fixed max_tokens=500 truncated the response on large
+    pools, and a truncated JSON object doesn't degrade — it fails to parse
+    and the entire ranking is discarded while the call still bills."""
+    from src.ranking import RankCandidate, rank_listwise
+
+    client = MagicMock()
+    client.chat.completions.create.return_value = MagicMock(
+        choices=[MagicMock(message=MagicMock(content='{"order": []}'))],
+    )
+    n = 100
+    cands = [RankCandidate(id=f"c{i}", title="t", company="c") for i in range(n)]
+    rank_listwise(client, "m", cands)
+    budget = client.chat.completions.create.call_args.kwargs["max_tokens"]
+    assert budget >= 24 * n  # room for one id per candidate

@@ -70,6 +70,14 @@ _OPENROUTER_BASE_URL = "https://openrouter.ai/api/v1"
 # Lexicographic primary: confidence band (db.CONFIDENCE_BAND_WIDTH wide).
 # Within-band composite: verdict bonus + skill score + geo bonus.
 _VERDICT_BONUS_YES = 3
+
+# How many rows the listwise ranker sees. Selection needs relative order near
+# the top, not a total ordering of the queue — and the queue is unbounded
+# (536 eligible when this was added), so ranking all of it scales input cost
+# with backlog size and asks the model to hold an ordering no one consumes.
+# ranking.py sizes its own output budget to the request, so this cap is about
+# cost and attention, not response overflow.
+_RANK_SHORTLIST = 20
 # Geo bucket scores: 0=Remote, 1=Local(<=30mi), 2=Commute(<=60mi), 3=Relocation(>60mi)
 _GEO_SCORES: dict[int, int] = {0: 5, 1: 4, 2: 3, 3: 1}
 # Mileage bucket boundaries (inclusive upper)
@@ -223,6 +231,14 @@ def _rank_select(rows: list[dict], top_n: int, client) -> list[dict] | None:
     """
     if ranking_mode(SURFACE_STAGE5) == "off" or len(rows) < 2:
         return None
+    # Rank a shortlist, not the whole queue. Picking N needs relative order
+    # near the top, not a total ordering of every eligible row — and asking
+    # for one is how this silently never worked: 536 candidates need ~10k
+    # output tokens for their ids alone, the response truncated mid-string,
+    # json.loads raised, and rank_candidates failed open to the input order
+    # on every run while still billing for the call. rows arrive sorted
+    # confidence DESC, so the head is the only part that can contain the pick.
+    shortlist = rows[:_RANK_SHORTLIST]
     candidates = [
         RankCandidate(
             id=str(r["id"]), title=r.get("title") or "",
@@ -231,7 +247,7 @@ def _rank_select(rows: list[dict], top_n: int, client) -> list[dict] | None:
             signals={"confidence": r.get("confidence", 0),
                      "verdict": r.get("verdict", "")},
         )
-        for r in rows
+        for r in shortlist
     ]
     ordered = rank_candidates(
         client=client, model=_tailor_model(), surface=SURFACE_STAGE5,
@@ -243,9 +259,10 @@ def _rank_select(rows: list[dict], top_n: int, client) -> list[dict] | None:
         # treat it as "no ranking" rather than silently claiming a rank-based
         # selection that never happened.
         return None
-    by_id = {str(r["id"]): r for r in rows}
+    by_id = {str(r["id"]): r for r in shortlist}
     picked = [by_id[i] for i in order if i in by_id][:top_n]
-    logger.info("M-6: selected top %d of %d by rank position", len(picked), len(rows))
+    logger.info("M-6: selected top %d of %d ranked (%d eligible)",
+                len(picked), len(shortlist), len(rows))
     return picked
 
 
@@ -423,20 +440,24 @@ def _build_slack_blocks(listing: dict, auto_json: dict, folder: Path) -> tuple[l
         {"type": "context", "elements": [{"type": "mrkdwn", "text": d} for d in detail_parts]},
     ]
     if job_summary:
-        card_blocks.append({
-            "type": "section",
-            "text": {"type": "mrkdwn", "text": f":memo: *TL;DR:* {job_summary[:800]}"},
-        },
-        {
-            # Stage 5 skills, via the shared card contract. The autopilot card
-            # is a THIRD renderer (after digest and the CLI) and previously
-            # showed skills only in its thread, from post-research JSON — so an
-            # enriched listing's card silently lacked the skills line every
-            # other surface carries. Post-research skills still appear in the
-            # thread below; this is the card-level summary.
-            "type": "section",
-            "text": {"type": "mrkdwn", "text": _card_skills_line(listing)},
-        })
+        card_blocks.extend([
+            {
+                "type": "section",
+                "text": {"type": "mrkdwn",
+                         "text": f":memo: *TL;DR:* {job_summary[:800]}"},
+            },
+            {
+                # Stage 5 skills, via the shared card contract. The autopilot
+                # card is a THIRD renderer (after digest and the CLI) and
+                # previously showed skills only in its thread, from
+                # post-research JSON — so an enriched listing's card silently
+                # lacked the skills line every other surface carries.
+                # Post-research skills still appear in the thread below; this
+                # is the card-level summary.
+                "type": "section",
+                "text": {"type": "mrkdwn", "text": _card_skills_line(listing)},
+            },
+        ])
     card_blocks.append({
         "type": "context",
         "elements": [{
@@ -531,21 +552,26 @@ def _post_results_to_slack(
     company = listing.get("company", "Unknown")
     pr_verdict = auto_json.get("post_research_verdict", "MAYBE")
     pr_conf = auto_json.get("post_research_confidence", "?")
-    card_blocks, thread_info = _build_slack_blocks(listing, auto_json, folder)
-    attachment = {
-        "color": (
-            "#2eb67d" if pr_verdict == "YES"
-            else "#36c5f0" if pr_verdict == "MAYBE"
-            else "#ddd"
-        ),
-        "blocks": card_blocks,
-    }
     card_text = (
         f":robot_face: Auto-evaluated: {title} at {company} — "
         f"{pr_verdict} ({pr_conf}%)"
     )
     thread_text = f"Deep Evaluation: {title} at {company} — {pr_verdict} ({pr_conf}%)"
+    # Card assembly is inside the try on purpose. It was outside, so a bug in
+    # _build_slack_blocks raised past this function's error handling and
+    # crashed the whole autopilot task — losing an enrichment that was already
+    # paid for and researched. Nothing about building a card should be able to
+    # do that; the contract of this function is "returns False on failure".
     try:
+        card_blocks, thread_info = _build_slack_blocks(listing, auto_json, folder)
+        attachment = {
+            "color": (
+                "#2eb67d" if pr_verdict == "YES"
+                else "#36c5f0" if pr_verdict == "MAYBE"
+                else "#ddd"
+            ),
+            "blocks": card_blocks,
+        }
         if existing_ts:
             app.client.chat_update(
                 channel=channel,

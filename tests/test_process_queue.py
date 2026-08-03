@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import json
+from pathlib import Path
 from unittest.mock import MagicMock, patch
 
 import pytest
@@ -229,3 +230,111 @@ class TestAutoPromptGrounding:
             "research", "profile", "resume",
         )
         assert "(No job description was stored.)" in prompt
+
+
+# ---------------------------------------------------------------------------
+# The autopilot Slack card
+# ---------------------------------------------------------------------------
+
+
+class TestBuildSlackBlocks:
+    """Regression: `card_blocks.append(dict, dict)` shipped and stayed broken
+    for weeks because nothing ever rendered this card. It raised TypeError
+    *outside* _post_results_to_slack's try, so it crashed the whole autopilot
+    task and stranded enrichments that had already been researched and paid
+    for. Every branch of the builder needs to be exercised, not just imported.
+    """
+
+    def _listing(self, **kw):
+        row = {
+            "id": "abcdef12-0000-0000-0000-000000000000",
+            "title": "Applied AI Engineer",
+            "company": "Acme",
+            "location": "Oakland, CA",
+            "salary": "$200k",
+            "job_summary": "Acme builds evaluation tooling. You own the harness.",
+            "verdict": "YES",
+            "confidence": 90,
+            "matching_skills": json.dumps(["Python", "Evals"]),
+            "missing_skills": json.dumps(["Rust"]),
+        }
+        row.update(kw)
+        return row
+
+    def _auto(self, **kw):
+        d = {
+            "post_research_verdict": "YES",
+            "post_research_confidence": 88,
+            "match_analysis": "Strong fit.",
+            "updated_skills_match": {"matching": ["Python"], "missing": ["Rust"]},
+        }
+        d.update(kw)
+        return d
+
+    def _render(self, listing=None, auto=None):
+        from src.process_queue import _build_slack_blocks
+        return _build_slack_blocks(
+            listing or self._listing(), auto or self._auto(), Path("output/x"))
+
+    def test_renders_with_a_job_summary(self):
+        card, thread = self._render()
+        assert all(isinstance(b, dict) for b in card)
+        assert any("TL;DR" in json.dumps(b) for b in card)
+
+    def test_renders_without_a_job_summary(self):
+        card, _ = self._render(self._listing(job_summary=""))
+        assert all(isinstance(b, dict) for b in card)
+
+    def test_card_carries_the_skills_line(self):
+        """The reason this branch exists — the card was the third renderer
+        that silently lacked skills."""
+        card, _ = self._render()
+        assert any("Python" in json.dumps(b) for b in card)
+
+    def test_no_section_exceeds_slacks_limit(self):
+        """Slack rejects the entire message when one section's text is over
+        3000 chars, so an over-long field drops the post rather than clipping
+        it. Model output length is unbounded."""
+        from src.notifications import SLACK_SECTION_TEXT_MAX
+        card, thread = self._render(auto=self._auto(match_analysis="x" * 9000))
+        for block in card + thread["thread_blocks"]:
+            text = (block.get("text") or {}).get("text", "")
+            assert len(text) <= SLACK_SECTION_TEXT_MAX
+
+    @pytest.mark.parametrize("verdict", ["YES", "MAYBE", "NO"])
+    def test_every_verdict_renders(self, verdict):
+        card, _ = self._render(auto=self._auto(post_research_verdict=verdict))
+        assert card
+
+
+class TestPostResultsIsNonFatal:
+    """_post_results_to_slack promises (success, ts). A card-building bug must
+    surface as False, never as an exception that kills the task."""
+
+    def test_card_builder_failure_returns_false(self):
+        from src.process_queue import _post_results_to_slack
+        with patch("src.process_queue._build_slack_blocks",
+                   side_effect=TypeError("boom")):
+            posted, ts = _post_results_to_slack(
+                MagicMock(), "C1", {"id": "x"}, {}, Path("output/x"), None)
+        assert posted is False and ts is None
+
+
+class TestRankShortlist:
+    """Regression: _rank_select fed all 536 eligible rows to the ranker. The
+    response needed ~10k output tokens for the ids alone, truncated, failed to
+    parse, and ranking silently fell open to input order on every production
+    run — while still billing a Sonnet call each time."""
+
+    def test_ranker_sees_only_the_head(self):
+        from src.process_queue import _RANK_SHORTLIST, _rank_select
+        rows = [_row(f"id-{i:03}", confidence=99 - i // 10) for i in range(60)]
+        with patch("src.process_queue.ranking_mode", return_value="listwise"), \
+             patch("src.process_queue.rank_candidates") as rank:
+            # Reverse so the order differs from input (else fail-open logic).
+            rank.side_effect = lambda **kw: list(reversed(kw["candidates"]))
+            picked = _rank_select(rows, top_n=10, client=MagicMock())
+        sent = rank.call_args.kwargs["candidates"]
+        assert len(sent) == _RANK_SHORTLIST
+        assert [c.id for c in sent] == [f"id-{i:03}" for i in range(_RANK_SHORTLIST)]
+        assert picked is not None and len(picked) == 10

@@ -177,7 +177,11 @@ def rank_listwise(
         resp = client.chat.completions.create(
             model=rank_model,
             messages=[{"role": "user", "content": prompt}],
-            max_tokens=500,
+            # One id per candidate, and UUIDs cost ~18 tokens each. Sized to
+            # the request rather than fixed: a fixed budget silently truncates
+            # on a large pool, and a truncated JSON object does not degrade —
+            # it fails to parse and the whole ranking is discarded.
+            max_tokens=max(500, 24 * len(candidates) + 200),
             temperature=0.0,
             response_format={"type": "json_object"},
         )
