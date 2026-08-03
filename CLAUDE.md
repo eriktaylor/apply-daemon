@@ -49,7 +49,8 @@ Load-bearing behaviors a change can easily break:
   scores N listings per call and caches verdicts. Coverage is stochastic and
   logged; anything a batch omits — or a whole batch rejected on its anchor —
   **falls back to pointwise**. Never assume a listing was scored by one path.
-- **`presented_at` is paging state, not a gate.** The reasoning, and why gating on it would strand a shown page, is in `db.get_review_queue`'s docstring — the only copy.
+- **`presented_at` is a delivery ledger, and the feed retires what it shows.** Re-showing was the defect: confidence is stable, so re-ranking one pool returns the same winners forever. Retirement is only safe because `next --seen` and `status.backlog` keep those rows reachable — see `db.get_review_queue`'s docstring, the only copy.
+- **The re-score prefers the session route.** `AUTOPILOT_RESCORE_VIA=session` shells out through `src/claude_cli.py` (subscription-billed, never written to `logs/model_usage.log` — that file drives the spend ceiling). Falls back to OpenRouter on any failure. Stage 5 deliberately stays metered: the CLI's ~23k-token startup overhead is decisive against 100+ small calls. See [docs/MODELS.md](docs/MODELS.md#the-session-route-subscription-billed).
 
 ### Project structure
 

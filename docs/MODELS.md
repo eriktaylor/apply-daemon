@@ -9,6 +9,31 @@ All LLM calls route through [OpenRouter](https://openrouter.ai), giving access t
 | `OPENROUTER_TAILOR_MODEL` | Resume, cover letter, interview prep | `anthropic/claude-sonnet-4.6` | Runs only on Tailor operations |
 | `OPENROUTER_TREND_MODEL` | `!trend` skill canonicalization | `openai/gpt-4o-mini` | On-demand only; 3 concurrent calls per `!trend` |
 
+## The session route (subscription-billed)
+
+Some work does not go through OpenRouter at all. `src/claude_cli.py` shells out to `claude -p --model X --output-format json`, which starts a headless Claude session billed to your **Claude subscription** rather than metered credit.
+
+| Env Var | Default | Notes |
+|---|---|---|
+| `AUTOPILOT_RESCORE_VIA` | `session` | `session` = subscription; `api` = OpenRouter. Same vocabulary as `cli tailor --via`. |
+| `CLAUDE_CLI_MODEL` | `sonnet` | Which model the session route asks for. |
+
+**Where it applies.** The autopilot post-research re-score (~97% of per-listing enrichment cost, at most `AUTOPILOT_TOP_N` calls a day), the `cli tailor` / `polish` / `cover-letter` / `interview-prep` / `answers` verbs, and `eval.listwise_compare --via-claude`.
+
+**Where it deliberately does not.** Stage 5 scoring. Each CLI invocation carries the harness's own system prompt (~23k tokens, measured 2026-07-30), which is irrelevant against a handful of large calls and decisive against 100+ small ones.
+
+**Cost accounting.** Session spend is *not* written to `logs/model_usage.log`. That file is the basis for the daily ceiling in `src/budget.py`, and counting subscription work there would make the cap refuse runs over money nobody was charged. The reported cost is logged at INFO for visibility. `tests/test_model_usage.py::TestSubscriptionSpendIsNotMetered` pins this.
+
+**Failure behaviour.** Every caller has a metered fallback and `claude_cli.run` never raises — a missing binary, non-zero exit, timeout, or malformed envelope all return `ok=False`. A cron environment without the CLI on `PATH` silently pays OpenRouter instead of losing the listing.
+
+## Pending: model-slot review
+
+**`OPENROUTER_TAILOR_MODEL` is pinned to `anthropic/claude-sonnet-4.6`, which is a generation behind.** It backs the tailor family, the autopilot re-score, and (via `_rank_model` fallback) `rank_stage5`.
+
+Deliberately *not* upgraded during the 2026-08 pilot freeze: a slug change moves the V-22 baseline mid-measurement. Revisit after the freeze, and note the session route may retire the question — once the re-score and tailoring run on the subscription, this slot is only the fallback path.
+
+**Before changing any Stage 5 or ranking slug**, run the gate — `python -m eval.listwise_compare --gold --shuffle --model <slug>`. Measured basis: `gemini-3.5-flash-lite` was worse *and* dearer than the incumbent, and `gpt-5.4-nano` collapsed to 58%. Version numbers are not fitness. Also re-verify pricing at openrouter.ai; the table in `eval/model_pricing.py` was 2.5–4× wrong for two production models before it was checked.
+
 ## Anthropic BYOK
 
 OpenRouter [Bring-Your-Own-Key](https://openrouter.ai/docs/guides/overview/auth/byok) is configured **server-side via the OpenRouter dashboard**, not via per-request HTTP headers or environment variables. Setting `ANTHROPIC_API_KEY` in `.env` alone does NOT enable BYOK — Apply Daemon will log a warning if you do that without dashboard configuration.

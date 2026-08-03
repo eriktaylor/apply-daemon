@@ -300,7 +300,10 @@ def post_digest() -> bool:
     app.client.retry_handlers.append(rate_limit_handler)
 
     cutoff_pct = int(round(get_confidence_threshold() * 100))
-    post_stage_5 = os.getenv("AUTOPILOT_POST_STAGE_5", "true").strip().lower() in (
+    # Default false: high-signal mode. True is the funnel-as-UI debug view —
+    # it posts every Stage 5 survivor to Slack, dozens of un-researched
+    # MAYBEs per run. An unset var must not put an install in debug mode.
+    post_stage_5 = os.getenv("AUTOPILOT_POST_STAGE_5", "false").strip().lower() in (
         "1", "true", "yes",
     )
     max_age_days = _max_listing_age_days()

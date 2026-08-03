@@ -47,7 +47,13 @@ from pathlib import Path
 
 from dotenv import load_dotenv
 
-from src.db import ENRICHED_STATUSES, REVIEW_STATUSES, Database
+from src.db import (
+    ENRICHED_STATUSES,
+    REVIEW_STATUSES,
+    SEEN_ONLY,
+    UNSEEN_ONLY,
+    Database,
+)
 from src.decisions import DECISIONS, target_status
 from src.decisions import apply as apply_decision
 from src.file_utils import find_output_folder
@@ -60,9 +66,10 @@ OUTPUT_DIR = Path("output")
 RESEARCH_FILE = "deep_research_context.txt"
 AUTO_ASSETS_FILE = "auto_assets.json"
 
-# Minutes a presented page stays "current". Long enough that `next` pages
-# forward across a working sitting; short enough that a listing skipped this
-# morning is offered again tonight.
+# How far back `pass --all` / `save --all` look for "the current page".
+# Bulk decisions act on what the user is looking at, so this is scoped to a
+# sitting. It no longer affects eligibility — the feed retires a listing when
+# it shows it (db.get_review_queue), rather than hiding it for a while.
 SESSION_WINDOW_MINUTES = 120
 
 DEFAULT_TOP = 3
@@ -322,30 +329,38 @@ def high_signal_only() -> bool:
     a statement that raw Stage 5 output is noise, and the review surface
     should honor it rather than re-surfacing what was filtered out.
     """
-    return os.getenv("AUTOPILOT_POST_STAGE_5", "true").strip().lower() not in (
+    # Fallback matches digest.py and .env.example: unset means high-signal.
+    return os.getenv("AUTOPILOT_POST_STAGE_5", "false").strip().lower() not in (
         "1", "true", "yes",
     )
 
 
 def review_page(db: Database, *, top: int, max_age: int | None = None,
-                all_tiers: bool = False) -> dict:
+                all_tiers: bool = False, seen: str = UNSEEN_ONLY) -> dict:
     """Fetch and mark one page of review candidates.
 
     Shared by `next` and `refresh`'s auto-chain (C-5) so the two cannot
     disagree about what "the top N" means — the chain reimplementing this
     would be the same drift R-1 collapsed elsewhere.
+
+    ``seen`` selects the feed (never shown) or the backlog (shown, still
+    undecided). The feed is the default: a run that repeats the previous
+    run's page is stale, not helpful.
     """
     max_age = review_max_age_days() if max_age is None else max_age
     statuses = REVIEW_STATUSES if (all_tiers or not high_signal_only()) \
         else ENRICHED_STATUSES
     rows = db.get_review_queue(
         limit=top,
-        session_window_minutes=SESSION_WINDOW_MINUTES,
         max_age_days=max_age or None,
         statuses=statuses,
+        seen=seen,
     )
     cards = [_card(r) for r in rows]
-    db.mark_presented([r["id"] for r in rows])
+    # Re-stamping the backlog would reorder it by re-presentation rather than
+    # by quality, so only the feed records delivery.
+    if seen == UNSEEN_ONLY:
+        db.mark_presented([r["id"] for r in rows])
 
     awaiting = 0
     if statuses == ENRICHED_STATUSES:
@@ -356,58 +371,93 @@ def review_page(db: Database, *, top: int, max_age: int | None = None,
         "count": len(cards),
         "listings": cards,
         "max_age_days": max_age,
+        "seen": seen,
         # Counted against the SAME tier filter as the view — an all-tier count
         # here once blamed staleness for what was an enrichment shortfall.
         "hidden_stale": (
             db.count_stale_reviewable(max_age, statuses) if max_age else 0
         ),
         "awaiting_enrichment": awaiting,
+        # The backlog stays visible without costing a page slot — this is what
+        # makes retiring a shown listing safe rather than lossy.
+        "backlog": db.count_seen_undecided(
+            max_age_days=max_age or None, statuses=statuses,
+        ),
         "tiers": list(statuses),
     }
 
 
+def _backlog_note(page: dict) -> str:
+    """One line keeping shown-but-undecided listings visible.
+
+    This is what pays for retirement: the feed never repeats itself, and the
+    rows it retired are still counted and one command away.
+    """
+    n = page.get("backlog") or 0
+    if not n:
+        return ""
+    return (f"{n} listing(s) shown earlier are still undecided — "
+            "`next --seen` to revisit.")
+
+
 def _fmt_page(page: dict) -> str:
     """Human rendering of a review page, with the stale-hidden footnote."""
+    backlog = _backlog_note(page)
     if not page["listings"]:
+        if page.get("seen") == SEEN_ONLY:
+            return "Nothing shown earlier is still undecided."
         # Steer by the dominant cause, in order of usefulness: fresh listings
         # awaiting enrichment beat stale ones, which beat a genuinely empty
         # queue. The wrong steer here sent users to `--max-age 0` (stale rows)
         # when 35 fresh un-enriched listings were the actual opportunity.
         if page.get("awaiting_enrichment"):
-            return (
-                f"No enriched listings ready — {page['awaiting_enrichment']} fresh "
+            out = (
+                f"No new enriched listings — {page['awaiting_enrichment']} fresh "
                 "listing(s) are awaiting autopilot enrichment.\n"
                 "Run a refresh to enrich the next batch, or "
                 "`next --all-tiers` to review them raw."
             )
-        if page["hidden_stale"]:
-            return (
-                f"Nothing fresh to review — {page['hidden_stale']} listing(s) are "
+        elif page["hidden_stale"]:
+            out = (
+                f"Nothing new to review — {page['hidden_stale']} listing(s) are "
                 f"older than {page['max_age_days']} days and were hidden.\n"
                 "Run a refresh for new listings, or `next --max-age 0` to see them."
             )
-        return (
-            "Nothing left to review. Run a refresh, or wait for the "
-            f"{SESSION_WINDOW_MINUTES}-minute window to release skipped listings."
-        )
+        else:
+            out = "Nothing new to review. Run a refresh to bring in more."
+        return f"{out}\n{backlog}" if backlog else out
     out = "\n\n".join(
         _fmt_card(c, i) for i, c in enumerate(page["listings"], 1)
     )
     if page["hidden_stale"]:
         out += (f"\n({page['hidden_stale']} older than "
                 f"{page['max_age_days']}d hidden — `--max-age 0` to include.)")
+    if backlog and page.get("seen") != SEEN_ONLY:
+        out += f"\n{backlog}"
     return out
 
 
 def cmd_next(db: Database, top: int, as_json: bool, max_age: int | None,
-             all_tiers: bool = False) -> int:
-    page = review_page(db, top=top, max_age=max_age, all_tiers=all_tiers)
+             all_tiers: bool = False, seen: bool = False) -> int:
+    page = review_page(db, top=top, max_age=max_age, all_tiers=all_tiers,
+                       seen=SEEN_ONLY if seen else UNSEEN_ONLY)
     payload = {"verb": "next", **page}
 
     human = _fmt_page(page)
     if page["listings"]:
         human += "\n\nDeep-dive one, pass what doesn't fit, or run `next` for more."
     _emit(payload, as_json, human)
+    return 0
+
+
+def cmd_saved(db: Database, top: int, as_json: bool) -> int:
+    """Listings you decided to keep — saved or already tailored."""
+    rows = db.get_decided(("saved", "tailored"), limit=top)
+    cards = [_card(r) for r in rows]
+    human = "\n\n".join(_fmt_card(c, i) for i, c in enumerate(cards, 1)) \
+        or "Nothing saved yet."
+    _emit({"verb": "saved", "ok": True, "count": len(cards), "listings": cards},
+          as_json, human)
     return 0
 
 
@@ -475,6 +525,12 @@ def cmd_status(db: Database, as_json: bool) -> int:
     fresh_by = db.fresh_counts_by_status(max_age) if max_age else {}
     ready = sum(n for st, n in fresh_by.items() if st in ENRICHED_STATUSES)
     awaiting = fresh - ready if max_age else 0
+    # The feed retires what it shows, so the backlog must be reported
+    # somewhere or those listings become invisible rather than merely quiet.
+    tiers = ENRICHED_STATUSES if high_signal_only() else REVIEW_STATUSES
+    backlog = db.count_seen_undecided(
+        max_age_days=max_age or None, statuses=tiers,
+    )
 
     payload = {
         "verb": "status",
@@ -482,6 +538,7 @@ def cmd_status(db: Database, as_json: bool) -> int:
             "reviewable": stats["reviewable"],
             "fresh": fresh,
             "ready": ready,
+            "backlog": backlog,
             "awaiting_enrichment": awaiting,
             "stale_hidden": stale,
             "max_age_days": max_age,
@@ -511,8 +568,9 @@ def cmd_status(db: Database, as_json: bool) -> int:
     }
 
     lines = [
-        f"Queue:   {ready} ready to review  ·  {awaiting} fresh awaiting "
-        f"enrichment  ·  {stale} stale  ({stats['reviewable']} total)",
+        f"Queue:   {ready} new  ·  {backlog} undecided from earlier  ·  "
+        f"{awaiting} awaiting enrichment  ·  {stale} stale  "
+        f"({stats['reviewable']} total)",
         f"Ingest:  {_fmt_age(ingest_age)}"
         f"   ·   last decision {_fmt_age(_age_hours(stats['last_decision']))}",
     ]
@@ -996,6 +1054,13 @@ def build_parser() -> argparse.ArgumentParser:
                         metavar="DAYS",
                         help=f"Hide listings ingested more than DAYS ago "
                              f"(default: {DEFAULT_MAX_AGE_DAYS}; 0 disables)")
+    p_next.add_argument("--seen", action="store_true",
+                        help="The backlog: shown earlier, still undecided")
+
+    p_saved = sub.add_parser("saved", parents=[common],
+                             help="Listings you saved or tailored")
+    p_saved.add_argument("--top", type=int, default=10,
+                         help="How many to show (default: 10)")
 
     sub.add_parser("status", parents=[common],
                    help="Queue freshness and today's spend against budget")
@@ -1083,7 +1148,9 @@ def main(argv: list[str] | None = None) -> int:
                                no_next=args.no_next)
         if args.verb == "next":
             return cmd_next(db, args.top, args.json, args.max_age,
-                            args.all_tiers)
+                            args.all_tiers, args.seen)
+        if args.verb == "saved":
+            return cmd_saved(db, args.top, args.json)
         if args.verb == "show":
             return cmd_show(db, args.id, args.json)
         if args.verb == "deep-dive":

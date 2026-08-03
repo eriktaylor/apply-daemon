@@ -38,6 +38,7 @@ from dotenv import load_dotenv
 
 load_dotenv()
 
+from src import claude_cli
 from src.audit_log import log_drop
 from src.compile import _serialize_safe
 from src.db import CONFIDENCE_BAND_WIDTH, Database
@@ -338,6 +339,43 @@ def _load_or_run_research(company: str, job_desc: str, folder: Path) -> str:
     if text:
         cache.write_text(text, encoding="utf-8")
     return text
+
+
+def rescore_route() -> str:
+    """Which route the post-research re-score takes.
+
+    ``session`` (default) bills the Claude subscription via the CLI;
+    ``api`` forces the metered OpenRouter path. Same vocabulary as
+    ``cli tailor --via``.
+    """
+    raw = os.getenv("AUTOPILOT_RESCORE_VIA", claude_cli.ROUTE_SESSION)
+    return raw.strip().lower() or claude_cli.ROUTE_SESSION
+
+
+async def _rescore_via_session(prompt: str, short: str) -> dict | None:
+    """Run the re-score through the Claude CLI. None means "use OpenRouter".
+
+    Every failure mode returns None rather than raising: the session route is
+    an optimisation, and a listing must never be lost because a subprocess
+    was unavailable.
+    """
+    if rescore_route() != claude_cli.ROUTE_SESSION:
+        return None
+    result = await asyncio.to_thread(
+        claude_cli.run,
+        prompt + "\n\nRespond with ONLY the JSON object, no prose, no fence.",
+        stage="autopilot_rescore",
+    )
+    if not result.ok:
+        logger.warning("Autopilot: session re-score unavailable for %s (%s) — "
+                       "falling back to OpenRouter", short, result.error)
+        return None
+    try:
+        return _parse_auto_response(result.text)
+    except Exception:
+        logger.warning("Autopilot: session re-score returned unparseable JSON "
+                       "for %s — falling back to OpenRouter", short)
+        return None
 
 
 def _parse_auto_response(text: str) -> dict:
@@ -773,22 +811,30 @@ async def _process_one(
 
         if auto_json is None:
             prompt = _build_prompt(listing, research_context, profile_text, resume_text)
-            try:
-                auto_model = _tailor_model()
-                resp = await client.chat.completions.create(
-                    model=auto_model,
-                    messages=[{"role": "user", "content": prompt}],
-                    max_tokens=2048,
-                    response_format={"type": "json_object"},
-                )
-                log_response_usage(resp, auto_model, "autopilot_rescore")
-                raw = resp.choices[0].message.content or ""
-                auto_json = _parse_auto_response(raw)
-            except Exception:
-                logger.error("Autopilot LLM call failed for %s", short, exc_info=True)
-                with Database() as db:
-                    db.update_pipeline_status(job_id, "failed_api")
-                return "failed"
+            # I-9: the re-score is the pipeline's most expensive metered call
+            # (97% of per-listing enrichment cost) and there are only TOP_N of
+            # them a day — exactly the shape the session route suits, where
+            # Stage 5's 100+ small calls are not. Falls back to OpenRouter on
+            # any failure, so a missing CLI or a bad envelope costs money
+            # rather than the listing.
+            auto_json = await _rescore_via_session(prompt, short)
+            if auto_json is None:
+                try:
+                    auto_model = _tailor_model()
+                    resp = await client.chat.completions.create(
+                        model=auto_model,
+                        messages=[{"role": "user", "content": prompt}],
+                        max_tokens=2048,
+                        response_format={"type": "json_object"},
+                    )
+                    log_response_usage(resp, auto_model, "autopilot_rescore")
+                    raw = resp.choices[0].message.content or ""
+                    auto_json = _parse_auto_response(raw)
+                except Exception:
+                    logger.error("Autopilot LLM call failed for %s", short, exc_info=True)
+                    with Database() as db:
+                        db.update_pipeline_status(job_id, "failed_api")
+                    return "failed"
             auto_path.write_text(json.dumps(auto_json, indent=2), encoding="utf-8")
             _merge_assets_json(folder, auto_json, research_context)
 

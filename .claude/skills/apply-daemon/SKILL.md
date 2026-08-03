@@ -11,15 +11,18 @@ scored. The loop is: **show three → they pick → repeat.**
 All work goes through `python -m src.cli`. Every verb takes `--json`; parse
 that, never the prose output. Run from the repo root.
 
-Reviewing is free. **`refresh` is the one verb that spends metered money** —
-check `status` first and say what it will cost.
+Reviewing is free. **`refresh` is the one verb that spends metered money on
+its own** (any verb given `--via api` also does) — check `status` first and
+say what it will cost.
 
 ## The loop
 
 ```
 python -m src.cli status --json            # worth running? can it afford to?
 python -m src.cli refresh --json          # get fresh listings (spends money)
-python -m src.cli next --top 3 --json      # a page of candidates
+python -m src.cli next --top 3 --json      # a page of NEW candidates
+python -m src.cli next --seen --json       # the backlog: shown, still undecided
+python -m src.cli saved --json             # what they kept
 python -m src.cli deep-dive <id> --json    # why it scored that way + research
 python -m src.cli save <id> --json         # they want it
 python -m src.cli pass <id> --json         # they don't
@@ -40,8 +43,9 @@ an existing queue without spending.
 
 Present the three listings compactly — title, company,
 verdict + confidence, location/distance, age, and whether a deep-dive is
-free — then ask what they want to do. Running `next` again pages forward;
-nothing is consumed by being shown. Lead with `status` instead when the user
+free — then ask what they want to do. Running `next` again pages forward to
+listings they have not seen; showing one retires it from the feed. Lead with
+`status` instead when the user
 opens with a broad question ("anything new?", "what's the state of
 things?") — it is free, and it says whether the queue already has fresh
 work or a refresh is the right move.
@@ -80,6 +84,20 @@ work or a refresh is the right move.
   "nothing to review".
 - `count: 0` with `hidden_stale > 0` means the queue is stale, not empty —
   say a refresh would bring new listings rather than "nothing to review".
+
+**The feed never repeats itself.** A listing shown once leaves `next`
+permanently — delivery already happened, and re-showing it is staleness, not
+a reminder. Two consequences:
+
+- `backlog` counts listings shown earlier that the user never decided on.
+  **Mention it when nonzero** — that is the only thing keeping those rows
+  visible. One clause is enough: "4 from earlier are still undecided."
+- `next --seen` returns exactly those, and does not re-stamp them. Reach for
+  it when the user says "what did I skip?", "show me those again", or asks
+  about something they remember seeing. `saved` is the other half — listings
+  they saved or tailored.
+
+Do not treat an empty feed as an empty queue while `backlog` is nonzero.
 
 **`refresh`** runs the pipeline and returns the first page. It, and any verb
 given `--via api`, are the only ways to spend metered money.

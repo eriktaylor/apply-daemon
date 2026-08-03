@@ -318,7 +318,8 @@ python -m src.report --days 7    # Last 7 days reference
 # CLI review surface — triage without Slack. Add --json for scripting.
 python -m src.cli status         # Queue freshness + today's spend vs budget
 python -m src.cli refresh        # Run the pipeline (--dry-run / --top-n N / --force)
-python -m src.cli next --top 3   # Next page of candidates
+python -m src.cli next --top 3   # Next page of new candidates (--seen for the backlog)
+python -m src.cli saved          # Listings you saved or tailored
 python -m src.cli deep-dive <id> # Stage 5 vs post-research verdict + dossier
 python -m src.cli save <id>      # or: pass <id> / pass --all
 python -m src.cli tailor <id>    # Tailor in-session (--via api to spend)
@@ -328,7 +329,7 @@ python -m src.cli polish <id>    # Also: cover-letter / interview-prep / answers
 python -m src.geo_backfill --dry-run
 ```
 
-The CLI reads `$APPLY_DAEMON_DB` (falling back to `./apply_daemon.db`), so it works from any directory. Showing a listing never consumes it — undecided listings return to the queue after a two-hour window.
+The CLI reads `$APPLY_DAEMON_DB` (falling back to `./apply_daemon.db`), so it works from any directory. The feed never repeats itself: a listing shown once is retired to the backlog, where `next --seen` can revisit it and `status` keeps it counted.
 
 **Slack reactions:** 👍 save · 👎 pass · ✏️ tailor · ❓ smart-route, directly on a digest card. Priority, idempotency, and every thread command are documented in [`docs/CHATOPS.md`](docs/CHATOPS.md).
 

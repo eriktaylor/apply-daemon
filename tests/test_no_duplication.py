@@ -80,6 +80,11 @@ OWNERSHIP: list[tuple[str, str, str]] = [
         "models.py",
         r'"raw_email_text",\s*"job_summary"',
     ),
+    (
+        "claude CLI subprocess transport (subscription-billed route)",
+        "claude_cli.py",
+        r'"claude",\s*"-p"',
+    ),
 ]
 
 # Patterns no module may contain, with the reason. Distinct from OWNERSHIP:

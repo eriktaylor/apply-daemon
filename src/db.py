@@ -32,6 +32,11 @@ REVIEW_STATUSES = ("auto", "auto_queued", "triaged")
 # AUTOPILOT_POST_STAGE_5 existed; the CLI review queue now does too.
 ENRICHED_STATUSES = ("auto",)
 
+# How `get_review_queue` treats `presented_at`. The feed shows what has never
+# been delivered; the backlog shows what was delivered and not acted on.
+UNSEEN_ONLY = "unseen"
+SEEN_ONLY = "seen"
+
 # Milliseconds a writer waits on a locked DB before raising. WAL gives
 # concurrent readers, but writers still serialize; short-lived CLI processes
 # invoked back-to-back would otherwise fail with "database is locked".
@@ -854,23 +859,31 @@ class Database:
         limit: int = 3,
         *,
         min_confidence_pct: int = 0,
-        session_window_minutes: int | None = None,
         max_age_days: int | None = None,
         statuses: tuple[str, ...] = REVIEW_STATUSES,
+        seen: str = UNSEEN_ONLY,
     ) -> list[sqlite3.Row]:
         """Return the next page of listings awaiting a human decision.
 
         Backs the CLI review surface (`plans/cli_skill_interface.md` I-1).
 
-        **``presented_at`` is paging state, not an eligibility gate.**
-        Eligibility comes from ``pipeline_status`` alone — a listing is
-        undecided until a human acts on it. Unlike ``slack_notified`` (a
-        one-way gate, correct there because a posted card persists in the
-        channel), a CLI presentation persists nowhere: if it gated
-        eligibility, "show 3" followed by a dead session would strand those
-        three forever. ``session_window_minutes`` only skips rows shown that
-        recently, so ``next`` pages forward within a sitting and undecided
-        rows reappear later.
+        **``presented_at`` is a delivery ledger.** ``seen=UNSEEN_ONLY`` (the
+        default) returns only listings never shown, so a run never repeats
+        the previous run's page — the same one-way semantics
+        ``slack_notified`` has always had, and for the same reason: delivery
+        happened, and re-delivering it is staleness, not a reminder.
+
+        This was previously a 120-minute paging window, on the reasoning that
+        a hard gate would strand a shown page if the session died. That risk
+        is real but is answered by reachability, not by re-showing:
+        ``seen=SEEN_ONLY`` backs an explicit "what haven't I acted on?" verb,
+        and ``count_seen_undecided`` keeps the backlog visible in ``status``.
+        Without those, retirement would indeed lose listings — do not gate
+        without them.
+
+        Confidence is stable, so re-ranking the same pool every run returns
+        the same winners forever; measured, nine fresh 95-98% enrichments
+        could not displace three 100% rows shown four runs in a row.
 
         **Ordering — tier, then quality band, then distance, then exact
         quality, then recency.** All in SQL, no network calls: an interactive
@@ -887,6 +900,12 @@ class Database:
         - Rows with no ``distance_bucket`` sort last within their band, never
           first — an unknown commute must not masquerade as a short one. Run
           ``python -m src.geo_backfill`` to populate them.
+        - Recency outranks exact confidence *within* a band. Confidence
+          saturates (a large share of the queue scores 90-100), so using it
+          as the final tiebreak sorted a growing backlog by an almost-constant
+          key and surfaced the oldest rows first. Banding already captured the
+          quality difference that matters; below that granularity, fresher is
+          the better listing — this is the freshness surface.
 
         ``max_age_days`` bounds *ingestion* age. It exists because this is the
         freshness surface and had no age check at all, while ``digest.py``
@@ -894,13 +913,10 @@ class Database:
         what was hidden — see ``cli.cmd_next``.
         """
         params: list = [min_confidence_pct]
-        cutoff_clause = ""
-        if session_window_minutes is not None:
-            cutoff = (
-                datetime.now(timezone.utc) - timedelta(minutes=session_window_minutes)
-            ).isoformat()
-            cutoff_clause = "AND (presented_at IS NULL OR presented_at < ?) "
-            params.append(cutoff)
+        if seen == SEEN_ONLY:
+            cutoff_clause = "AND presented_at IS NOT NULL "
+        else:
+            cutoff_clause = "AND presented_at IS NULL "
 
         age_clause = ""
         if max_age_days is not None and max_age_days > 0:
@@ -923,12 +939,45 @@ class Database:
             "ORDER BY tier_rank, "
             f"  (confidence / {CONFIDENCE_BAND_WIDTH}) DESC, "
             "  (distance_bucket IS NULL), distance_bucket ASC, "
-            "  confidence DESC, date_ingested DESC "
+            "  date_ingested DESC, confidence DESC "
             "LIMIT ?"
         )
         # Status placeholders bind before min_confidence_pct in the SQL text.
         params = [*statuses, *params, limit]
         return self.conn.execute(sql, params).fetchall()
+
+    def get_decided(
+        self, statuses: tuple[str, ...], limit: int = 20,
+    ) -> list[sqlite3.Row]:
+        """Listings the user has acted on, most recently decided first.
+
+        The archive half of the review model: the feed shows what is new, the
+        backlog what was shown and skipped, and this what was kept.
+        """
+        placeholders = ", ".join("?" for _ in statuses)
+        return self.conn.execute(
+            f"SELECT * FROM listings WHERE pipeline_status IN ({placeholders}) "
+            "ORDER BY updated_at DESC, date_ingested DESC LIMIT ?",
+            [*statuses, limit],
+        ).fetchall()
+
+    def count_seen_undecided(
+        self,
+        *,
+        min_confidence_pct: int = 0,
+        max_age_days: int | None = None,
+        statuses: tuple[str, ...] = REVIEW_STATUSES,
+    ) -> int:
+        """Listings shown to the user that they never decided on.
+
+        The backlog. This count is what makes retiring a shown listing safe:
+        the rows stop competing for a page slot but never become invisible.
+        """
+        rows = self.get_review_queue(
+            limit=10_000, min_confidence_pct=min_confidence_pct,
+            max_age_days=max_age_days, statuses=statuses, seen=SEEN_ONLY,
+        )
+        return len(rows)
 
     def count_stale_reviewable(
         self, max_age_days: int, statuses: tuple[str, ...] = REVIEW_STATUSES,

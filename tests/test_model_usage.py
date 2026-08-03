@@ -134,3 +134,21 @@ class TestMeteringCoverage:
             "OpenRouter call sites without usage logging (invariant 7): "
             + "; ".join(offenders)
         )
+
+
+class TestSubscriptionSpendIsNotMetered:
+    """The inverse of TestMeteringCoverage.
+
+    `logs/model_usage.log` is the basis for the daily spend ceiling
+    (src/budget.py). Subscription-billed work costs the user nothing at the
+    margin, so writing it there would make the budget refuse runs over money
+    nobody was charged — a self-inflicted outage, and the exact failure the
+    membership route exists to avoid.
+    """
+
+    def test_claude_cli_does_not_write_the_metered_log(self):
+        from pathlib import Path
+        src = Path(__file__).resolve().parent.parent / "src" / "claude_cli.py"
+        text = src.read_text(encoding="utf-8")
+        assert "log_response_usage(" not in text
+        assert "log_model_usage(" not in text

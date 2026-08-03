@@ -36,6 +36,7 @@ from dotenv import load_dotenv
 
 load_dotenv()
 
+from src import claude_cli
 from src.db import Database
 from src.listing_card import parse_skill_list
 from src.model_usage import log_response_usage
@@ -160,43 +161,20 @@ def score_via_claude_cli(model: str, profile: str, rows: list,
     real usage, including cache hits, which OpenRouter's list pricing cannot
     show us.
     """
-    import subprocess
-
     block = "\n".join(_format_listing(r) for r in rows)
     prompt = _LISTWISE_PROMPT.format(profile=profile, listings_block=block)
     prompt += "\n\nRespond with ONLY the JSON object, no prose, no code fence."
 
-    # Prompt goes on stdin, not argv: passing it as an argument fails without
-    # a TTY (backgrounded runs error with "Input must be provided either
-    # through stdin or as a prompt argument"), and these prompts are long
-    # enough to risk ARG_MAX.
-    proc = subprocess.run(
-        ["claude", "-p", "--model", model, "--output-format", "json"],
-        input=prompt, capture_output=True, text=True, timeout=timeout_s,
-    )
+    result = claude_cli.run(prompt, model=model, timeout_s=timeout_s,
+                            stage="eval_listwise")
     by_id: dict[str, dict] = {}
-    if proc.returncode != 0:
-        logger.warning("claude CLI failed (rc=%d): %s", proc.returncode,
-                       (proc.stderr or "")[-300:])
+    if not result.ok:
+        logger.warning("claude CLI failed: %s", result.error)
         return by_id, 0, 0, 0.0
+    in_tok, out_tok, cost = (
+        result.input_tokens, result.output_tokens, result.cost_usd)
     try:
-        envelope = json.loads(proc.stdout)
-    except json.JSONDecodeError:
-        logger.warning("claude CLI returned non-JSON envelope")
-        return by_id, 0, 0, 0.0
-
-    usage = envelope.get("usage", {}) or {}
-    # Cache reads/creations are real input the model processed; counting only
-    # `input_tokens` would understate the batch by orders of magnitude.
-    in_tok = (int(usage.get("input_tokens", 0) or 0)
-              + int(usage.get("cache_read_input_tokens", 0) or 0)
-              + int(usage.get("cache_creation_input_tokens", 0) or 0))
-    out_tok = int(usage.get("output_tokens", 0) or 0)
-    cost = float(envelope.get("total_cost_usd", 0.0) or 0.0)
-
-    text = _strip_fence(envelope.get("result", "") or "")
-    try:
-        data = json.loads(text)
+        data = json.loads(result.text)
     except json.JSONDecodeError:
         logger.warning("claude CLI result was not parseable JSON")
         return by_id, in_tok, out_tok, cost
@@ -210,17 +188,6 @@ def score_via_claude_cli(model: str, profile: str, rows: list,
             except (TypeError, ValueError):
                 continue
     return by_id, in_tok, out_tok, cost
-
-
-def _strip_fence(text: str) -> str:
-    text = text.strip()
-    if text.startswith("```"):
-        parts = text.split("```")
-        for part in parts:
-            cleaned = part.removeprefix("json").strip()
-            if cleaned.startswith("{"):
-                return cleaned
-    return text
 
 
 def score_listwise(client, model: str, profile: str, rows: list) -> tuple[dict, int, int]:

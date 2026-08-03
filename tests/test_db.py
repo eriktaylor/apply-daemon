@@ -6,6 +6,7 @@ import pytest
 
 from src.db import (
     DEFAULT_DB_PATH,
+    SEEN_ONLY,
     Database,
     _format_history_timeline,
     is_duplicate_email,
@@ -743,29 +744,62 @@ class TestReviewQueue:
         self._seed(db, title="Nope", company="A", verdict="NO", confidence=90)
         assert db.get_review_queue(limit=10) == []
 
-    def test_presented_rows_still_eligible_without_session_window(self, db):
-        """The core F2 guarantee: presenting does NOT remove a listing."""
+    def test_the_feed_retires_what_it_shows(self, db):
+        """A shown listing leaves the feed permanently, not for 120 minutes.
+
+        Re-showing was the defect: confidence is stable, so re-ranking the
+        same pool every run returned the same winners forever — measured,
+        three rows led the page four runs running while nine fresher
+        enrichments sat behind them.
+        """
         job_id = self._seed(db, title="Shown", company="A", confidence=80)
         db.mark_presented([job_id])
-        rows = db.get_review_queue(limit=10)
-        assert [r["id"] for r in rows] == [job_id]
+        assert db.get_review_queue(limit=10) == []
 
     def test_session_window_pages_forward(self, db):
         first = self._seed(db, title="First", company="A", confidence=90)
         second = self._seed(db, title="Second", company="B", confidence=80)
         db.mark_presented([first])
-        rows = db.get_review_queue(limit=10, session_window_minutes=60)
+        rows = db.get_review_queue(limit=10)
         assert [r["id"] for r in rows] == [second]
 
-    def test_stale_presentation_reappears(self, db):
+    def test_retired_rows_are_reachable_as_the_backlog(self, db):
+        """What makes retirement safe rather than lossy — the rows stop
+        competing for a slot but stay one command away."""
+        job_id = self._seed(db, title="Shown", company="A", confidence=80)
+        db.mark_presented([job_id])
+        rows = db.get_review_queue(limit=10, seen=SEEN_ONLY)
+        assert [r["id"] for r in rows] == [job_id]
+        assert db.count_seen_undecided() == 1
+
+    def test_backlog_excludes_decided_rows(self, db):
+        job_id = self._seed(db, title="Shown", company="A", confidence=80)
+        db.mark_presented([job_id])
+        db.update_pipeline_status(job_id, "passed")
+        assert db.count_seen_undecided() == 0
+
+    def test_age_of_presentation_is_irrelevant(self, db):
         job_id = self._seed(db, title="Stale", company="A", confidence=80)
-        old = (datetime.now(timezone.utc) - timedelta(hours=5)).isoformat()
+        old = (datetime.now(timezone.utc) - timedelta(days=5)).isoformat()
         db.conn.execute(
             "UPDATE listings SET presented_at = ? WHERE id = ?", (old, job_id)
         )
         db.conn.commit()
-        rows = db.get_review_queue(limit=10, session_window_minutes=60)
-        assert [r["id"] for r in rows] == [job_id]
+        assert db.get_review_queue(limit=10) == []
+        assert len(db.get_review_queue(limit=10, seen=SEEN_ONLY)) == 1
+
+    def test_recency_breaks_ties_within_a_band(self, db):
+        """Confidence saturates, so it cannot be the final tiebreak — that
+        sorted a growing backlog by an almost-constant key and surfaced the
+        oldest rows first."""
+        old = self._seed(db, title="Old", company="A", confidence=99)
+        new = self._seed(db, title="New", company="B", confidence=96)
+        stamp = (datetime.now(timezone.utc) - timedelta(days=20)).isoformat()
+        db.conn.execute("UPDATE listings SET date_ingested = ? WHERE id = ?",
+                        (stamp, old))
+        db.conn.commit()
+        rows = db.get_review_queue(limit=10)
+        assert [r["id"] for r in rows] == [new, old]
 
     def test_mark_presented_counts_rows(self, db):
         a = self._seed(db, title="A", company="A")

@@ -338,3 +338,51 @@ class TestRankShortlist:
         assert len(sent) == _RANK_SHORTLIST
         assert [c.id for c in sent] == [f"id-{i:03}" for i in range(_RANK_SHORTLIST)]
         assert picked is not None and len(picked) == 10
+
+
+class TestRescoreRoute:
+    """I-9: the post-research re-score is 97% of per-listing enrichment cost
+    and runs at most AUTOPILOT_TOP_N times a day — the shape that suits the
+    subscription route. It must never cost a listing, only money."""
+
+    def _run(self, monkeypatch, result):
+        import asyncio
+
+        from src.process_queue import _rescore_via_session
+        monkeypatch.delenv("AUTOPILOT_RESCORE_VIA", raising=False)
+        with patch("src.claude_cli.run", return_value=result):
+            return asyncio.run(_rescore_via_session("PROMPT", "abcd1234"))
+
+    def test_session_result_is_used(self, monkeypatch):
+        from src.claude_cli import ClaudeResult
+        payload = json.dumps({
+            "post_research_verdict": "YES",
+            "post_research_confidence": 91,
+            "match_analysis": "Good.",
+        })
+        got = self._run(monkeypatch, ClaudeResult(text=payload, ok=True))
+        assert got["post_research_verdict"] == "YES"
+
+    def test_unavailable_cli_falls_back(self, monkeypatch):
+        from src.claude_cli import ClaudeResult
+        got = self._run(monkeypatch, ClaudeResult(ok=False, error="not on PATH"))
+        assert got is None
+
+    def test_unparseable_output_falls_back(self, monkeypatch):
+        from src.claude_cli import ClaudeResult
+        got = self._run(monkeypatch, ClaudeResult(text="sorry, no", ok=True))
+        assert got is None
+
+    def test_via_api_skips_the_session_entirely(self, monkeypatch):
+        import asyncio
+
+        from src.process_queue import _rescore_via_session
+        monkeypatch.setenv("AUTOPILOT_RESCORE_VIA", "api")
+        with patch("src.claude_cli.run") as run:
+            assert asyncio.run(_rescore_via_session("P", "x")) is None
+        run.assert_not_called()
+
+    def test_session_is_the_default_route(self, monkeypatch):
+        from src.process_queue import rescore_route
+        monkeypatch.delenv("AUTOPILOT_RESCORE_VIA", raising=False)
+        assert rescore_route() == "session"

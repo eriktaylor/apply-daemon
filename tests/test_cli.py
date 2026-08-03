@@ -11,7 +11,7 @@ import json
 
 import pytest
 
-from src.cli import SESSION_WINDOW_MINUTES, main
+from src.cli import main
 from src.db import Database
 from src.models import JobListing
 
@@ -129,7 +129,8 @@ class TestJsonContract:
         _seed(db)
         _, payload = _run_json(capsys, "next")
         assert set(payload) == {"verb", "count", "listings", "max_age_days",
-                                "hidden_stale", "awaiting_enrichment", "tiers"}
+                                "hidden_stale", "awaiting_enrichment", "tiers",
+                                "seen", "backlog"}
         assert set(payload["listings"][0]) == self.CARD_KEYS
 
     def test_show_card_keys(self, db, capsys):
@@ -310,27 +311,45 @@ class TestLedger:
         assert load_labels(_ledger) == {saved: "positive", passed: "negative"}
 
 
-class TestSessionWindow:
-    def test_window_constant_matches_plan(self):
-        assert SESSION_WINDOW_MINUTES == 120
+class TestFeedAndBacklog:
+    """The feed shows what has never been delivered; the backlog shows what
+    was delivered and not acted on. Merging them re-ranked one pool by a
+    stable score, so the same rows won every run forever."""
 
-    def test_undecided_listing_returns_after_window(self, db, capsys):
-        from datetime import datetime, timedelta, timezone
+    def test_a_shown_listing_leaves_the_feed(self, db, capsys):
+        _seed(db)
+        assert _run_json(capsys, "next")[1]["count"] == 1
+        assert _run_json(capsys, "next")[1]["count"] == 0
 
+    def test_retired_listings_are_reachable_as_the_backlog(self, db, capsys):
+        """Retirement is only safe because this exists."""
+        _seed(db)
+        _run_json(capsys, "next")
+        page = _run_json(capsys, "next", "--seen")[1]
+        assert page["count"] == 1 and page["seen"] == "seen"
+
+    def test_the_backlog_is_reported_on_the_feed(self, db, capsys):
+        """Counted, so retired rows go quiet rather than invisible."""
+        _seed(db)
+        _run_json(capsys, "next")
+        assert _run_json(capsys, "next")[1]["backlog"] == 1
+
+    def test_deciding_clears_the_backlog(self, db, capsys):
         job_id = _seed(db)
         _run_json(capsys, "next")
-        assert _run_json(capsys, "next")[1]["count"] == 0  # inside window
+        _run_json(capsys, "pass", job_id)
+        assert _run_json(capsys, "next")[1]["backlog"] == 0
 
-        stale = (
-            datetime.now(timezone.utc)
-            - timedelta(minutes=SESSION_WINDOW_MINUTES + 10)
-        ).isoformat()
-        db.conn.execute(
-            "UPDATE listings SET presented_at = ? WHERE id = ?", (stale, job_id)
-        )
-        db.conn.commit()
-        # Not stranded: an undecided listing comes back around.
-        assert _run_json(capsys, "next")[1]["count"] == 1
+    def test_revisiting_the_backlog_does_not_re_stamp_it(self, db, capsys):
+        """Re-stamping would reorder the backlog by re-presentation rather
+        than by quality."""
+        _seed(db)
+        _run_json(capsys, "next")
+        before = db.get_listing_by_id(
+            db.get_review_queue(limit=1, seen="seen")[0]["id"])["presented_at"]
+        _run_json(capsys, "next", "--seen")
+        after = db.get_review_queue(limit=1, seen="seen")[0]["presented_at"]
+        assert before == after
 
 
 class TestDeepDive:
@@ -686,7 +705,7 @@ class TestStatusVerb:
         _, payload = _run_json(capsys, "status")
         assert set(payload) == {"verb", "queue", "budget"}
         assert set(payload["queue"]) == {
-            "reviewable", "fresh", "ready", "awaiting_enrichment",
+            "reviewable", "fresh", "ready", "backlog", "awaiting_enrichment",
             "stale_hidden", "max_age_days", "by_tier", "total_listings",
             "last_ingest", "last_ingest_age_hours", "last_decision",
         }
@@ -1126,7 +1145,8 @@ class TestSurfacesTellOneStory:
     def test_status_human_line_shows_the_split(self, db, capsys):
         self._mixed_queue(db)
         _, out = _run(capsys, "status")
-        assert "1 ready" in out and "3 fresh awaiting enrichment" in out
+        assert "1 new" in out and "3 awaiting enrichment" in out
+        assert "undecided from earlier" in out
 
     def test_status_steers_to_enrichment_not_max_age(self, db, capsys):
         for i in range(3):
