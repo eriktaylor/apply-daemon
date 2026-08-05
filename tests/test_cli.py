@@ -706,6 +706,7 @@ class TestStatusVerb:
         assert set(payload) == {"verb", "queue", "budget"}
         assert set(payload["queue"]) == {
             "reviewable", "fresh", "ready", "backlog", "awaiting_enrichment",
+            "enrichment_cap", "enriched_today", "enrichment_remaining",
             "stale_hidden", "max_age_days", "by_tier", "total_listings",
             "last_ingest", "last_ingest_age_hours", "last_decision",
         }
@@ -1175,3 +1176,61 @@ class TestSurfacesTellOneStory:
         db.conn.commit()
         _, payload = _run_json(capsys, "next")
         assert payload["hidden_stale"] == 0
+
+
+class TestEnrichmentCapacityIsVisible:
+    """Autopilot is what puts cards in Slack and rows in the enriched feed.
+    When its daily cap is spent, a refresh still costs money and still
+    ingests, but produces no new cards anywhere — which reads as a broken
+    Slack integration unless the surface says so. It did, once, for real."""
+
+    def test_status_reports_capacity(self, db, capsys, monkeypatch):
+        monkeypatch.setenv("AUTOPILOT_TOP_N", "10")
+        _, payload = _run_json(capsys, "status")
+        q = payload["queue"]
+        assert q["enrichment_cap"] == 10
+        assert q["enriched_today"] == 0
+        assert q["enrichment_remaining"] == 10
+
+    def test_human_line_warns_when_capped(self, db, capsys, monkeypatch):
+        monkeypatch.setenv("AUTOPILOT_TOP_N", "0")
+        _, out = _run(capsys, "status")
+        assert "cap reached" in out
+        assert "no new cards" in out
+
+    def test_human_line_shows_headroom_when_not_capped(self, db, capsys, monkeypatch):
+        monkeypatch.setenv("AUTOPILOT_TOP_N", "10")
+        _, out = _run(capsys, "status")
+        assert "0/10 used today" in out and "10 left" in out
+
+
+class TestSweepVerb:
+    """`cli sweep` is sweeper's dispatch with ✏️ deferred — the JSON contract
+    the skill reads, and the promise that a failed sweep is reported, not
+    raised."""
+
+    def _counts(self, **kw):
+        base = {"passed": 1, "saved": 2, "skipped": 3, "tailored": 0,
+                "deferred_tailors": []}
+        base.update(kw)
+        return base
+
+    def test_json_contract(self, db, capsys, mocker):
+        mocker.patch("src.sweeper.sweep", return_value=self._counts())
+        _, payload = _run_json(capsys, "sweep")
+        assert set(payload) == {"verb", "ok", "passed", "saved", "skipped",
+                                "pending_tailors"}
+        assert payload["ok"] and payload["passed"] == 1
+
+    def test_defers_and_names_the_free_route(self, db, capsys, mocker):
+        mocker.patch("src.sweeper.sweep",
+                     return_value=self._counts(deferred_tailors=["abc123"]))
+        _, out = _run(capsys, "sweep")
+        assert "tailor abc123" in out
+        assert "no API cost" in out
+
+    def test_failure_is_reported_not_raised(self, db, capsys, mocker):
+        mocker.patch("src.sweeper.sweep", side_effect=RuntimeError("slack down"))
+        code, payload = _run_json(capsys, "sweep")
+        assert code == 1
+        assert payload["error"] == "sweep_failed" and "slack down" in payload["detail"]

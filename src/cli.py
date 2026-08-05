@@ -450,6 +450,44 @@ def cmd_next(db: Database, top: int, as_json: bool, max_age: int | None,
     return 0
 
 
+def cmd_sweep(db: Database, limit: int, as_json: bool) -> int:
+    """Process Slack reactions from here, billing ✏️ to the subscription.
+
+    Same reaction logic as `python -m src.sweeper` — it *is* that code, with
+    the tailor step deferred. 👍/👎 apply immediately (no LLM, no spend); ✏️
+    ids come back in `pending_tailors` for `cli tailor <id>` to answer
+    in-session, which is the only difference: Slack's own sweeper has no
+    session to hand a prompt to, so its ✏️ costs ~$0.11 through OpenRouter.
+    """
+    from src.sweeper import sweep
+
+    try:
+        counts = sweep(limit=limit, defer_tailor=True)
+    except Exception as exc:
+        logger.error("Sweep failed: %s", exc)
+        _emit({"verb": "sweep", "ok": False, "error": "sweep_failed",
+               "detail": str(exc)},
+              as_json, f"Sweep failed: {exc}")
+        return 1
+
+    pending = counts.get("deferred_tailors", [])
+    payload = {"verb": "sweep", "ok": True,
+               "passed": counts.get("passed", 0),
+               "saved": counts.get("saved", 0),
+               "skipped": counts.get("skipped", 0),
+               "pending_tailors": pending}
+
+    lines = [f"Swept Slack: {payload['passed']} passed, {payload['saved']} saved"
+             f", {payload['skipped']} already current."]
+    if pending:
+        lines.append(
+            f"{len(pending)} listing(s) reacted ✏️ and are waiting to be "
+            "tailored in-session (no API cost):")
+        lines += [f"  python -m src.cli tailor {jid}" for jid in pending]
+    _emit(payload, as_json, "\n".join(lines))
+    return 0
+
+
 def cmd_saved(db: Database, top: int, as_json: bool) -> int:
     """Listings you decided to keep — saved or already tailored."""
     rows = db.get_decided(("saved", "tailored"), limit=top)
@@ -531,6 +569,13 @@ def cmd_status(db: Database, as_json: bool) -> int:
     backlog = db.count_seen_undecided(
         max_age_days=max_age or None, statuses=tiers,
     )
+    # Enrichment capacity. Autopilot is what puts cards in Slack and rows in
+    # the enriched feed, so when its daily cap is spent a refresh still costs
+    # money and still ingests, but produces no new cards anywhere — which
+    # looks like a broken integration unless something says so.
+    from src.process_queue import _top_n
+    enrich_cap = _top_n()
+    enriched_today = db.count_autopilot_processed_today()
 
     payload = {
         "verb": "status",
@@ -540,6 +585,9 @@ def cmd_status(db: Database, as_json: bool) -> int:
             "ready": ready,
             "backlog": backlog,
             "awaiting_enrichment": awaiting,
+            "enrichment_cap": enrich_cap,
+            "enriched_today": enriched_today,
+            "enrichment_remaining": max(0, enrich_cap - enriched_today),
             "stale_hidden": stale,
             "max_age_days": max_age,
             "by_tier": stats["by_status"],
@@ -567,10 +615,15 @@ def cmd_status(db: Database, as_json: bool) -> int:
         },
     }
 
+    remaining = max(0, enrich_cap - enriched_today)
     lines = [
         f"Queue:   {ready} new  ·  {backlog} undecided from earlier  ·  "
         f"{awaiting} awaiting enrichment  ·  {stale} stale  "
         f"({stats['reviewable']} total)",
+        f"Enrich:  {enriched_today}/{enrich_cap} used today"
+        + ("   ⚠️  cap reached — a refresh will ingest but produce no new "
+           "cards until tomorrow" if remaining == 0 else
+           f"   ·   {remaining} left"),
         f"Ingest:  {_fmt_age(ingest_age)}"
         f"   ·   last decision {_fmt_age(_age_hours(stats['last_decision']))}",
     ]
@@ -1062,6 +1115,12 @@ def build_parser() -> argparse.ArgumentParser:
     p_saved.add_argument("--top", type=int, default=10,
                          help="How many to show (default: 10)")
 
+    p_sweep = sub.add_parser(
+        "sweep", parents=[common],
+        help="Process Slack reactions; ✏️ comes back for in-session tailoring")
+    p_sweep.add_argument("--limit", type=int, default=50,
+                         help="Messages to scan (default: 50)")
+
     sub.add_parser("status", parents=[common],
                    help="Queue freshness and today's spend against budget")
 
@@ -1151,6 +1210,8 @@ def main(argv: list[str] | None = None) -> int:
                             args.all_tiers, args.seen)
         if args.verb == "saved":
             return cmd_saved(db, args.top, args.json)
+        if args.verb == "sweep":
+            return cmd_sweep(db, args.limit, args.json)
         if args.verb == "show":
             return cmd_show(db, args.id, args.json)
         if args.verb == "deep-dive":

@@ -23,6 +23,13 @@ The entire post-triage workflow is driven by Slack reactions and thread commands
 
 Each digest message includes a reaction legend. No buttons or Socket Mode required — just react on the message:
 
+> **Two ways to process reactions.** `python -m src.sweeper` runs unattended
+> and executes everything below as documented, including the metered ✏️
+> tailor. `python -m src.cli sweep` applies the same reactions from a Claude
+> session — identical dispatch logic — but returns ✏️ ids as
+> `pending_tailors` so `cli tailor <id>` can run them on the subscription
+> instead. Same decisions either way; only who pays for tailoring differs.
+
 | Reaction | Action | Result |
 |----------|--------|--------|
 | :thumbsup: | **Save** | Status → `saved`, bot adds :white_check_mark: receipt |

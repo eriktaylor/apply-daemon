@@ -1,6 +1,6 @@
 """Tests for the reaction-based sweeper module."""
 
-from unittest.mock import MagicMock
+from unittest.mock import MagicMock, patch
 
 import pytest
 
@@ -1295,3 +1295,62 @@ class TestTrendChunks:
             assert len(wrapped) <= _SLACK_SECTION_TEXT_MAX, (
                 f"chunk exceeds Slack section limit: {len(wrapped)} chars"
             )
+
+
+class TestDeferTailor:
+    """`cli sweep` reuses this dispatcher so the two surfaces cannot disagree
+    about what a reaction means. The ONLY difference is who pays for ✏️:
+    Slack runs unattended and must use OpenRouter (~$0.11/listing); a sweep
+    driven from a session defers the ids and tailors on the subscription."""
+
+    def _msg(self, job_id, emoji="pencil2"):
+        return {"ts": "1.0", "text": f"`{job_id}`",
+                "reactions": [{"name": emoji, "users": ["U1"]}]}
+
+    def _db(self, status="auto"):
+        row = {"pipeline_status": status, "id": "abc123",
+               "title": "T", "company": "C"}
+        db = MagicMock()
+        db.get_listing_by_id.return_value = row
+        return db
+
+    def _counts(self):
+        return {"passed": 0, "saved": 0, "tailored": 0, "questions": 0,
+                "skipped": 0, "deferred_tailors": []}
+
+    def _run(self, defer, status="auto"):
+        from src.sweeper import _dispatch_reactions
+        counts = self._counts()
+        with patch("src.sweeper._extract_job_id", return_value="abc123"), \
+             patch("src.sweeper._handle_tailor") as handle, \
+             patch("src.sweeper._append_human_label"):
+            _dispatch_reactions(MagicMock(), self._db(status), "C1",
+                                [self._msg("abc123")], counts, defer)
+        return counts, handle
+
+    @pytest.mark.parametrize("status", ["auto", "saved", "triaged"])
+    def test_deferred_sweep_never_calls_the_metered_tailor(self, status):
+        counts, handle = self._run(defer=True, status=status)
+        handle.assert_not_called()
+        assert counts["deferred_tailors"] == ["abc123"]
+        assert counts["tailored"] == 0
+
+    @pytest.mark.parametrize("status", ["auto", "saved"])
+    def test_unattended_sweep_still_tailors_inline(self, status):
+        counts, handle = self._run(defer=False, status=status)
+        handle.assert_called_once()
+        assert counts["tailored"] == 1
+        assert counts["deferred_tailors"] == []
+
+    def test_pass_is_applied_either_way(self):
+        """Only ✏️ defers — state transitions cost nothing and must not wait
+        on a session that may never come back."""
+        from src.sweeper import _dispatch_reactions
+        counts = self._counts()
+        with patch("src.sweeper._extract_job_id", return_value="abc123"), \
+             patch("src.sweeper._handle_pass") as handle, \
+             patch("src.sweeper._append_human_label"):
+            _dispatch_reactions(MagicMock(), self._db("auto"), "C1",
+                                [self._msg("abc123", "-1")], counts, True)
+        handle.assert_called_once()
+        assert counts["passed"] == 1

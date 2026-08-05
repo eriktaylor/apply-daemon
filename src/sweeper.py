@@ -221,8 +221,17 @@ def _auto_pass_no_verdict_cards(
 
 def _dispatch_reactions(
     app, db: Database, channel: str, messages: list, counts: dict,
+    defer_tailor: bool = False,
 ) -> None:
     """Priority-first reaction dispatch for a batch of Slack messages.
+
+    ``defer_tailor`` changes only who pays for a ✏️. Slack runs unattended, so
+    its tailor goes through OpenRouter (metered). A sweep driven from a Claude
+    session can instead collect the ids into ``counts["deferred_tailors"]`` and
+    let the caller run ``cli tailor <id>``, which bills the subscription. Every
+    other action — pass, save, the ledger writes, the priority order — is
+    identical either way, which is the point of putting the switch here rather
+    than in a second dispatcher.
 
     Exclusive-action priority order: pass > tailor > save.
     Only the highest-priority reaction present on each card fires; lower-priority
@@ -273,6 +282,9 @@ def _dispatch_reactions(
         elif highest == "tailor":
             if current_status in ("triaged", "saved"):
                 # Standard fresh tailor
+                if defer_tailor:
+                    counts["deferred_tailors"].append(job_id)
+                    continue
                 _append_human_label(job_id, "tailor", row)
                 _handle_tailor(
                     app, db, channel, ts, job_id, msg,
@@ -291,6 +303,9 @@ def _dispatch_reactions(
                     research_file = folder / "deep_research_context.txt"
                     if research_file.exists():
                         cached_research = research_file.read_text(encoding="utf-8")
+                if defer_tailor:
+                    counts["deferred_tailors"].append(job_id)
+                    continue
                 _append_human_label(job_id, "tailor", row)
                 _handle_tailor(
                     app, db, channel, ts, job_id, msg,
@@ -378,13 +393,16 @@ def _dispatch_reactions(
                 counts["questions"] += 1
 
 
-def sweep(limit: int = 50) -> dict:
+def sweep(limit: int = 50, *, defer_tailor: bool = False) -> dict:
     """Scan the Slack channel for reactions and process them.
 
     Args:
         limit: Total number of messages to scan. When > 200 (Slack's per-page
                max), cursor pagination fetches additional pages automatically.
                Pass a higher value via ``--deep N`` on the CLI.
+        defer_tailor: collect ✏️ ids into ``deferred_tailors`` instead of
+               running the metered tailor. Set by ``cli sweep`` so the caller
+               can tailor in-session on the subscription.
 
     Returns a summary dict with counts of each action taken.
     """
@@ -394,6 +412,7 @@ def sweep(limit: int = 50) -> dict:
         return {
             "passed": 0, "saved": 0, "tailored": 0, "questions": 0,
             "chatops": 0, "triage": 0, "trend": 0, "skipped": 0, "regenerate": 0,
+            "deferred_tailors": [],
         }
 
     try:
@@ -403,6 +422,7 @@ def sweep(limit: int = 50) -> dict:
         return {
             "passed": 0, "saved": 0, "tailored": 0, "questions": 0,
             "chatops": 0, "triage": 0, "trend": 0, "skipped": 0, "regenerate": 0,
+            "deferred_tailors": [],
         }
 
     from slack_sdk.http_retry.builtin_handlers import RateLimitErrorRetryHandler
@@ -412,6 +432,7 @@ def sweep(limit: int = 50) -> dict:
     counts = {
         "passed": 0, "saved": 0, "tailored": 0, "questions": 0,
         "chatops": 0, "triage": 0, "trend": 0, "skipped": 0, "regenerate": 0,
+        "deferred_tailors": [],
     }
 
     # Fetch messages with cursor pagination so --deep N can reach beyond the
@@ -455,7 +476,7 @@ def sweep(limit: int = 50) -> dict:
         # was in place — convert them to "Passed" so they leave the active lane.
         _auto_pass_no_verdict_cards(app, db, channel, messages, counts)
 
-        _dispatch_reactions(app, db, channel, messages, counts)
+        _dispatch_reactions(app, db, channel, messages, counts, defer_tailor)
 
         # --- ChatOps pass: scan threads for !commands ---
         chatops_count = _scan_chatops_commands(app, db, channel, messages)

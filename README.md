@@ -89,17 +89,18 @@ you:
 ```
 You:  anything good today?
 
-      → checks the budget, runs the batch, enriches the top matches,
-        and comes back with the shortlist
+      → applies your Slack reactions, checks whether the queue is already
+        stocked, and answers from it if so — instantly, for nothing
 
-Claude: Ran the batch — $0.42, 44 new listings, 3 enriched.
+Claude: Swept Slack: 2 passed. 30 ready to review, no refresh needed.
 
         [1] YES: Staff ML Engineer — Acme
             Palo Alto, CA (Local)  |  new · 2d  |  YES 95%
             TL;DR: Own the applied-eval stack for agentic systems…
             Skills: 75% (3/4)
             match: Agentic AI, Evaluation, Python   gaps: Finance domain
-            auto · research cached — deep-dive is free
+            https://example.com/jobs/4448240991
+            id: 8f2c1a04  ·  research cached — deep-dive is free
 
         [2] … [3] …
 
@@ -107,6 +108,11 @@ Claude: Ran the batch — $0.42, 44 new listings, 3 enriched.
 
 You:  1 looks good, pass the others
 ```
+
+It only runs the batch when the queue is actually empty — a refresh takes
+minutes and costs money, and the listings it ingests aren't reviewable until
+the *next* run enriches them. Ask on a stocked queue and you get an answer in
+about a second.
 
 **No agent?** One command does the same thing, and prints per-stage progress
 as it goes:
@@ -318,7 +324,8 @@ python -m src.report             # All-time reference
 python -m src.report --days 7    # Last 7 days reference
 
 # CLI review surface — triage without Slack. Add --json for scripting.
-python -m src.cli status         # Queue freshness + today's spend vs budget
+python -m src.cli sweep          # Apply your Slack reactions (free, run first)
+python -m src.cli status         # Queue freshness, enrichment capacity, spend
 python -m src.cli refresh        # Run the pipeline (--dry-run / --top-n N / --force)
 python -m src.cli next --top 3   # Next page of new candidates (--seen for the backlog)
 python -m src.cli saved          # Listings you saved or tailored
@@ -343,14 +350,16 @@ Post-triage work happens on two surfaces.
 
 **The CLI** (`python -m src.cli`, command list in step H) is where new work goes. A bundled Claude Code skill (`.claude/skills/apply-daemon/`) drives it conversationally: ask Claude "what's new?" and it walks you through the top matches, deep-dives whichever you pick, and records your decisions. Reviewing never spends tokens — enrichment is pre-cached by autopilot, and in-session tailoring is billed to your Claude session, not an API.
 
-**Slack** is the ambient surface: the digest plus four reactions, processed by `python -m src.sweeper`. Thread commands are **frozen** — new verbs land in the CLI — and every asset they produce now has a CLI equivalent that runs in-session instead of on the API:
+**Slack** is the ambient surface: the digest plus four reactions, triageable from a phone. Thread commands are **frozen** — new verbs land in the CLI.
 
-| Asset | CLI (free, in-session) | Slack (metered) |
+**The two surfaces share one set of decisions.** `python -m src.cli sweep` reads your Slack reactions and applies them here — it *is* the sweeper's dispatch logic, so 👍/👎 mean exactly what they mean unattended. The one difference is who pays for ✏️:
+
+| Reaction / command | Unattended (`src.sweeper`) | From the CLI (`cli sweep`) |
 |---|---|---|
-| Polish a tailor run into a final document | `cli polish <id>` | `!polish` |
-| Cover letter | `cli cover-letter <id>` | `!coverletter` |
-| Interview prep | `cli interview-prep <id>` | `!prep` |
-| Answer custom application questions | `cli answers <id> --questions "…"` | `!answer` |
+| 👍 save · 👎 pass | applied, free | applied, free |
+| ✏️ tailor | runs immediately, **~$0.11 via OpenRouter** | returned as `pending_tailors` → `cli tailor <id>`, **$0** |
+
+Same for the on-demand assets: `!polish` / `!coverletter` / `!prep` / `!answer` each cost $0.04–$0.09 through the API, while `cli polish` / `cover-letter` / `interview-prep` / `answers` produce identical artifacts on your Claude subscription. Slack has no session to hand a prompt to, which is the whole reason for the split — **react from your phone, tailor from the CLI.**
 
 Full reference: [`docs/CHATOPS.md`](docs/CHATOPS.md).
 

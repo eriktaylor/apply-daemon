@@ -8,8 +8,12 @@ description: Drive the apply-daemon job-search pipeline — fetch fresh listings
 Walk the user through job listings the pipeline has already collected and
 scored. The loop is: **show three → they pick → repeat.**
 
-All work goes through `python -m src.cli`. Every verb takes `--json`; parse
-that, never the prose output. Run from the repo root.
+All work goes through `.venv/bin/python -m src.cli`, run from the repo root.
+Every verb takes `--json`; parse that, never the prose output.
+
+**Use `.venv/bin/python`, not `python`.** There is no `python` on PATH in a
+default shell here, and `source .venv/bin/activate` does not persist between
+tool calls. The explicit interpreter path always works and needs no setup.
 
 Reviewing is free. **`refresh` is the one verb that spends metered money on
 its own** (any verb given `--via api` also does) — check `status` first and
@@ -18,46 +22,58 @@ say what it will cost.
 ## The loop
 
 ```
-python -m src.cli status --json            # worth running? can it afford to?
-python -m src.cli refresh --json          # get fresh listings (spends money)
-python -m src.cli next --top 3 --json      # a page of NEW candidates
-python -m src.cli next --seen --json       # the backlog: shown, still undecided
-python -m src.cli saved --json             # what they kept
-python -m src.cli deep-dive <id> --json    # why it scored that way + research
-python -m src.cli save <id> --json         # they want it
-python -m src.cli pass <id> --json         # they don't
-python -m src.cli pass --all --json        # none of these three
-python -m src.cli show <id> --json         # detail without the dossier
-python -m src.cli tailor <id> --json       # tailor a resume (see below)
+.venv/bin/python -m src.cli status --json            # worth running? can it afford to?
+.venv/bin/python -m src.cli refresh --json          # get fresh listings (spends money)
+.venv/bin/python -m src.cli next --top 3 --json      # a page of NEW candidates
+.venv/bin/python -m src.cli next --seen --json       # the backlog: shown, still undecided
+.venv/bin/python -m src.cli saved --json             # what they kept
+.venv/bin/python -m src.cli sweep --json             # apply Slack reactions (free)
+.venv/bin/python -m src.cli deep-dive <id> --json    # why it scored that way + research
+.venv/bin/python -m src.cli save <id> --json         # they want it
+.venv/bin/python -m src.cli pass <id> --json         # they don't
+.venv/bin/python -m src.cli pass --all --json        # none of these three
+.venv/bin/python -m src.cli show <id> --json         # detail without the dossier
+.venv/bin/python -m src.cli tailor <id> --json       # tailor a resume (see below)
 ```
 
-**Default motion — one call.** For "anything good today?" / "what's new?" /
-"any fresh matches?", run `refresh --json`: it checks the budget, runs the
-batch, and returns the first page in `page`. Report the cost and present that
-page. Don't call `status` then `refresh` then `next` — `refresh` is the whole
-sequence.
+**Default motion — `sweep`, then `status`, then decide.** For "anything good
+today?" / "what's new?", first run `sweep --json` (their phone reactions land
+before you show them anything), then `status --json`. Both are free; sweep
+takes a second or two of Slack I/O, status is instant. Status answers the
+only question that matters: is there already fresh work?
 
-Use `status` alone when the user asks about state rather than results ("how's
-the queue?", "what have I spent?"), and `next` alone to page forward through
-an existing queue without spending.
+- **`queue.ready > 0`** → run `next --top 3`. Present those. **Do not
+  refresh.** A refresh takes 2–4 minutes and spends money to ingest listings
+  that will not be reviewable until the *next* run enriches them, so
+  refreshing on a stocked queue makes the user wait and pay for nothing they
+  can act on now.
+- **`queue.ready == 0`** → refresh is the right call. Say what it will cost
+  and that it takes a few minutes, then run it; it chains into a page.
+- **`queue.enrichment_remaining == 0`** → say so before refreshing. Autopilot
+  is what produces reviewable cards and Slack posts; with its daily cap spent
+  a refresh still ingests and still bills, but adds nothing to either surface
+  until tomorrow. Offer `next`/`next --seen` instead.
+- **`budget.can_run: false`** → report `reason` verbatim and fall back to
+  `next`.
 
-Present the three listings compactly — title, company,
-verdict + confidence, location/distance, age, and whether a deep-dive is
-free — then ask what they want to do. Running `next` again pages forward to
-listings they have not seen; showing one retires it from the feed. Lead with
-`status` instead when the user
-opens with a broad question ("anything new?", "what's the state of
-things?") — it is free, and it says whether the queue already has fresh
-work or a refresh is the right move.
+Prefer the cheap, instant answer. The user asked what is good today, not for
+the pipeline to run.
 
 ## Reading the output
 
 **`status`** returns `{verb, queue, budget}`.
 
-- `queue.fresh` is the number that matters: undecided listings inside the
-  freshness window. `queue.reviewable` is the total including stale;
-  `queue.by_tier` splits it into `auto` / `auto_queued` / `triaged`.
-  Fresh 0 with a large stale count means "refresh", not "all done".
+- **`queue.ready` is the number that decides your next call** — listings that
+  are fresh, enriched, and never shown. That is what `next` can hand back
+  right now. `queue.fresh` is broader (includes rows autopilot has not
+  enriched, which `next` will not show by default), `queue.reviewable` is
+  broader still (includes stale). Ready 0 with a large stale count means
+  "refresh"; ready 0 with a large `awaiting_enrichment` means the cap, not
+  the queue, is the constraint.
+- `queue.enriched_today` / `enrichment_cap` / `enrichment_remaining` are
+  autopilot's daily budget. Remaining 0 means no new cards will appear on
+  *either* surface — chat or Slack — until tomorrow, however many listings a
+  refresh ingests.
 - `queue.last_ingest_age_hours` is how stale the newest listings are.
 - `budget.can_run` is whether a pipeline run is permitted right now, with
   `budget.reason` explaining it. Report the reason verbatim when it is
@@ -69,6 +85,33 @@ work or a refresh is the right move.
 **`next`** returns `{verb, count, listings[]}`. Each card has `id`, `title`,
 `company`, `location`, `salary`, `verdict`, `confidence`, `status`, `tier`,
 `research_cached`, `url`, `date_ingested`.
+
+### How to present a listing
+
+**Always include the `url`, as a clickable link, on every listing you show.**
+This is not optional formatting. The user's next action is almost always
+"open it and read the posting" — a card without its link is a dead end that
+forces them back to Slack or a search engine to act on what you just showed
+them. Slack cards have always carried the link; a chat summary that drops it
+is strictly worse than the surface it replaces.
+
+Also always include the `id`, so the user can name a listing for `deep-dive`,
+`save`, `pass`, or `tailor` without you re-querying.
+
+A good rendering is compact and complete:
+
+```
+1. Senior AI Engineer — Talkspace   ·  YES 95%  ·  Remote  ·  2d old
+   Leading RL strategy + multi-agent architecture for a behavioral-health
+   AI product. Skills 3/4 — has RL, multi-agent, healthcare AI; missing
+   control theory.
+   https://www.linkedin.com/jobs/view/4448240991
+   id: 8f2c1a04
+   (research cached — deep-dive is free)
+```
+
+Never summarize a page into prose that omits links and ids. The point of this
+surface is speed *to a decision*, and a decision needs the posting.
 
 - `tier` is `auto` / `auto_queued` / `triaged`. **`auto` means the research
   is already cached, so a deep-dive costs nothing** — say so when offering.
@@ -99,13 +142,28 @@ a reminder. Two consequences:
 
 Do not treat an empty feed as an empty queue while `backlog` is nonzero.
 
+**`sweep`** applies the reactions the user left in Slack — 👍 save, 👎 pass —
+and returns any ✏️ ids in `pending_tailors`. It is free and fast.
+
+- **Run it at the start of a session**, before `status`. The user triages from
+  their phone; those decisions belong in the queue before you show them
+  anything, or you will present listings they already passed on.
+- `pending_tailors` are listings they marked ✏️ but that have **not** been
+  tailored yet. Deliberate: Slack's own sweeper would spend ~$0.11 each
+  through OpenRouter, while `cli tailor <id>` costs nothing because you answer
+  the prompt. Offer to run them, and say the tailoring is free.
+- Never tell the user to react ✏️ in Slack "and let the sweeper handle it" —
+  that is the expensive path. From here, `cli tailor <id>` is strictly better
+  and produces identical artifacts.
+
 **`refresh`** runs the pipeline and returns the first page. It, and any verb
 given `--via api`, are the only ways to spend metered money.
 
 - `page` holds the first page of results; render it rather than calling
   `next` again, which would skip past those listings.
 
-- Check `status` first: if `queue.fresh` is healthy, reviewing beats refreshing.
+- Check `status` first — see "Default motion" above. Refreshing a stocked
+  queue costs minutes and money for listings that are not yet reviewable.
 - `--dry-run` shows the stages and the budget verdict without spending; use it
   when the user asks "what would that cost?".
 - `ok: false` with `error: "budget_blocked"` means a cap or the cooldown
@@ -114,7 +172,13 @@ given `--via api`, are the only ways to spend metered money.
   when the cooldown lifts. **Do not pass `--force`** unless the user
   explicitly asks — it exists for them, not for you.
 - `spent_usd_this_run` is what the run actually cost. Report it.
-- On success, follow with `next`.
+- `page` is already the first page — render it (with urls and ids). Do not
+  call `next` afterwards; that would page *past* what you just showed.
+- **A refresh does not guarantee new cards.** Ingestion and enrichment are
+  separate: a run can score 80 listings while autopilot enriches none, if its
+  daily cap was already spent. If the page looks unchanged, check
+  `status.enrichment_remaining` and say so plainly rather than implying the
+  run failed.
 
 **`deep-dive`** returns `{verb, ok, listing, research, post_research}`.
 
@@ -151,9 +215,9 @@ Two steps, and **you** are the model in the middle — that is the point. The
 work is billed to this session rather than metered per token, so prefer it.
 
 ```
-python -m src.cli tailor <id>              # 1. prints the prompt
+.venv/bin/python -m src.cli tailor <id>              # 1. prints the prompt
 # ... you answer it, producing JSON ...
-python -m src.cli tailor <id> --apply -    # 2. pipe your JSON back in
+.venv/bin/python -m src.cli tailor <id> --apply -    # 2. pipe your JSON back in
 ```
 
 Step 1 emits a prompt containing the candidate profile, base resume, the
@@ -184,10 +248,10 @@ Four more assets use the identical two-step handshake — emit, answer as
 JSON, `--apply` it back — and are free the same way:
 
 ```bash
-python -m src.cli polish <id>          # final document; needs a prior tailor
-python -m src.cli cover-letter <id>
-python -m src.cli interview-prep <id>
-python -m src.cli answers <id> --questions "Why this company? ..."
+.venv/bin/python -m src.cli polish <id>          # final document; needs a prior tailor
+.venv/bin/python -m src.cli cover-letter <id>
+.venv/bin/python -m src.cli interview-prep <id>
+.venv/bin/python -m src.cli answers <id> --questions "Why this company? ..."
 ```
 
 Each accepts `--apply` and `--via api` exactly as `tailor` does, so read the
