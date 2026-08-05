@@ -52,14 +52,17 @@ Once configured, OpenRouter automatically forwards Anthropic-model requests thro
 
 Stage 5 scoring runs a single call to `OPENROUTER_MODEL` and returns a verdict (`YES` / `MAYBE` / `NO`) and a confidence percentage. Rejection rules:
 
-- **`NO` is always rejected**, regardless of confidence. A high-confidence NO is still a NO and never reaches Slack.
-- **`YES` / `MAYBE`** survive only when confidence is at or above `CONFIDENCE_THRESHOLD` (a fraction between `0.0` and `1.0`, default `0.5`).
+- **`NO` is always rejected**, regardless of confidence. A high-confidence NO is still a NO.
+- **`YES` / `MAYBE`** survive only when confidence is at or above `CONFIDENCE_THRESHOLD` (a fraction between `0.0` and `1.0`; the code falls back to `0.5` when unset, and `.env.example` ships `0.40`).
+
+**Rejection means deletion.** A listing below the threshold is never written to the database — it cannot be reviewed, ranked, or recovered later, and nothing logs its passing. This is the knob's real weight: it is a *keep/discard* decision, not a display filter. The separate `NOISE_FLOOR_PCT` decides what autopilot spends enrichment on, and being wrong there costs nothing — the row stays queryable. Keep `CONFIDENCE_THRESHOLD` below the bottom band of your profile's ranking ladder so "ranked last" never silently becomes "deleted"; the interaction is worked through in [`docs/PROFILE.md`](PROFILE.md).
 
 | `CONFIDENCE_THRESHOLD` | Behaviour |
 |---|---|
 | `0.0` | Keep every YES / MAYBE — only NO verdicts are rejected. (Equivalent to the legacy `accept_all` mode.) |
-| `0.5` | **Default.** YES/MAYBE below 50% are auto-rejected; 55–75% surface as MAYBE / needs-review; ≥ 80% on a YES verdict surface as AUTO_MATCH. |
-| `0.75` | Strict — only surface YES/MAYBE the model is highly confident about. |
+| `0.40` | **Template default.** Low floor for profiles that rank across a ladder of bands; the bottom bands survive as rows while `NOISE_FLOOR_PCT` (e.g. `55`) keeps enrichment spend at the top. |
+| `0.5` | Code fallback when unset. YES/MAYBE below 50% are deleted; ≥ 80% on a YES verdict surfaces as AUTO_MATCH. |
+| `0.75` | Strict — only keep YES/MAYBE the model is highly confident about. Everything else is deleted, not hidden. |
 
 The same value also gates AUTO_MATCH in the digest: a `YES` verdict marks as AUTO_MATCH when its confidence is at or above `max(CONFIDENCE_THRESHOLD, 0.8) × 100`%. So raising the threshold above 0.8 tightens both rejection *and* AUTO_MATCH simultaneously.
 

@@ -33,7 +33,7 @@ Work through these once during onboarding, in order. Each item maps to a section
 - [ ] **C. Install dependencies**
 - [ ] **D. Set up the Slack channel and bot** *(optional — skip for CLI-only use)*
 - [ ] **E. Configure OpenRouter (required) and your `.env`**
-- [ ] **F. Configure `profile.md` (required), `search_config.yaml` (Track A), and/or email alerts (Track B)**
+- [ ] **F. Configure `profile.md` (required — see [`docs/PROFILE.md`](docs/PROFILE.md)), `search_config.yaml` (Track A), and/or email alerts (Track B)**
 - [ ] **G. Configure an IPRoyal residential proxy for heavy scraping (optional)**
 - [ ] **H. Run the pipeline**
 
@@ -227,7 +227,7 @@ Fill in your `.env` — every variable is documented inline in [`.env.example`](
 - **OPENROUTER_API_KEY** *(required)* — powers the pipeline's LLM calls. Get a key at [openrouter.ai/keys](https://openrouter.ai/keys). Per-stage model slots, defaults, and BYOK setup: [`docs/MODELS.md`](docs/MODELS.md).
 - **SLACK_BOT_TOKEN** / **SLACK_CHANNEL_ID** — From step D.
 - **GMAIL_ADDRESS** / **GMAIL_APP_PASSWORD** — Required only if you plan to use Track B email ingestion (step F). Create a dedicated Gmail account for job alerts, enable 2FA, and generate an [App Password](https://support.google.com/accounts/answer/185833).
-- **CONFIDENCE_THRESHOLD** — minimum Stage 5 confidence to keep a listing. Bands and migration notes: [`docs/MODELS.md`](docs/MODELS.md).
+- **CONFIDENCE_THRESHOLD** — minimum Stage 5 confidence to **keep** a listing. Below it, the listing is never stored and can't be reviewed later, so keep it below the bottom of your profile's ranking ladder; use `NOISE_FLOOR_PCT` to decide what's worth *enriching*. Bands and migration notes: [`docs/MODELS.md`](docs/MODELS.md); how the two interact: [`docs/PROFILE.md`](docs/PROFILE.md).
 
 Runtime knobs that don't belong in `profile.md` (model slots, `CONFIDENCE_THRESHOLD`, `GENERATE_ASSETS`, Slack tokens, IPRoyal credentials) all live in `.env`.
 
@@ -238,6 +238,8 @@ Pick at least one of Track A or Track B. `profile.md` is required for both.
 #### `profile.md` (required)
 
 Edit `my_profile/profile.md` — write naturally about who you are, what you want, and what you don't want. The LLM reads it like a person would. Richer descriptions produce better matching. Drop your `base_resume` (and optional `cover_letter`) from step A into `my_profile/` alongside it.
+
+**This file decides everything you see, so it repays a careful first draft — read [`docs/PROFILE.md`](docs/PROFILE.md) before writing it.** The two mistakes that cost the most: writing for a pass/fail threshold instead of a ranked ladder (which collapses every match into one band and makes the ordering meaningless), and writing reject rules that need exceptions (which silently drops good listings before you ever see them). The guide covers both, plus how to keep the profile in sync with your résumé — it feeds résumé tailoring as well as scoring, so a stale claim there can end up in a document you send an employer.
 
 The **Pipeline Settings** table in `profile.md` (e.g. `max_listings_per_run`, `dedup_window_days`, `pass_window_days`, `batch_process_days`, `home_location`, `max_listing_age_days`) controls runtime behaviour. See [`my_profile_example/profile.md`](my_profile_example/profile.md) for the full set of values and inline notes.
 

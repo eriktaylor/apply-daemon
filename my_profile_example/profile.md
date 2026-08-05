@@ -34,8 +34,46 @@ My trajectory is toward senior IC roles at companies where engineering culture v
 ## What I'm looking for
 
 <!-- Be specific about role type, location, compensation, and preferences.
-     The LLM uses this to make yes/no/maybe calls on listings. Vague preferences
-     produce vague results. -->
+     The LLM uses this to rank listings against each other.
+
+     READ docs/PROFILE.md BEFORE EDITING THIS SECTION. The single most common
+     mistake is writing for a pass/fail threshold instead of for rank order,
+     which collapses everything into one band and makes the ranking useless. -->
+
+### How to score
+
+<!-- Keep this block. Adjust the bands to your own targets, but keep the
+     instruction to spread scores and the "everything else" band at the end. -->
+
+**Selection is by rank order within a batch, not by an absolute threshold.
+Spread the scores.** If most of a batch lands in the same band, the ranking
+carries no information. Given two listings that both look acceptable, say
+which is better and why.
+
+Rank by the ladder below, highest band first. Within a band, use the
+tie-breakers.
+
+- **Band A — best fit.** Distributed systems and data-pipeline architecture
+  where I own the design: event processing, streaming infrastructure, the
+  systems other engineers build on top of.
+- **Band B — platform and developer tooling.** Internal platforms, developer
+  experience, infrastructure-as-product.
+- **Band C — backend engineering with real ownership.** Senior/Staff IC roles
+  where I own a service end to end rather than implementing tickets.
+- **Band D — everything else that survives the literal rejects.** Surface it,
+  but rank it last.
+
+**Rank UP within a band:** small focused team · genuinely remote-friendly ·
+the listing describes a concrete technical problem rather than a stack list ·
+Series A–C.
+
+**Rank DOWN within a band (these are not rejects):** large org where the role
+is one narrow slice · heavy on-call or maintenance duty · vague engineering
+language with no system described · compensation clearly below $120K.
+
+<!-- Keyword count is not fit. A listing that sprays fashionable vocabulary
+     but describes narrow implementation work ranks BELOW one in plainer
+     language that clearly hands you design ownership. -->
 
 **Role type:** Senior or Staff-level IC focused on backend systems, platform engineering, or distributed infrastructure. I want hard technical problems with a small, focused team.
 
@@ -80,16 +118,38 @@ Mildly interested in: Rust adoption in backend systems, machine learning infrast
 
 ## What I don't want
 
-<!-- Be equally specific here. The LLM uses these to reject listings quickly.
-     Include both hard dealbreakers and softer red flags. -->
+<!-- Two lists, and the split matters. A rule that needs an exception to be
+     correct is not a reject rule — every reject misfire is a good listing
+     dropped before you ever see it, silently. Put judgement calls in the
+     second list. See docs/PROFILE.md §4. -->
 
-**Wrong role type:** Junior, entry-level, or intern roles. People management (Manager, Director, VP). Data analyst or BI roles. QA or manual testing roles.
+### Literal rejects — decidable without judgement
 
-**Wrong technical focus:** Primarily front-end (React/Angular/Vue without backend). Mobile development (iOS/Android). Enterprise IT (Salesforce, SAP, Oracle). Legacy systems (mainframe, COBOL, .NET, Java-heavy stacks). CMS work (WordPress, Drupal).
+<!-- Only things readable straight off the listing text: named stacks, named
+     products, interview markers, credential gates, geography, seniority. -->
 
-**Wrong environment:** On-site only outside Seattle metro. Federal or defense contractor roles (usually requires clearance). Consulting or agency work.
+- Junior, entry-level, intern, or new-grad roles.
+- Core stack is PHP, .NET, or Java/Scala.
+- Enterprise IT products: Salesforce, SAP, Oracle, Workday, ServiceNow.
+- Legacy systems: mainframe, COBOL, Hadoop.
+- Primarily front-end (React/Angular/Vue) with no backend component.
+- Mobile development (iOS/Android) as the primary role.
+- Requires an active security clearance.
+- Six or more interview rounds, or LeetCode/whiteboard screens stated in the
+  process.
+- On-site required outside the Seattle metro.
 
-**Red flags:** "Rockstar" / "ninja" / "guru" language. "Unlimited PTO." Six-plus round interview processes. PHP as the primary language. Whiteboard coding emphasis.
+### Rank down, do not reject
+
+<!-- Everything needing a judgement call. These reduce rank but stay in the
+     pool — better to review and pass than to miss one. -->
+
+- People management (Manager/Director/VP) — unless the role is explicitly
+  hands-on at a small company.
+- Data analyst or BI-flavored work with some engineering attached.
+- Consulting or agency work.
+- "Rockstar" / "ninja" / "guru" culture language, or "unlimited PTO."
+- Vague postings that list a stack but never describe a problem.
 
 ---
 
@@ -103,7 +163,7 @@ Mildly interested in: Rust adoption in backend systems, machine learning infrast
 | dedup_window_days | 30 | How far back to check for duplicates (active listings) |
 | pass_window_days | 180 | How long passed/expired listings stay blocked before resurfacing |
 | batch_process_days | 3 | Batch process only saved jobs from the past n days |
-| home_location | Oakland, CA | Base location for commute distance calculations |
+| home_location | Seattle, WA | Base location for commute distance calculations |
 | max_listing_age_days | 60 | Drop YES/MAYBE listings whose date_posted is older than this many days. Listings with unknown date_posted always pass. Leave blank to disable filter (badge will still render). |
 
 ---

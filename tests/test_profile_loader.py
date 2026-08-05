@@ -55,8 +55,12 @@ def test_settings_parsed(profile):
 
 
 def test_home_location_parsed(profile):
+    """The template's home_location must match the persona it describes —
+    it shipped as a real maintainer's city while the persona lived in
+    Seattle, which is both a stray personal detail in a public file and a
+    contradiction the LLM reads as scoring context."""
     settings = profile["settings"]
-    assert settings.get("home_location") == "Oakland, CA"
+    assert settings.get("home_location") == "Seattle, WA"
 
 
 def test_missing_profile_raises():
