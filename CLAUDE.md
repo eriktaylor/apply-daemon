@@ -24,7 +24,7 @@ python -m src.jobspy_ingest     # Track A: proactive JobSpy scrape
 python -m src.pipeline          # Track B: email ingestion
 python -m src.digest            # Post Slack digest cards
 python -m src.sweeper           # Process Slack reactions + ChatOps commands
-python -m src.cli status        # CLI review surface (also: refresh/next/show/deep-dive/save/pass)
+python -m src.cli status        # CLI review surface (also: refresh/next/saved/sweep/show/deep-dive/save/pass)
                                 # tailor + polish/cover-letter/interview-prep/answers: in-session by default
 python -m src.batch_process     # Concurrent tailor for all saved listings
 python -m src.process_queue     # Autopilot Speculative Agent (no-op unless AUTOPILOT_ENABLED=true)
@@ -41,11 +41,11 @@ Two ingestion tracks converge on a shared LLM scoring stage and a single SQLite 
 
 **The pipeline diagrams live in [README.md](README.md#how-it-works)** — "Ingestion & scoring" and "Review & apply". They are not repeated here; see the anti-drift principle below. What follows is the agent-facing map: which module owns what.
 
-Load-bearing behaviors a change can easily break:
+Load-bearing behaviors a change can easily break, grouped by what they guard:
 
+**Scoring**
 - **Dedup runs *before* Stage 5** — already-known listings are skipped without spending tokens. The Smart Upsert afterwards handles races between tracks.
 - **Three independent OpenRouter model slots** (`OPENROUTER_STAGE1_MODEL`, `OPENROUTER_MODEL` for Stage 5, `OPENROUTER_TAILOR_MODEL`, plus optional `OPENROUTER_TREND_MODEL`) let cost/quality be tuned per stage. See [docs/MODELS.md](docs/MODELS.md).
-- **Autopilot** (`process_queue.py`) is a no-op unless `AUTOPILOT_ENABLED=true`. It pre-caches Deep Research so a CLI deep-dive costs nothing.
 - **Stage 5 may batch** (`STAGE5_LISTWISE_BATCH`): `triage.prescore_batch`
   scores N listings per call and caches verdicts. Coverage is stochastic and
   logged; anything a batch omits — or a whole batch rejected on its anchor —
@@ -56,27 +56,19 @@ Load-bearing behaviors a change can easily break:
   regenerated into a tailored résumé. Any change to what the profile carries
   has to be considered against both consumers. Authoring guidance lives in
   [docs/PROFILE.md](docs/PROFILE.md).
-- **`CONFIDENCE_THRESHOLD` deletes; `NOISE_FLOOR_PCT` only declines to spend.**
-  A listing below the first is never stored and cannot be reviewed, ranked, or
-  recovered; below the second it stays queryable and merely skips enrichment.
-  They default to the same value, which silently converts "rank this low" into
-  "discard this" — the trap for any profile that ranks across a ladder.
-- **A rule that needs an exception is not a gate rule.** Applies to prompts as
-  much as to profiles: a cheap-model stage asked to apply
-  *reject-unless-one-of-six* fails toward false negatives, which are invisible.
-  Push conditional judgement to the stage that has the context for it.
+- **`CONFIDENCE_THRESHOLD` deletes; `NOISE_FLOOR_PCT` only declines to spend**
+  — they default to the same value, which silently converts "rank this low"
+  into "discard this" for any profile that ranks across a ladder. Mechanism
+  and defaults: [docs/MODELS.md](docs/MODELS.md#confidence-threshold).
+- **A rule that needs an exception is not a gate rule** — the profile-authoring
+  version of this lesson is in [docs/PROFILE.md](docs/PROFILE.md), and it
+  generalizes to prompts: a cheap-model stage asked to apply
+  *reject-unless-one-of-six* fails toward false negatives, which are
+  invisible. Push conditional judgement to the stage that has the context
+  for it.
+
+**Review feed**
 - **`presented_at` is a delivery ledger, and the feed retires what it shows.** Re-showing was the defect: confidence is stable, so re-ranking one pool returns the same winners forever. Retirement is only safe because `next --seen` and `status.backlog` keep those rows reachable — see `db.get_review_queue`'s docstring, the only copy.
-- **The re-score prefers the session route.** `AUTOPILOT_RESCORE_VIA=session` shells out through `src/claude_cli.py` (subscription-billed, never written to `logs/model_usage.log` — that file drives the spend ceiling). Falls back to OpenRouter on any failure. Stage 5 deliberately stays metered: the CLI's ~23k-token startup overhead is decisive against 100+ small calls — though note that argument is about *this* transport, not all of them (`src/gemini_cli.py` parallelises 8-wide at ~100% efficiency and still lost, on latency and dropped batches rather than overhead). See [docs/MODELS.md](docs/MODELS.md#the-session-route-subscription-billed).
-- **`refresh` contains a stage failure instead of cancelling the chain, and
-  returns before Slack does.** No stage reads another's exit code — all five
-  communicate only through SQLite — so one failure says nothing about the
-  next; *two consecutive* failures trip a circuit breaker and abandon the
-  rest. `ok` still means "everything succeeded", which is why `partial` and
-  `failed_stages` exist. Both `digest` stages are launched detached, so
-  autopilot may be posting Slack cards while a digest is: that is what
-  `digest._already_delivered` guards, and why detaching is off when
-  `AUTOPILOT_POST_STAGE_5` puts both on the same rows. `--wait` restores the
-  fully in-line chain for cron/CI.
 - **The feed ranks by the post-research re-score; both scores are kept.**
   Autopilot writes its re-score to `post_research_verdict` /
   `post_research_confidence` (`db.set_post_research_score`), *never* over
@@ -88,7 +80,21 @@ Load-bearing behaviors a change can easily break:
   pre-research number 106 of them shared. **The eval gold standard reads that
   JSON, not the DB** (`eval.listwise_compare.load_gold`) — keep it that way,
   or a backfill silently re-baselines every eval number.
-- **The re-score prefers the session route.** `AUTOPILOT_RESCORE_VIA=session` shells out through `src/claude_cli.py` (subscription-billed, never written to `logs/model_usage.log` — that file drives the spend ceiling). Falls back to OpenRouter on any failure. Stage 5 deliberately stays metered: the CLI's ~23k-token startup overhead is decisive against 100+ small calls. See [docs/MODELS.md](docs/MODELS.md#the-session-route-subscription-billed).
+
+**Spend & billing**
+- **Autopilot** (`process_queue.py`) is a no-op unless `AUTOPILOT_ENABLED=true`. It pre-caches Deep Research so a CLI deep-dive costs nothing.
+- **The re-score prefers the session route.** `AUTOPILOT_RESCORE_VIA=session` shells out through `src/claude_cli.py` (subscription-billed, never written to `logs/model_usage.log` — that file drives the spend ceiling). Falls back to OpenRouter on any failure. Stage 5 deliberately stays metered: the CLI's ~23k-token startup overhead is decisive against 100+ small calls — though note that argument is about *this* transport, not all of them (`src/gemini_cli.py` parallelises 8-wide at ~100% efficiency and still lost, on latency and dropped batches rather than overhead). See [docs/MODELS.md](docs/MODELS.md#the-session-route-subscription-billed).
+
+**Run orchestration**
+- **`refresh` contains a stage failure instead of cancelling the chain, and
+  returns before Slack does.** No stage reads another's exit code — all five
+  communicate only through SQLite — so one failure says nothing about the
+  next; *two consecutive* failures trip a circuit breaker and abandon the
+  rest (`ok`/`partial`/`failed_stages` semantics: see the skill). Both
+  `digest` stages are launched detached, so autopilot may be posting Slack
+  cards while a digest is — that's what `digest._already_delivered` guards,
+  and why detaching is off when `AUTOPILOT_POST_STAGE_5` puts both on the
+  same rows. `--wait` restores the fully in-line chain for cron/CI.
 
 ### Project structure
 
@@ -107,7 +113,7 @@ apply-daemon/
 │   ├── sweeper.py               # Reaction sweeper + ChatOps parser. Priority: pass > tailor > save. Idempotent.
 │   │                            # THREAD COMMANDS ARE FROZEN — see Conventions.
 │   ├── human_labels.py          # Shared human-feedback ledger writer (data/human_labels.jsonl)
-│   ├── cli.py                   # CLI review surface (status/next/show/deep-dive/save/pass/tailor + 4 asset verbs). Local-only except --via api.
+│   ├── cli.py                   # CLI review surface (status/next/saved/sweep/show/deep-dive/save/pass/tailor + 4 asset verbs). Local-only except --via api.
 │   ├── decisions.py             # Shared decision policy (verb→status, guard) for every surface
 │   ├── listing_card.py          # Card contract: the one field set every review surface renders
 │   ├── budget.py                # Spend ceilings: daily USD cap, run cooldown, projection (refuse-and-report)
@@ -122,12 +128,16 @@ apply-daemon/
 │   ├── batch_process.py         # Concurrent OpenRouter tailor requests for every saved listing
 │   ├── process_queue.py         # Autopilot Speculative Agent (no-op unless AUTOPILOT_ENABLED=true)
 │   ├── email_fetcher.py         # IMAP connection + retrieval
+│   ├── email_config.py          # Loads my_profile/email_config.yaml — Track B sender allowlist + knobs
+│   ├── email_aggregator.py      # Track B: pools alert-email candidates, cheap-signal + reachability shortlist
 │   ├── email_classifier.py      # Header-only regex classification (no LLM)
 │   ├── text_extractor.py        # Generic HTML → text (no platform-specific parsers)
 │   ├── triage.py                # Stage 5 LLM scoring (multi-line prompts; E501 ignored)
+│   ├── ranking.py               # Shared listwise/swiss LLM ranking (RANKING_MODE) — Track B shortlist + Stage 5 top-N
 │   ├── mismatch_gate.py         # Autopilot: hybrid title↔body gate (substring → LLM fallback)
 │   ├── expired_probe.py         # Autopilot: HTTP backstop for expired/dead listings
 │   ├── audit_log.py             # Pipe-delimited audit log for silent drops; file sink is logs/audit.log (see docs/AUDIT.md)
+│   ├── model_usage.py           # OpenRouter spend telemetry (model/stage/tokens) → logs/model_usage.log; feeds budget.py
 │   ├── file_logger.py           # Shared FileHandler-attach-once helper (audit_log.py + model_usage.py)
 │   ├── geo.py                   # Nominatim geocoding + LRU cache + haversine
 │   ├── models.py                # JobListing dataclass
@@ -168,19 +178,17 @@ intended driver is the bundled skill in `.claude/skills/apply-daemon/`, which
 is where per-verb guidance lives — this section covers only what a coding
 agent working *on* the repo needs.
 
-**The daily motion is one utterance.** `refresh` runs the batch and chains
-straight into the first page (`page` in its JSON), so "anything good today?"
-is a single call, not a sequence. Any new verb that produces listings should
-chain the same way rather than telling the user to run something else.
+**`refresh` chains into a page in the same call** (`page` in its JSON) — a
+listing-producing verb should never require a follow-up call to show its
+results. *When* to call `refresh` versus `sweep`/`next` is runtime routing
+policy, owned by the skill, not this file.
 
-**Reviewing is free; only `refresh` and `--via api` spend metered money.**
-The four on-demand assets (`polish`, `cover-letter`, `interview-prep`,
-`answers`) share `tailor`'s emit/apply handshake and `src/tailor.py`'s
-`ASSET_SPECS` registry — a new asset is an entry there plus a row in
-`cli._ASSET_VERBS`, never a new code path.
-Enrichment is pre-cached by autopilot, and tailoring runs in-session. Keep it
-that way: a read verb that makes a network call breaks the conversational
-loop's latency and its cost story at once.
+**A new on-demand asset is a registry entry, never a new code path.**
+`polish`, `cover-letter`, `interview-prep`, and `answers` share `tailor`'s
+emit/apply handshake via `src/tailor.py`'s `ASSET_SPECS` registry plus a row
+in `cli._ASSET_VERBS`. Enrichment is pre-cached by autopilot and tailoring
+runs in-session — keep it that way: a read verb that makes a network call
+breaks the conversational loop's latency and its cost story at once.
 
 **`auto_queued` is backend state, not review material** — raw Stage 5 output
 with no research and no large-model re-score. `next` shows enriched rows only
@@ -227,6 +235,7 @@ When editing:
   the pointers still read true.
 - **Prefer deleting to duplicating.** Moving a section is better than
   summarizing it in a second place.
+
 ### Anti-drift in code
 
 The same rule, and it fails the same way: a behavior implemented twice
@@ -285,22 +294,16 @@ When auditing your own or prior work, these are steps rather than instincts:
 ## Conventions
 
 - Multi-line LLM prompt templates in `triage.py` / `tailor.py` are deliberately one prose sentence per line so the wire-format is preserved — do not reflow them; ruff E501 is already ignored for these files.
-- Several entry points need `load_dotenv()` before importing modules that read env at import time → E402 is ignored for those (`pipeline.py`, `digest.py`, `batch_process.py`, `jobspy_ingest.py`, `process_queue.py`, `proxy_test.py`, `sweeper.py`, `tailor.py`).
+- Several entry points need `load_dotenv()` before importing modules that read env at import time → E402 is ignored for those (`pipeline.py`, `digest.py`, `batch_process.py`, `geo_backfill.py`, `jobspy_ingest.py`, `process_queue.py`, `proxy_test.py`, `sweeper.py`, `tailor.py`).
 - Squash on merge; commit messages on `main` read like changelog entries.
-- **Stage 5 model swaps must pass the gate:** `python -m eval.listwise_compare
-  --gold --shuffle --model <slug>` before any slug change. Measured basis:
-  `gpt-5.4-nano` collapsed to 58% on this task, and every tier upgrade tested
-  since — Flash and Pro alike — has bought nothing. Version numbers are not
-  fitness.
-- **The gate's own metric is weak; know this before citing a percentage.**
-  It is exact verdict match against a model referee, on a class-imbalanced
-  set — *always answering YES scored 62%* the last time it was checked, so a
-  result in the low 60s has beaten a constant by nothing, and exact match
-  actively penalises a model for being more conservative than the referee.
-  Score a ranking metric alongside it (the pipeline ranks and gates; it never
-  needs the label to match), and treat gaps of a few points at n≤50 as noise
-  — two slugs once differing by 5 points tied exactly on re-run. The only
-  non-proxy ground truth is `data/human_labels.jsonl`.
+- **Stage 5 or ranking model swaps must pass the gate** — `python -m
+  eval.listwise_compare --gold --shuffle --model <slug>` — before any slug
+  change; version numbers are not fitness. The gate's own metric is weak
+  (exact match against a model referee, class-imbalanced — a naive
+  always-YES baseline already scores in the low 60s), so also check a
+  ranking metric and treat n≤50 gaps of a few points as noise.
+  `data/human_labels.jsonl` is the only non-proxy ground truth. Measured
+  basis and full caveat: [docs/MODELS.md](docs/MODELS.md#pending-model-slot-review).
 - **Slack thread commands (`!applied`, `!triage`, `!trend`, …) are frozen** — they still work, but new post-triage functionality belongs in the CLI review surface, not `sweeper.py`. Slack *reactions* (👍 👎 ✏️ ❓) are unaffected. See `docs/CHATOPS.md`.
 - **Every human decision must append to `data/human_labels.jsonl`** via `src/human_labels.py::append_human_label` (pass `surface=`). That ledger is the only input to the preference-pair extractor behind the ranking evals — a surface that skips it is invisible to that work, silently.
-- **Metered spend must be auditable.** Any code path that calls OpenRouter routes its token count through `src/model_usage.py::log_model_usage` (model, stage, tokens — never prompt or response content). `logs/model_usage.log` is the audit trail and the basis for spend ceilings (`src/budget.py`); a spending path missing from it makes the budget unenforceable. All nine call sites comply, and `tests/test_model_usage.py::TestMeteringCoverage` fails the suite if a new one doesn't. In-session (subscription-billed) work is exempt: it has no metered cost to record.
+- **Metered spend must be auditable.** Any code path that calls OpenRouter routes its token count through `src/model_usage.py::log_model_usage` (model, stage, tokens — never prompt or response content). `logs/model_usage.log` is the audit trail and the basis for spend ceilings (`src/budget.py`); a spending path missing from it makes the budget unenforceable. `tests/test_model_usage.py::TestMeteringCoverage` greps every `chat.completions.create` call site in `src/` and fails the suite if one doesn't log its usage. In-session (subscription-billed) work is exempt: it has no metered cost to record.
