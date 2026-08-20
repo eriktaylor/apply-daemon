@@ -120,9 +120,12 @@ class TestJsonContract:
     # change is reviewed rather than absorbed silently.
     CARD_KEYS = {
         "id", "title", "company", "verdict", "confidence", "location",
-        "distance", "url", "tldr", "skills_pct", "skills_matched",
-        "skills_total", "matching_skills", "missing_skills", "age_days",
-        "freshness", "tier", "research_cached",
+        "post_research_verdict", "post_research_confidence",
+        "confidence_delta", "confidence_source",
+        "effective_verdict", "effective_confidence",
+        "distance", "distance_detail", "url", "tldr", "skills_pct",
+        "skills_matched", "skills_total", "matching_skills", "missing_skills",
+        "age_days", "freshness", "tier", "research_cached",
         "status", "date_ingested", "salary",
     }
     DETAIL_KEYS = CARD_KEYS | {"reason"}

@@ -46,7 +46,7 @@ from src.decisions import target_status
 from src.expired_probe import probe as expired_probe
 from src.file_utils import read_dropzone_file
 from src.geo import get_distance
-from src.listing_card import parse_skill_list, skills_match
+from src.listing_card import build_card, format_verdict_line, parse_post_research
 from src.mismatch_gate import check_mismatch
 from src.model_usage import log_response_usage
 from src.models import (
@@ -418,101 +418,124 @@ def _merge_assets_json(folder: Path, auto_json: dict, research_context: str) -> 
 
 
 
-def _card_skills_line(listing: dict) -> str:
-    """Stage 5 skills summary for the autopilot card (shared contract)."""
-    matching = parse_skill_list(listing.get("matching_skills"))
-    missing = parse_skill_list(listing.get("missing_skills"))
-    pct, matched, total = skills_match(matching, missing)
-    if pct is None:
+def _card_skills_line(card: dict) -> str:
+    """The card's skills field set, in Slack's dialect.
+
+    Presentation only: every number here comes off the card, because the
+    percentage was once computed in three places and one of them silently
+    stopped rendering.
+    """
+    if card["skills_pct"] is None:
         return ":dart: *Skills Match:* N/A (Not specified in listing)"
-    text = f":dart: *Skills Match:* {pct}% ({matched}/{total})"
+    text = (
+        f":dart: *Skills Match:* {card['skills_pct']}% "
+        f"({card['skills_matched']}/{card['skills_total']})"
+    )
     parts = []
-    if matching:
-        parts.append(f":white_check_mark: *Matching:* {', '.join(matching)}")
-    if missing:
-        parts.append(f":x: *Gaps:* {', '.join(missing)}")
+    if card["matching_skills"]:
+        parts.append(
+            f":white_check_mark: *Matching:* {', '.join(card['matching_skills'])}"
+        )
+    if card["missing_skills"]:
+        parts.append(f":x: *Gaps:* {', '.join(card['missing_skills'])}")
     if parts:
         text += "\n" + "  |  ".join(parts)
     return text
 
 
-def _build_slack_blocks(listing: dict, auto_json: dict, folder: Path) -> tuple[list[dict], dict]:
-    """Build the Slack card + the threaded Deep Evaluation blocks."""
-    title = listing.get("title", "Unknown")
-    company = listing.get("company", "Unknown")
-    location = listing.get("location", "")
-    salary = listing.get("salary", "")
-    confidence = listing.get("confidence", 0)
-    verdict = listing.get("verdict", "")
-    job_summary = listing.get("job_summary", "")
-    listing_id = listing.get("id", "")
+def _pin_location(listing: dict) -> str:
+    """The listing's location, or "" when it is only a placeholder."""
+    location = (listing.get("location") or "").strip()
+    return "" if location.lower() == "not specified" else location
 
-    links_raw = listing.get("links", "")
-    links: list[str] = []
-    if links_raw:
-        try:
-            links = json.loads(links_raw) if isinstance(links_raw, str) else links_raw
-        except (json.JSONDecodeError, TypeError):
-            links = []
+
+def _autopilot_card(listing: dict, post: dict | None) -> dict:
+    """The canonical card for an enriched listing, mid-run.
+
+    The re-score is handed in rather than re-read from the row: autopilot has
+    it in memory and has just written it, so this renders exactly what the
+    CLI feed will show. Distance is geocoded here because the contract stays
+    pure — the same reason ``research_cached`` is passed in.
+    """
+    location = _pin_location(listing)
+    return build_card(
+        listing,
+        post_research=post or None,
+        distance_detail=get_distance(location) if location else None,
+    )
+
+
+def _build_slack_blocks(listing: dict, auto_json: dict, folder: Path) -> tuple[list[dict], dict]:
+    """Build the Slack card + the threaded Deep Evaluation blocks.
+
+    An adapter over ``listing_card.build_card`` — Block Kit is this
+    function's only contribution. It assembled its own field set from
+    ``auto_json`` and the raw row until R-4, which is how one listing came to
+    read ``MAYBE 58%`` here and ``YES 95%`` in the CLI.
+    """
+    post = parse_post_research(auto_json, listing.get("confidence")) or {}
+    card = _autopilot_card(listing, post)
+    title = card["title"] or "Unknown"
+    company = card["company"] or "Unknown"
 
     header_text = f"*{title}* — {company}"
-    if links:
-        header_text = f"<{links[0]}|*{title}*> — {company}"
-    if location and location != "not specified":
-        distance = get_distance(location)
+    if card["url"]:
+        header_text = f"<{card['url']}|*{title}*> — {company}"
+    location = _pin_location(listing)
+    if location:
+        distance = card["distance_detail"]
         if distance == "Remote":
             header_text += "\n:round_pushpin: Remote"
-        elif distance != "Distance unknown":
+        elif distance and distance != "Distance unknown":
             header_text += f"\n:round_pushpin: {location} ({distance} from home)"
         else:
             header_text += f"\n:round_pushpin: {location}"
 
-    detail_parts = [
-        f":robot_face: Auto-evaluated  |  {verdict} ({confidence}%)",
-    ]
-    if salary and salary != "not listed":
-        detail_parts.append(f":moneybag: {salary}")
+    # The effective score, with the Stage 5 one it displaced. This line read
+    # Stage 5 alone while the message text beside it read post-research — the
+    # card disagreed with its own notification.
+    detail_parts = [f":robot_face: Auto-evaluated  |  {format_verdict_line(card)}"]
+    if card["salary"] and card["salary"] != "not listed":
+        detail_parts.append(f":moneybag: {card['salary']}")
 
     card_blocks: list[dict] = [
         {"type": "section", "text": {"type": "mrkdwn", "text": header_text}},
-        {"type": "context", "elements": [{"type": "mrkdwn", "text": d} for d in detail_parts]},
+        {"type": "context",
+         "elements": [{"type": "mrkdwn", "text": d} for d in detail_parts]},
     ]
-    if job_summary:
-        card_blocks.extend([
-            {
-                "type": "section",
-                "text": {"type": "mrkdwn",
-                         "text": f":memo: *TL;DR:* {job_summary[:800]}"},
-            },
-            {
-                # Stage 5 skills, via the shared card contract. The autopilot
-                # card is a THIRD renderer (after digest and the CLI) and
-                # previously showed skills only in its thread, from
-                # post-research JSON — so an enriched listing's card silently
-                # lacked the skills line every other surface carries.
-                # Post-research skills still appear in the thread below; this
-                # is the card-level summary.
-                "type": "section",
-                "text": {"type": "mrkdwn", "text": _card_skills_line(listing)},
-            },
-        ])
+    if card["tldr"]:
+        card_blocks.append({
+            "type": "section",
+            "text": {"type": "mrkdwn",
+                     "text": fit_section_text(f":memo: *TL;DR:* {card['tldr'][:800]}")},
+        })
+    # Stage 5 skills, via the shared card contract. The autopilot card is a
+    # THIRD renderer (after digest and the CLI) and previously showed skills
+    # only in its thread, from post-research JSON — so an enriched listing's
+    # card silently lacked the skills line every other surface carries. It
+    # also hung off the TL;DR branch, so a listing with no summary lost them
+    # a second time. Post-research skills still appear in the thread below;
+    # this is the card-level summary.
+    card_blocks.append({
+        "type": "section",
+        "text": {"type": "mrkdwn", "text": fit_section_text(_card_skills_line(card))},
+    })
     card_blocks.append({
         "type": "context",
         "elements": [{
             "type": "mrkdwn",
             "text": (
                 f"React: :thumbsup: Save  |  :thumbsdown: Pass  |  "
-                f":pencil2: Tailor  •  `{listing_id}`"
+                f":pencil2: Tailor  •  `{card['id'] or ''}`"
             ),
         }],
     })
 
-    pr_verdict = auto_json.get("post_research_verdict", "MAYBE")
-    pr_conf = auto_json.get("post_research_confidence", "?")
-    match_analysis = auto_json.get("match_analysis", "")
-    skills = auto_json.get("updated_skills_match", {}) or {}
-    matching = skills.get("matching", []) if isinstance(skills, dict) else []
-    missing = skills.get("missing", []) if isinstance(skills, dict) else []
+    pr_verdict = post.get("verdict") or "MAYBE"
+    pr_conf = post.get("confidence")
+    match_analysis = post.get("match_analysis") or ""
+    matching = post.get("matching_skills") or []
+    missing = post.get("missing_skills") or []
 
     if len(match_analysis) > 2500:
         match_analysis = match_analysis[:2500] + "\n_(truncated)_"
@@ -534,8 +557,8 @@ def _build_slack_blocks(listing: dict, auto_json: dict, folder: Path) -> tuple[l
             "text": {
                 "type": "mrkdwn",
                 "text": (
-                    f"{verdict_emoji} *Post-Research Verdict:* "
-                    f"{pr_verdict} ({pr_conf}% confidence)"
+                    f"{verdict_emoji} *Post-Research Verdict:* {pr_verdict} "
+                    f"({pr_conf if pr_conf is not None else '?'}% confidence)"
                 ),
             },
         },
@@ -567,7 +590,7 @@ def _build_slack_blocks(listing: dict, auto_json: dict, folder: Path) -> tuple[l
 
     metadata = {
         "event_type": "apply_daemon_listing",
-        "event_payload": {"job_id": listing_id},
+        "event_payload": {"job_id": card["id"] or ""},
     }
     return card_blocks, {"thread_blocks": thread_blocks, "metadata": metadata}
 
@@ -588,8 +611,10 @@ def _post_results_to_slack(
     """
     title = listing.get("title", "Unknown")
     company = listing.get("company", "Unknown")
-    pr_verdict = auto_json.get("post_research_verdict", "MAYBE")
-    pr_conf = auto_json.get("post_research_confidence", "?")
+    post = parse_post_research(auto_json, listing.get("confidence")) or {}
+    pr_verdict = post.get("verdict") or "MAYBE"
+    pr_conf = post.get("confidence")
+    pr_conf = pr_conf if pr_conf is not None else "?"
     card_text = (
         f":robot_face: Auto-evaluated: {title} at {company} — "
         f"{pr_verdict} ({pr_conf}%)"
@@ -838,8 +863,20 @@ async def _process_one(
             auto_path.write_text(json.dumps(auto_json, indent=2), encoding="utf-8")
             _merge_assets_json(folder, auto_json, research_context)
 
-        # 4) Auto-pass on NO verdict — gray out the existing card in place.
-        pr_verdict = (auto_json.get("post_research_verdict") or "").upper()
+        # 4) Persist the re-score, then branch on it. R-4: this write did not
+        # exist — the re-score reached auto_assets.json and the Slack card and
+        # went no further, so the CLI feed showed and ranked by the
+        # pre-research Stage 5 number that 212 of 213 enriched rows disagreed
+        # with. Stage 5's own columns are left alone: `deep-dive` reports the
+        # disagreement, so both values have to survive.
+        post = parse_post_research(auto_json, listing.get("confidence")) or {}
+        pr_verdict = post.get("verdict") or ""
+        with Database() as db:
+            db.set_post_research_score(
+                job_id, pr_verdict or None, post.get("confidence"),
+            )
+
+        # Auto-pass on NO verdict — gray out the existing card in place.
         if pr_verdict == "NO":
             if slack_ctx is not None and existing_ts:
                 app, channel = slack_ctx

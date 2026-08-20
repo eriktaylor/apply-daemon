@@ -17,11 +17,14 @@ import json
 import pytest
 
 from src.listing_card import (
+    POST_RESEARCH_FIELDS,
     REQUIRED_FIELDS,
     age_in_days,
     build_card,
     format_skills_line,
+    format_verdict_line,
     freshness,
+    parse_post_research,
     parse_skill_list,
     skills_match,
 )
@@ -186,3 +189,201 @@ class TestSurfacesShareTheContract:
             "digest.py no longer imports the card contract — it is assembling "
             "its own field set again."
         )
+
+
+class TestTwoScores:
+    """Stage 5's score and autopilot's re-score both survive; the card names
+    which one a renderer should show (R-4)."""
+
+    def test_no_rescore_falls_back_to_stage5(self):
+        card = build_card(_row())
+        assert card["confidence_source"] == "stage5"
+        assert (card["effective_verdict"], card["effective_confidence"]) == ("YES", 85)
+        assert card["post_research_verdict"] is None
+        assert card["confidence_delta"] is None
+
+    def test_rescore_from_row_columns_wins(self):
+        card = build_card(_row(post_research_verdict="MAYBE",
+                               post_research_confidence=58))
+        assert card["confidence_source"] == "post_research"
+        assert (card["effective_verdict"], card["effective_confidence"]) == ("MAYBE", 58)
+        # Stage 5 is kept, not overwritten — the disagreement is the point.
+        assert (card["verdict"], card["confidence"]) == ("YES", 85)
+        assert card["confidence_delta"] == -27
+
+    def test_rescore_can_be_passed_in_by_a_caller_holding_the_envelope(self):
+        """Autopilot renders mid-run from auto_assets.json, not from the row."""
+        post = parse_post_research(
+            {"post_research_verdict": "maybe", "post_research_confidence": "58"},
+            85,
+        )
+        card = build_card(_row(), post_research=post)
+        assert (card["effective_verdict"], card["effective_confidence"]) == ("MAYBE", 58)
+        assert card["confidence_delta"] == -27
+
+    def test_a_rescore_without_a_confidence_does_not_blend(self):
+        card = build_card(_row(post_research_verdict="MAYBE"))
+        assert card["confidence_source"] == "stage5"
+        assert card["effective_confidence"] == 85
+        assert card["effective_verdict"] == "MAYBE"
+
+    @pytest.mark.parametrize("junk", ["", "not a number", None, [], {}])
+    def test_malformed_rescore_degrades_to_stage5(self, junk):
+        card = build_card(_row(post_research_verdict=junk,
+                               post_research_confidence=junk))
+        assert card["confidence_source"] == "stage5"
+        assert card["effective_confidence"] == 85
+
+    def test_verdict_line_names_its_source(self):
+        assert format_verdict_line(build_card(_row())) == "YES 85% (stage 5)"
+        line = format_verdict_line(
+            build_card(_row(post_research_verdict="MAYBE",
+                            post_research_confidence=58))
+        )
+        assert line == "MAYBE 58% (post-research · was YES 85%, -27)"
+
+    def test_verdict_line_states_absence_rather_than_raising(self):
+        assert format_verdict_line(build_card({})) == "? (stage 5)"
+
+
+class TestParsePostResearch:
+    """One parser for autopilot's envelope, so the CLI and Slack cannot
+    disagree about the same file."""
+
+    def test_full_envelope(self):
+        post = parse_post_research({
+            "post_research_verdict": "yes",
+            "post_research_confidence": 80,
+            "match_analysis": "Strong fit.",
+            "updated_skills_match": {"matching": ["Python"], "missing": ["Rust"]},
+        }, 95)
+        assert set(post) == set(POST_RESEARCH_FIELDS)
+        assert post["verdict"] == "YES"
+        assert post["confidence"] == 80
+        assert post["confidence_delta"] == -15
+        assert post["matching_skills"] == ["Python"]
+
+    def test_non_mapping_is_none(self):
+        assert parse_post_research(["not", "a", "dict"]) is None
+        assert parse_post_research(None) is None
+
+    def test_empty_envelope_keeps_the_key_set(self):
+        post = parse_post_research({}, 95)
+        assert set(post) == set(POST_RESEARCH_FIELDS)
+        assert post["verdict"] is None and post["confidence"] is None
+        assert post["confidence_delta"] is None
+
+    def test_skills_of_the_wrong_shape_never_raise(self):
+        post = parse_post_research({"updated_skills_match": "junk"})
+        assert post["matching_skills"] == [] and post["missing_skills"] == []
+
+    def test_delta_needs_both_numbers(self):
+        assert parse_post_research(
+            {"post_research_confidence": 80}, None)["confidence_delta"] is None
+
+
+class TestCrossSurfaceParity:
+    """V-35 — Slack and the CLI must show the same verdict and confidence for
+    the same listing.
+
+    This failed on 212 of 213 rows: autopilot's Slack card was built from
+    ``auto_assets.json`` while the CLI built one from the DB row, and only the
+    JSON carried the re-score. The assertion is over the shared contract, not
+    two renderers eyeballed side by side — a contract test cannot catch drift
+    while only one surface imports it.
+    """
+
+    RESCORE = {
+        "post_research_verdict": "MAYBE",
+        "post_research_confidence": 58,
+        "match_analysis": "Weaker than the listing implies.",
+        "updated_skills_match": {"matching": ["Python"], "missing": ["Rust"]},
+    }
+    EXPECTED = "MAYBE 58% (post-research · was YES 95%, -37)"
+
+    def _db_row(self):
+        """What the CLI feed reads: the row, after autopilot's write-back."""
+        return _row(confidence=95,
+                    post_research_verdict=self.RESCORE["post_research_verdict"],
+                    post_research_confidence=self.RESCORE["post_research_confidence"])
+
+    def _listing(self):
+        """What autopilot holds mid-run: the row *without* the re-score."""
+        row = _row(confidence=95)
+        row["salary"] = "$200k"
+        return row
+
+    def test_slack_and_cli_render_the_same_score(self, tmp_path, monkeypatch):
+        import src.cli as cli
+        from src.process_queue import _build_slack_blocks
+
+        monkeypatch.setattr(cli, "OUTPUT_DIR", tmp_path)
+        cli_card = cli._card(self._db_row())
+        blocks, _ = _build_slack_blocks(
+            self._listing(), self.RESCORE, tmp_path / "Acme_x_abc12345")
+        slack_card = build_card(
+            self._listing(),
+            post_research=parse_post_research(self.RESCORE, 95),
+        )
+
+        assert format_verdict_line(cli_card) == self.EXPECTED
+        assert format_verdict_line(slack_card) == self.EXPECTED
+        # ...and both renderers actually put that string in front of a human.
+        assert self.EXPECTED in cli._fmt_card(cli_card)
+        assert self.EXPECTED in json.dumps(blocks, ensure_ascii=False)
+
+    def test_the_two_sources_agree_field_by_field(self, tmp_path, monkeypatch):
+        import src.cli as cli
+
+        monkeypatch.setattr(cli, "OUTPUT_DIR", tmp_path)
+        from_db = cli._card(self._db_row())
+        from_json = build_card(
+            self._listing(),
+            post_research=parse_post_research(self.RESCORE, 95),
+        )
+        for field in ("verdict", "confidence", "post_research_verdict",
+                      "post_research_confidence", "confidence_delta",
+                      "confidence_source", "effective_verdict",
+                      "effective_confidence"):
+            assert from_db[field] == from_json[field], field
+
+
+class TestAutopilotUsesTheBuilder:
+    """The third renderer. It assembled its own field set until R-4 — which is
+    the drift `TestSurfacesShareTheContract` was written to prevent and could
+    not see, because process_queue imported only the helpers."""
+
+    def test_autopilot_card_uses_the_builder(self):
+        import inspect
+
+        import src.process_queue as pq
+        assert "build_card" in inspect.getsource(pq._autopilot_card)
+
+    def test_autopilot_card_carries_every_decision_field(self, tmp_path):
+        from src.process_queue import _build_slack_blocks
+
+        listing = _row(salary="$200k")
+        blocks, thread = _build_slack_blocks(
+            listing,
+            {"post_research_verdict": "YES", "post_research_confidence": 88,
+             "match_analysis": "Strong fit."},
+            tmp_path,
+        )
+        rendered = json.dumps(blocks)
+        for expected in ("Applied AI ML Researcher Director", "Acme Bank",
+                         "Palo Alto", "$200k", "75%", "Agentic AI systems",
+                         "Financial domain expertise", "abc12345-0000",
+                         "https://example.com/job/1"):
+            assert expected in rendered, expected
+
+    def test_skills_survive_a_listing_with_no_summary(self, tmp_path):
+        """They used to hang off the TL;DR branch, so a summary-less listing
+        lost the line the card exists to carry."""
+        from src.process_queue import _build_slack_blocks
+
+        blocks, _ = _build_slack_blocks(
+            _row(job_summary=""),
+            {"post_research_verdict": "YES", "post_research_confidence": 88},
+            tmp_path,
+        )
+        assert "Agentic AI systems" in json.dumps(blocks)

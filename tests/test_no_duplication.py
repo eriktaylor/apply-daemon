@@ -76,6 +76,18 @@ OWNERSHIP: list[tuple[str, str, str]] = [
         r"len\(matching\)\s*[/+]|matched\s*/\s*total",
     ),
     (
+        "reading autopilot's re-score envelope (auto_assets.json)",
+        "listing_card.py",
+        # Three surfaces unpacked this envelope key by key — process_queue for
+        # the Slack card, cli for deep-dive, sweeper for its tailor thread —
+        # and only the ones reading the JSON ever saw the re-score, so the CLI
+        # feed showed YES 95% for a listing Slack called MAYBE 58% (R-4).
+        # Matches the *envelope* read only: db.py's SQL and the backfill name
+        # the same column but store and copy it rather than interpret it, and
+        # `card["post_research_verdict"]` is a read of the contract's output.
+        r'get\("post_research_verdict"',
+    ),
+    (
         "which stored field is the job description",
         "models.py",
         r'"raw_email_text",\s*"job_summary"',

@@ -132,7 +132,10 @@ database, so you can switch between them freely, even mid-batch.
 Every card carries the same fields — verdict, confidence, location and
 commute, freshness, TL;DR, and skills matched vs missing. The percentages are
 computed from the model's own lists rather than asked of it, so they cost
-nothing and can't be hallucinated.
+nothing and can't be hallucinated. The confidence shown is labelled with
+where it came from: once autopilot has re-read a listing against its research
+dossier, its `(post-research)` score is the one both surfaces show and rank
+by, with the `(stage 5)` one it replaced alongside.
 
 > **Still worth a manual click:** the CLI doesn't yet check whether a posting
 > is still live, so open the URL before investing in a tailor — especially on

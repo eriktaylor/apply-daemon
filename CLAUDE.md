@@ -32,6 +32,7 @@ python -m src.process_queue --backfill        # Promote existing YES/MAYBE into 
 python -m src.integration_test  # Config + reachability check (use --no-llm / --no-network to skip)
 python -m src.report --days 7   # Funnel metrics (--models, --spend)
 python -m src.geo_backfill      # One-time distance_bucket backfill (--dry-run first)
+python -m src.backfill_post_research   # One-time re-score backfill (dry-run by default)
 ```
 
 ## Architecture
@@ -76,6 +77,17 @@ Load-bearing behaviors a change can easily break:
   `digest._already_delivered` guards, and why detaching is off when
   `AUTOPILOT_POST_STAGE_5` puts both on the same rows. `--wait` restores the
   fully in-line chain for cron/CI.
+- **The feed ranks by the post-research re-score; both scores are kept.**
+  Autopilot writes its re-score to `post_research_verdict` /
+  `post_research_confidence` (`db.set_post_research_score`), *never* over
+  Stage 5's columns — `deep-dive` reports the disagreement, so both have to
+  survive. Every review query prefers the re-score
+  (`db.EFFECTIVE_CONFIDENCE_SQL`) and every card labels which one it is
+  showing (`listing_card.build_card`'s `confidence_source`). It used to reach
+  only `auto_assets.json` and the Slack card, so the CLI ranked 172 rows by a
+  pre-research number 106 of them shared. **The eval gold standard reads that
+  JSON, not the DB** (`eval.listwise_compare.load_gold`) — keep it that way,
+  or a backfill silently re-baselines every eval number.
 - **The re-score prefers the session route.** `AUTOPILOT_RESCORE_VIA=session` shells out through `src/claude_cli.py` (subscription-billed, never written to `logs/model_usage.log` — that file drives the spend ceiling). Falls back to OpenRouter on any failure. Stage 5 deliberately stays metered: the CLI's ~23k-token startup overhead is decisive against 100+ small calls. See [docs/MODELS.md](docs/MODELS.md#the-session-route-subscription-billed).
 
 ### Project structure
@@ -102,6 +114,7 @@ apply-daemon/
 │   ├── geo_backfill.py          # One-time distance_bucket backfill so the queue can sort by location
 │   ├── claude_cli.py            # Subscription transport: `claude -p` (membership-billed, never metered)
 │   ├── gemini_cli.py            # Subscription transport: `agy` (Google AI Pro). Eval capacity only — see docs/MODELS.md
+│   ├── backfill_post_research.py  # One-time re-score backfill (auto_assets.json → listings); dry-run by default
 │   ├── tailor.py                # Cloud LLM escalation engine (multi-line prompts; E501 ignored)
 │   ├── compile.py               # .docx generation from tailored bullets
 │   ├── research.py              # Deep Research agent (semantic scraping; runs before every tailor)

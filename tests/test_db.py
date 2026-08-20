@@ -705,6 +705,48 @@ class TestReviewQueue:
         db.insert_listing(listing)
         return listing.id
 
+    def test_ranks_by_the_post_research_score_where_one_exists(self, db):
+        """R-4 — the feed ranks by the re-score, not by the Stage 5 number it
+        replaced. Ranking by the stale column left 106 of 172 enriched rows
+        tied at exactly 95, which the band tiebreak cannot order."""
+        demoted = self._seed(db, title="Looked good", company="A", confidence=95)
+        steady = self._seed(db, title="Actually good", company="B", confidence=90)
+        db.set_post_research_score(demoted, "MAYBE", 40)
+        rows = db.get_review_queue(limit=10)
+        assert [r["id"] for r in rows] == [steady, demoted]
+
+    def test_a_post_research_no_leaves_the_queue(self, db):
+        job_id = self._seed(db, title="Reads worse up close", company="A",
+                            confidence=95)
+        db.set_post_research_score(job_id, "NO", 10)
+        assert db.get_review_queue(limit=10) == []
+
+    def test_the_confidence_gate_reads_the_effective_score(self, db):
+        job_id = self._seed(db, title="Optimistic", company="A", confidence=90)
+        db.set_post_research_score(job_id, "MAYBE", 30)
+        assert db.get_review_queue(limit=10, min_confidence_pct=50) == []
+
+    def test_stage5_survives_the_write(self, db):
+        """The two-value design: `deep-dive` reports the disagreement, so a
+        write-back that overwrote Stage 5 would destroy the verb."""
+        job_id = self._seed(db, title="Both scores", company="A", confidence=95)
+        db.set_post_research_score(job_id, "MAYBE", 40)
+        row = db.get_listing_by_id(job_id)
+        assert (row["verdict"], row["confidence"]) == ("YES", 95)
+        assert (row["post_research_verdict"], row["post_research_confidence"]) == (
+            "MAYBE", 40)
+        assert row["post_research_at"]
+
+    def test_counts_agree_with_the_queue_they_describe(self, db):
+        """status's numbers and the feed must apply the same rule, or the
+        surface reports listings it will never show."""
+        job_id = self._seed(db, title="Dropped by the re-score", company="A",
+                            confidence=95)
+        db.set_post_research_score(job_id, "NO", 10)
+        assert db.get_queue_stats()["reviewable"] == 0
+        assert db.fresh_counts_by_status(30) == {}
+        assert db.count_stale_reviewable(1) == 0
+
     def test_returns_only_review_statuses(self, db):
         keep = self._seed(db, title="Keep", company="A", confidence=80)
         drop = self._seed(db, title="Drop", company="B", confidence=80)

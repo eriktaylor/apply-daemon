@@ -58,7 +58,12 @@ from src.decisions import DECISIONS, target_status
 from src.decisions import apply as apply_decision
 from src.file_utils import find_output_folder
 from src.human_labels import SURFACE_CLI, append_human_label
-from src.listing_card import build_card, format_skills_line
+from src.listing_card import (
+    build_card,
+    format_skills_line,
+    format_verdict_line,
+    parse_post_research,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -144,19 +149,6 @@ _DETACHABLE_MODULES = frozenset({"src.digest"})
 LOG_DIR = Path("logs")
 
 
-def _json_list(raw: object) -> list:
-    """Parse a TEXT column holding a JSON array; [] on anything unusable."""
-    if isinstance(raw, list):
-        return raw
-    if not raw:
-        return []
-    try:
-        parsed = json.loads(raw)
-    except (json.JSONDecodeError, TypeError):
-        return []
-    return parsed if isinstance(parsed, list) else []
-
-
 def _output_folder(job_id: str) -> Path | None:
     """Locate this job's asset folder (see file_utils.find_output_folder).
 
@@ -198,26 +190,14 @@ def _read_text(path: Path) -> str | None:
         return None
 
 
-def _skill_list(raw: object) -> list:
-    """Parse a skills value that may be a list, a JSON string, or junk.
-
-    ``updated_skills_match`` values arrive as either shape depending on which
-    model wrote them, so both are accepted.
-    """
-    if isinstance(raw, list):
-        return [str(s) for s in raw]
-    if isinstance(raw, str):
-        return _json_list(raw)
-    return []
-
-
 def _post_research(folder: Path, triage_confidence: int | None) -> dict | None:
-    """Read autopilot's post-research re-score, if autopilot has run.
+    """Read autopilot's post-research re-score off disk, if autopilot has run.
 
-    This is the large model's verdict after reading the research dossier, and
-    it frequently disagrees with the Stage 5 score shown in `next` — that
-    disagreement is the main thing a deep-dive exists to surface, so the
-    delta is computed rather than left for the reader to eyeball.
+    The dossier folder rather than the DB, because this verb also shows
+    ``match_analysis``, which is archived only in ``auto_assets.json`` — and
+    because a row the backfill never reached still has its re-score here.
+    Shape and the delta arithmetic belong to the card contract
+    (``listing_card.parse_post_research``); this function owns only the read.
     """
     raw = _read_text(folder / AUTO_ASSETS_FILE)
     if not raw:
@@ -227,32 +207,7 @@ def _post_research(folder: Path, triage_confidence: int | None) -> dict | None:
     except json.JSONDecodeError:
         logger.warning("Malformed %s in %s", AUTO_ASSETS_FILE, folder.name)
         return None
-    if not isinstance(data, dict):
-        return None
-
-    skills = data.get("updated_skills_match") or {}
-    if not isinstance(skills, dict):
-        skills = {}
-
-    verdict = data.get("post_research_verdict")
-    confidence = data.get("post_research_confidence")
-    try:
-        confidence = int(confidence) if confidence is not None else None
-    except (TypeError, ValueError):
-        confidence = None
-
-    delta = None
-    if confidence is not None and triage_confidence is not None:
-        delta = confidence - triage_confidence
-
-    return {
-        "verdict": verdict,
-        "confidence": confidence,
-        "confidence_delta": delta,
-        "match_analysis": data.get("match_analysis"),
-        "matching_skills": _skill_list(skills.get("matching")),
-        "missing_skills": _skill_list(skills.get("missing")),
-    }
+    return parse_post_research(data, triage_confidence)
 
 
 def _tier_of(row: sqlite3.Row) -> str:
@@ -274,9 +229,6 @@ def _card(row: sqlite3.Row, *, detail: bool = False) -> dict:
     card["date_ingested"] = row["date_ingested"]
     if detail:
         card["reason"] = _get_row(row, "reason")
-        card["salary"] = _get_row(row, "salary")
-    else:
-        card["salary"] = _get_row(row, "salary")
     return card
 
 
@@ -294,7 +246,8 @@ def _emit(payload: dict, as_json: bool, human: str) -> None:
 def _fmt_card(card: dict, index: int | None = None) -> str:
     """Render the canonical card. Field set is the contract's, not ours."""
     prefix = f"[{index}] " if index is not None else ""
-    lines = [f"{prefix}{card['verdict']}: {card['title']} — {card['company']}"]
+    verdict = card.get("effective_verdict") or "?"
+    lines = [f"{prefix}{verdict}: {card['title']} — {card['company']}"]
 
     loc = card.get("location") or "location unknown"
     if card.get("distance"):
@@ -303,7 +256,9 @@ def _fmt_card(card: dict, index: int | None = None) -> str:
     if card.get("freshness"):
         age = card.get("age_days")
         meta.append(f"{card['freshness']}" + (f" · {age}d" if age is not None else ""))
-    meta.append(f"{card['verdict']} {card['confidence']}%")
+    # Which score this is, and what it displaced — the contract's wording, so
+    # the Slack card and this line cannot disagree about the same listing.
+    meta.append(format_verdict_line(card))
     lines.append("    " + "  |  ".join(meta))
 
     if card.get("tldr"):
@@ -540,7 +495,7 @@ def cmd_show(db: Database, job_id: str, as_json: bool) -> int:
     if card.get("job_summary"):
         human += f"\n\n{card['job_summary']}"
     if card.get("reason"):
-        human += f"\n\nWhy this scored {card['confidence']}%: {card['reason']}"
+        human += f"\n\nWhy Stage 5 scored {card['confidence']}%: {card['reason']}"
     if card.get("matching_skills"):
         human += f"\n\nMatching: {', '.join(card['matching_skills'])}"
     if card.get("missing_skills"):

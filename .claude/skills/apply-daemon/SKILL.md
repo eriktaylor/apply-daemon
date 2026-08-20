@@ -86,6 +86,16 @@ the pipeline to run.
 `company`, `location`, `salary`, `verdict`, `confidence`, `status`, `tier`,
 `research_cached`, `url`, `date_ingested`.
 
+**Show `effective_verdict` / `effective_confidence`, not `verdict` /
+`confidence`.** A card carries two scores: Stage 5's (`verdict`,
+`confidence`) and autopilot's re-score after it read the research dossier
+(`post_research_verdict`, `post_research_confidence`). `effective_*` is
+whichever one the card says to present, and `confidence_source` names it —
+`"post_research"` or `"stage5"`. Say which, in the same breath as the number:
+"MAYBE 58% (post-research)" and "YES 95% (stage 5)" mean different things,
+and the feed is ordered by the effective one. Don't compute this yourself;
+the card has already decided.
+
 ### How to present a listing
 
 **Always include the `url`, as a clickable link, on every listing you show.**
@@ -101,7 +111,7 @@ Also always include the `id`, so the user can name a listing for `deep-dive`,
 A good rendering is compact and complete:
 
 ```
-1. Senior AI Engineer — Talkspace   ·  YES 95%  ·  Remote  ·  2d old
+1. Senior AI Engineer — Talkspace   ·  YES 95% (stage 5)  ·  Remote  ·  2d old
    Leading RL strategy + multi-agent architecture for a behavioral-health
    AI product. Skills 3/4 — has RL, multi-agent, healthcare AI; missing
    control theory.
@@ -201,8 +211,10 @@ the user Slack is up to date — the CLI page you just rendered is.
 **`deep-dive`** returns `{verb, ok, listing, research, post_research}`.
 
 - `post_research` is the *large* model's verdict after reading the research
-  dossier. It regularly disagrees with the Stage 5 `confidence` on the card —
-  **that disagreement is the most useful thing on the screen.** Lead with it.
+  dossier, read straight from the dossier folder — so it is present here even
+  for a listing enriched before the score was written to the row. It
+  regularly disagrees with the Stage 5 `confidence` on the card — **that
+  disagreement is the most useful thing on the screen.** Lead with it.
 - `confidence_delta` is post-research minus Stage 5. It skews negative
   (typically around −20): the first pass is optimistic. A large negative
   delta means "looked better from the outside than it is."

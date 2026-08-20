@@ -21,6 +21,25 @@ DEFAULT_DB_PATH = Path("apply_daemon.db")
 # high→low. One definition — process_queue imports this (R-1).
 CONFIDENCE_BAND_WIDTH = 5
 
+# The *effective* score, in SQL. Autopilot re-scores an enriched listing
+# against its research dossier and writes the result to
+# `post_research_verdict` / `post_research_confidence`; where that exists it
+# is the better number and the one every review surface shows and ranks by.
+# Stage 5's columns stay untouched — the disagreement between the two is what
+# `deep-dive` reports, and overwriting would destroy it.
+#
+# Both fragments are literal SQL with no parameters, so they interpolate
+# safely; `src/listing_card.py` resolves the same precedence in Python for
+# rendering. One rule, stated in the two languages that need it.
+EFFECTIVE_VERDICT_SQL = "COALESCE(NULLIF(post_research_verdict, ''), verdict)"
+EFFECTIVE_CONFIDENCE_SQL = "COALESCE(post_research_confidence, confidence)"
+
+# Verdicts a listing must hold to be reviewable at all. NO never reaches a
+# review surface: Stage 5 drops it, and autopilot auto-passes a post-research
+# NO. Applied to the effective verdict so a re-score that says NO stops
+# competing for a page slot the moment it is written.
+_REVIEWABLE_VERDICT_CLAUSE = f"AND {EFFECTIVE_VERDICT_SQL} IN ('YES', 'MAYBE') "
+
 # Statuses eligible for the CLI review queue, in presentation order.
 # 'auto' first: those rows already have cached Deep Research in output/,
 # so deep-diving one costs no tokens.
@@ -134,6 +153,18 @@ class Database:
             (
                 "presented_at",
                 "ALTER TABLE listings ADD COLUMN presented_at TEXT",
+            ),
+            (
+                "post_research_verdict",
+                "ALTER TABLE listings ADD COLUMN post_research_verdict TEXT",
+            ),
+            (
+                "post_research_confidence",
+                "ALTER TABLE listings ADD COLUMN post_research_confidence INTEGER",
+            ),
+            (
+                "post_research_at",
+                "ALTER TABLE listings ADD COLUMN post_research_at TEXT",
             ),
             (
                 "gmail_message_id",
@@ -582,6 +613,32 @@ class Database:
         self.conn.commit()
         return cursor.rowcount > 0
 
+    def set_post_research_score(
+        self, listing_id: str, verdict: str | None, confidence: int | None,
+    ) -> bool:
+        """Persist autopilot's re-score alongside — never over — Stage 5's.
+
+        This is the write that was missing: the re-score reached
+        ``auto_assets.json`` and the Slack card and then evaporated, so the
+        CLI feed showed and sorted by a pre-research number that 212 of 213
+        enriched rows disagreed with.
+
+        ``verdict``/``confidence`` are stored as given (normalize with
+        ``listing_card.parse_post_research`` first); a None for either leaves
+        that column NULL, which the effective-score SQL reads as "no
+        re-score" and falls back to Stage 5. The timestamp records that the
+        re-score happened at all, so a NULL confidence is distinguishable
+        from a row autopilot never reached.
+        """
+        now = datetime.now(timezone.utc).isoformat()
+        cursor = self.conn.execute(
+            "UPDATE listings SET post_research_verdict = ?, "
+            "post_research_confidence = ?, post_research_at = ? WHERE id = ?",
+            (verdict, confidence, now, listing_id),
+        )
+        self.conn.commit()
+        return cursor.rowcount > 0
+
     def mark_autopilot_processed(self, listing_id: str) -> bool:
         """Stamp the moment autopilot finalized this listing (auto or auto-pass)."""
         now = datetime.now(timezone.utc).isoformat()
@@ -753,18 +810,24 @@ class Database:
     def get_saved_listings(self, max_age_days: int | None = None) -> list[sqlite3.Row]:
         """Get listings with pipeline_status == 'saved'.
 
+        Ordered by the effective score, so `cli saved` lists in the order it
+        displays — a saved row is usually enriched, and ranking it by the
+        Stage 5 number while showing the re-score is the same mismatch this
+        surface exists to avoid.
+
         Args:
             max_age_days: If set, only return listings saved within the past N days.
         """
+        order = f"ORDER BY {EFFECTIVE_CONFIDENCE_SQL} DESC"
         if max_age_days is not None:
             cutoff = (datetime.now(timezone.utc) - timedelta(days=max_age_days)).isoformat()
             return self.conn.execute(
                 "SELECT * FROM listings WHERE pipeline_status = 'saved' "
-                "AND updated_at >= ? ORDER BY confidence DESC",
+                f"AND updated_at >= ? {order}",
                 (cutoff,),
             ).fetchall()
         return self.conn.execute(
-            "SELECT * FROM listings WHERE pipeline_status = 'saved' ORDER BY confidence DESC",
+            f"SELECT * FROM listings WHERE pipeline_status = 'saved' {order}",
         ).fetchall()
 
     def get_trend_skills(self, limit: int = 100) -> list[sqlite3.Row]:
@@ -892,6 +955,11 @@ class Database:
 
         - ``auto`` rows lead because their Deep Research is already cached in
           ``output/``, making a deep-dive token-free.
+        - **Quality means the effective score** (``EFFECTIVE_CONFIDENCE_SQL``)
+          — autopilot's post-research re-score where one exists, Stage 5's
+          otherwise. Ranking by the Stage 5 column alone was R-4: 106 of 172
+          enriched rows sat at exactly 95, so the band tiebreak had nothing to
+          work with and the head of the feed was effectively arbitrary.
         - Confidence is banded (``CONFIDENCE_BAND_WIDTH``) before distance is
           consulted, mirroring ``process_queue._band()``'s existing admission
           that raw confidence isn't trustworthy to single-digit precision. So
@@ -933,13 +1001,13 @@ class Database:
             "END AS tier_rank "
             "FROM listings "
             f"WHERE pipeline_status IN ({placeholders}) "
-            "AND verdict IN ('YES', 'MAYBE') "
-            "AND confidence >= ? "
+            f"{_REVIEWABLE_VERDICT_CLAUSE}"
+            f"AND {EFFECTIVE_CONFIDENCE_SQL} >= ? "
             f"{cutoff_clause}{age_clause}"
             "ORDER BY tier_rank, "
-            f"  (confidence / {CONFIDENCE_BAND_WIDTH}) DESC, "
+            f"  ({EFFECTIVE_CONFIDENCE_SQL} / {CONFIDENCE_BAND_WIDTH}) DESC, "
             "  (distance_bucket IS NULL), distance_bucket ASC, "
-            "  date_ingested DESC, confidence DESC "
+            f"  date_ingested DESC, {EFFECTIVE_CONFIDENCE_SQL} DESC "
             "LIMIT ?"
         )
         # Status placeholders bind before min_confidence_pct in the SQL text.
@@ -999,7 +1067,7 @@ class Database:
         row = self.conn.execute(
             "SELECT COUNT(*) n FROM listings "
             f"WHERE pipeline_status IN ({placeholders}) "
-            "AND verdict IN ('YES', 'MAYBE') "
+            f"{_REVIEWABLE_VERDICT_CLAUSE}"
             "AND date_ingested < ?",
             [*statuses, cutoff],
         ).fetchone()
@@ -1025,7 +1093,7 @@ class Database:
         rows = self.conn.execute(
             "SELECT pipeline_status, COUNT(*) n FROM listings "
             f"WHERE pipeline_status IN ({placeholders}) "
-            "AND verdict IN ('YES', 'MAYBE') "
+            f"{_REVIEWABLE_VERDICT_CLAUSE}"
             f"{age_clause}"
             "GROUP BY pipeline_status",
             params,
@@ -1043,7 +1111,7 @@ class Database:
         rows = self.conn.execute(
             "SELECT pipeline_status, COUNT(*) n FROM listings "
             f"WHERE pipeline_status IN ({placeholders}) "
-            "AND verdict IN ('YES', 'MAYBE') "
+            f"{_REVIEWABLE_VERDICT_CLAUSE}"
             "GROUP BY pipeline_status",
             list(REVIEW_STATUSES),
         ).fetchall()

@@ -38,6 +38,7 @@ load_dotenv()
 from src.db import REVIEW_STATUSES, Database
 from src.decisions import is_allowed, target_status
 from src.human_labels import SURFACE_SLACK, append_human_label
+from src.listing_card import parse_post_research
 from src.model_usage import log_response_usage
 from src.models import FULL_JOB_DESCRIPTION_CHARS, job_description_text
 from src.notifications import _get_slack_config, _import_slack_app
@@ -1306,13 +1307,16 @@ def _handle_tailor(
         except Exception:
             logger.debug("Failed to update status indicator on original message", exc_info=True)
 
-        # Post Deep Evaluation as a threaded reply
-        verdict = claude_json.get("post_research_verdict", "MAYBE")
-        confidence = claude_json.get("post_research_confidence", "?")
-        match_analysis = claude_json.get("match_analysis", "")
-        skills = claude_json.get("updated_skills_match", {})
-        matching = skills.get("matching", [])
-        missing = skills.get("missing", [])
+        # Post Deep Evaluation as a threaded reply. The envelope is autopilot's
+        # shape, so it is read through the card contract's parser rather than
+        # key by key — this was the third hand-rolled reader of it (R-4).
+        post = parse_post_research(claude_json) or {}
+        verdict = post.get("verdict") or "MAYBE"
+        confidence = post.get("confidence")
+        confidence = confidence if confidence is not None else "?"
+        match_analysis = post.get("match_analysis") or ""
+        matching = post.get("matching_skills") or []
+        missing = post.get("missing_skills") or []
 
         verdict_emoji = ":large_green_circle:" if verdict == "YES" else (
             ":yellow_circle:" if verdict == "MAYBE" else ":red_circle:"
