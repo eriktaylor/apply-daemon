@@ -85,6 +85,11 @@ OWNERSHIP: list[tuple[str, str, str]] = [
         "claude_cli.py",
         r'"claude",\s*"-p"',
     ),
+    (
+        "dedicated-logger file-sink attach-once pattern",
+        "file_logger.py",
+        r"logging\.FileHandler\(",
+    ),
 ]
 
 # Patterns no module may contain, with the reason. Distinct from OWNERSHIP:

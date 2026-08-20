@@ -103,7 +103,8 @@ apply-daemon/
 │   ├── triage.py                # Stage 5 LLM scoring (multi-line prompts; E501 ignored)
 │   ├── mismatch_gate.py         # Autopilot: hybrid title↔body gate (substring → LLM fallback)
 │   ├── expired_probe.py         # Autopilot: HTTP backstop for expired/dead listings
-│   ├── audit_log.py             # Pipe-delimited audit log for silent drops (see docs/AUDIT.md)
+│   ├── audit_log.py             # Pipe-delimited audit log for silent drops; file sink is logs/audit.log (see docs/AUDIT.md)
+│   ├── file_logger.py           # Shared FileHandler-attach-once helper (audit_log.py + model_usage.py)
 │   ├── geo.py                   # Nominatim geocoding + LRU cache + haversine
 │   ├── models.py                # JobListing dataclass
 │   ├── profile_loader.py        # Loads profile.md (Pipeline Settings table drives runtime knobs)

@@ -4,12 +4,13 @@ An append-only log of every OpenRouter call's cost signals — model slug,
 pipeline stage, and token count — so the live model report (O-2) has a
 durable source across interactive runs and cron runs alike.
 
-Deliberately independent of ``src/audit_log.py``: it borrows that module's
-pipe-delimited, no-raw-content schema style but writes to its own sink
-(``logs/model_usage.log``). The audit logger has no sink of its own — its
-lines land in whatever captures ``script.sh``'s stdout (per ``docs/AUDIT.md``),
-which evaporates on interactive runs and is useless as a source O-2 must
-aggregate across weeks.
+Shares its "dedicated logger, file sink attached once" mechanics with
+``src/audit_log.py`` via ``src/file_logger.py`` (see that module — the one
+implementation site, guarded by ``tests/test_no_duplication.py``). The two
+channels stay logically independent sinks with independent files: this one
+is metered-spend telemetry (``logs/model_usage.log``) consumed by
+``budget.py``/``report.py``; audit_log is drop reasons (``logs/audit.log``)
+consumed by grep — see ``docs/AUDIT.md``.
 
 Data-safety (SECURITY.md invariant 2): only the model slug, stage, and token
 counts are ever written — never raw email, prompt, or response content.
@@ -34,9 +35,16 @@ from collections.abc import Iterator
 from datetime import datetime, timezone
 from pathlib import Path
 
+from src.file_logger import get_file_logger
+
 _LOGGER_NAME = "apply_daemon.audit.model_usage"
 _DEFAULT_LOG_PATH = "logs/model_usage.log"
 
+# Legacy fast-path flag, kept for tests that reset the channel by setting it
+# False (tests/test_model_usage.py::_reset_channel). The actual attach-once
+# guard now lives in src/file_logger.py, keyed off logger.handlers, so this
+# flag no longer gates anything itself — it just mirrors whether the last
+# attach attempt succeeded.
 _configured = False
 
 
@@ -56,25 +64,14 @@ def _get_logger() -> logging.Logger | None:
     """Return the dedicated usage logger, attaching its FileHandler once.
 
     Returns None if the sink can't be opened — telemetry loss must never
-    break a production LLM call.
+    break a production LLM call. Handler-attach mechanics live in
+    src/file_logger.py (shared with src/audit_log.py); this wrapper only
+    adds the module's env-driven path and the "data sink, not diagnostic
+    output" propagation choice.
     """
     global _configured
-    logger = logging.getLogger(_LOGGER_NAME)
-    if _configured:
-        return logger
-    try:
-        path = _log_path()
-        path.parent.mkdir(parents=True, exist_ok=True)
-        handler = logging.FileHandler(path, encoding="utf-8")
-        handler.setFormatter(logging.Formatter("%(message)s"))
-        logger.addHandler(handler)
-        logger.setLevel(logging.INFO)
-        # Keep usage lines out of the root/app logs — this is a data sink,
-        # not diagnostic output.
-        logger.propagate = False
-        _configured = True
-    except OSError:
-        return None
+    logger = get_file_logger(_LOGGER_NAME, _log_path(), propagate=False)
+    _configured = logger is not None
     return logger
 
 

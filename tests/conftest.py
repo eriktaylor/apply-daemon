@@ -2,9 +2,10 @@
 
 Two jobs, both about isolating the suite from the developer's machine:
 
-1. Disable the O-1 model-usage telemetry sink so the suite never writes a
-   stray logs/ directory. Tests that exercise the channel opt back in
-   explicitly with a tmp path (see test_model_usage.py).
+1. Disable the O-1 model-usage telemetry sink and the audit-drop file sink
+   so the suite never writes a stray logs/ directory. Tests that exercise
+   either channel opt back in explicitly with a tmp path (see
+   test_model_usage.py, test_audit_log.py).
 
 2. Pin runtime knobs to their in-code defaults so a developer's real .env
    cannot change test outcomes. Several modules call ``load_dotenv()`` at
@@ -21,6 +22,7 @@ Two jobs, both about isolating the suite from the developer's machine:
 import os
 
 os.environ.setdefault("MODEL_USAGE_LOG_ENABLED", "false")
+os.environ.setdefault("AUDIT_LOG_ENABLED", "false")
 
 # Runtime knobs → in-code defaults. Keep in sync with the reading module.
 _ENV_DEFAULTS = {

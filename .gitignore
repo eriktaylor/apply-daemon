@@ -28,3 +28,6 @@ plans/
 .venv/
 *:Zone.Identifier
 *.Zone.Identifier
+
+# Agent worktrees (created by Claude Code; removed after merge)
+.claude/worktrees/

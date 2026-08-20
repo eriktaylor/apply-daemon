@@ -15,10 +15,24 @@ All audit entries route through the Python logger:
 apply_daemon.audit.mismatch_drops
 ```
 
-It uses the standard `logging.INFO` stream — no separate sink, no file
-rotation of its own. In production the lines land in whatever stream
-captures the rest of `script.sh`'s output (typically the cron stdout
-redirect).
+It writes to its own file, **`logs/audit.log`** by default, via
+`src/file_logger.py` — the same dedicated-logger-with-a-file-sink helper
+`src/model_usage.py` uses for `logs/model_usage.log`. Override the path
+with `AUDIT_LOG_PATH`, or disable the file sink entirely with
+`AUDIT_LOG_ENABLED=false` (default `true`).
+
+This is additive, not a replacement: the logger still propagates to the
+root logger, so a `script.sh`/cron setup that redirects stdout/stderr keeps
+capturing these lines exactly as before — nothing to change there.
+
+**Why this changed.** The original design ("no separate sink, no file")
+assumed every run went through cron, where stderr redirection was a given.
+That assumption broke when the CLI's `refresh` verb became the normal way
+to run the pipeline by hand (`plans/cli_skill_interface.md` A-8): the CLI
+streams stderr to the terminal and captures nothing, so under it every drop
+reason was lost with no way to recover it after the fact. The file sink
+gives the CLI path — and any other caller that doesn't own its own log
+capture — a durable trail without taking anything away from cron's.
 
 ## Log line schema
 
@@ -57,16 +71,17 @@ emitting.
 
 ## How to audit
 
-Tail the live stream (cron-redirected log file):
+Tail the file (works for both the CLI path and cron, since both now write
+here):
 
 ```bash
-grep "audit.mismatch_drops" /var/log/apply-daemon.log | tail -n 200
+grep "audit.mismatch_drops" logs/audit.log | tail -n 200
 ```
 
 Bucket by gate to see where drops are concentrated:
 
 ```bash
-grep "audit.mismatch_drops" /var/log/apply-daemon.log \
+grep "audit.mismatch_drops" logs/audit.log \
   | awk -F'|' '{ gsub(/ /, "", $5); print $5 }' \
   | sort | uniq -c | sort -rn
 ```
@@ -75,7 +90,7 @@ Find the worst-offending hosts (likely candidates for the
 `_AGGREGATOR_DOMAINS` blocklist):
 
 ```bash
-grep "audit.mismatch_drops" /var/log/apply-daemon.log \
+grep "audit.mismatch_drops" logs/audit.log \
   | awk -F'|' '{ gsub(/ /, "", $8); print $8 }' \
   | sort | uniq -c | sort -rn | head
 ```
@@ -84,12 +99,18 @@ A host that shows up repeatedly with `gate=llm` is a strong signal we
 should add it to the blocklist, eliminating the LLM call entirely for
 that domain on future runs.
 
+If `AUDIT_LOG_ENABLED=false` or the path was overridden, substitute
+`$AUDIT_LOG_PATH` (or a cron-redirected stdout file, if that's still the
+only capture in place) for `logs/audit.log` above.
+
 ## Retention
 
-No code-level retention policy — the log line is treated like any other
-INFO record. If the stdout cron log is rotated nightly, audit history
-matches that rotation. For long-term trend analysis, copy the matching
-lines into a dedicated file before rotation.
+No code-level retention policy — `logs/audit.log` is gitignored (see
+`.gitignore`'s `logs/` entry) and grows unbounded like
+`logs/model_usage.log`. If a cron setup also redirects stdout to a rotated
+file, that copy rotates on its own schedule; the file sink does not. For
+long-term trend analysis, copy the matching lines out before rotating or
+truncating either one.
 
 ## Security note
 
