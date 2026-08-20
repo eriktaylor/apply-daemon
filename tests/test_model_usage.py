@@ -5,6 +5,8 @@ from __future__ import annotations
 import logging
 from types import SimpleNamespace
 
+import pytest
+
 import src.model_usage as mu
 from src.model_usage import _LOGGER_NAME, log_model_usage, log_response_usage
 
@@ -146,9 +148,34 @@ class TestSubscriptionSpendIsNotMetered:
     membership route exists to avoid.
     """
 
-    def test_claude_cli_does_not_write_the_metered_log(self):
+    # Every subscription-billed transport, so a third one is caught by adding
+    # a name here rather than by copying the test (CLAUDE.md -> Anti-drift in
+    # code). claude_cli -> Claude membership; gemini_cli -> Google AI Pro.
+    SUBSCRIPTION_TRANSPORTS = ["claude_cli.py", "gemini_cli.py"]
+
+    @pytest.mark.parametrize("module", SUBSCRIPTION_TRANSPORTS)
+    def test_subscription_transport_does_not_write_the_metered_log(self, module):
         from pathlib import Path
-        src = Path(__file__).resolve().parent.parent / "src" / "claude_cli.py"
+        src = Path(__file__).resolve().parent.parent / "src" / module
         text = src.read_text(encoding="utf-8")
         assert "log_response_usage(" not in text
         assert "log_model_usage(" not in text
+
+    def test_registry_lists_every_subscription_transport(self):
+        """The registry is the guard; a transport missing from it is invisible
+        to the test above, which is the failure mode this whole class exists
+        to prevent."""
+        import re
+        from pathlib import Path
+        src = Path(__file__).resolve().parent.parent / "src"
+        found = {
+            path.name for path in sorted(src.glob("*.py"))
+            if re.search(r"subscription-billed", path.read_text(encoding="utf-8"),
+                         re.IGNORECASE)
+            and re.search(r"^def run\(", path.read_text(encoding="utf-8"), re.M)
+        }
+        missing = found - set(self.SUBSCRIPTION_TRANSPORTS)
+        assert not missing, (
+            "subscription transport(s) not registered in "
+            f"SUBSCRIPTION_TRANSPORTS: {sorted(missing)}"
+        )

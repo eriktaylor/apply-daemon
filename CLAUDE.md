@@ -65,7 +65,7 @@ Load-bearing behaviors a change can easily break:
   *reject-unless-one-of-six* fails toward false negatives, which are invisible.
   Push conditional judgement to the stage that has the context for it.
 - **`presented_at` is a delivery ledger, and the feed retires what it shows.** Re-showing was the defect: confidence is stable, so re-ranking one pool returns the same winners forever. Retirement is only safe because `next --seen` and `status.backlog` keep those rows reachable — see `db.get_review_queue`'s docstring, the only copy.
-- **The re-score prefers the session route.** `AUTOPILOT_RESCORE_VIA=session` shells out through `src/claude_cli.py` (subscription-billed, never written to `logs/model_usage.log` — that file drives the spend ceiling). Falls back to OpenRouter on any failure. Stage 5 deliberately stays metered: the CLI's ~23k-token startup overhead is decisive against 100+ small calls. See [docs/MODELS.md](docs/MODELS.md#the-session-route-subscription-billed).
+- **The re-score prefers the session route.** `AUTOPILOT_RESCORE_VIA=session` shells out through `src/claude_cli.py` (subscription-billed, never written to `logs/model_usage.log` — that file drives the spend ceiling). Falls back to OpenRouter on any failure. Stage 5 deliberately stays metered: the CLI's ~23k-token startup overhead is decisive against 100+ small calls — though note that argument is about *this* transport, not all of them (`src/gemini_cli.py` parallelises 8-wide at ~100% efficiency and still lost, on latency and dropped batches rather than overhead). See [docs/MODELS.md](docs/MODELS.md#the-session-route-subscription-billed).
 
 ### Project structure
 
@@ -89,6 +89,8 @@ apply-daemon/
 │   ├── listing_card.py          # Card contract: the one field set every review surface renders
 │   ├── budget.py                # Spend ceilings: daily USD cap, run cooldown, projection (refuse-and-report)
 │   ├── geo_backfill.py          # One-time distance_bucket backfill so the queue can sort by location
+│   ├── claude_cli.py            # Subscription transport: `claude -p` (membership-billed, never metered)
+│   ├── gemini_cli.py            # Subscription transport: `agy` (Google AI Pro). Eval capacity only — see docs/MODELS.md
 │   ├── tailor.py                # Cloud LLM escalation engine (multi-line prompts; E501 ignored)
 │   ├── compile.py               # .docx generation from tailored bullets
 │   ├── research.py              # Deep Research agent (semantic scraping; runs before every tailor)
@@ -261,10 +263,19 @@ When auditing your own or prior work, these are steps rather than instincts:
 - Several entry points need `load_dotenv()` before importing modules that read env at import time → E402 is ignored for those (`pipeline.py`, `digest.py`, `batch_process.py`, `jobspy_ingest.py`, `process_queue.py`, `proxy_test.py`, `sweeper.py`, `tailor.py`).
 - Squash on merge; commit messages on `main` read like changelog entries.
 - **Stage 5 model swaps must pass the gate:** `python -m eval.listwise_compare
-  --gold --shuffle --model <slug>` before any slug change. Measured basis: a
-  newer model (`gemini-3.5-flash-lite`) was worse *and* dearer, and
-  `gpt-5.4-nano` collapsed to 58% on this task. Version numbers are not
+  --gold --shuffle --model <slug>` before any slug change. Measured basis:
+  `gpt-5.4-nano` collapsed to 58% on this task, and every tier upgrade tested
+  since — Flash and Pro alike — has bought nothing. Version numbers are not
   fitness.
+- **The gate's own metric is weak; know this before citing a percentage.**
+  It is exact verdict match against a model referee, on a class-imbalanced
+  set — *always answering YES scored 62%* the last time it was checked, so a
+  result in the low 60s has beaten a constant by nothing, and exact match
+  actively penalises a model for being more conservative than the referee.
+  Score a ranking metric alongside it (the pipeline ranks and gates; it never
+  needs the label to match), and treat gaps of a few points at n≤50 as noise
+  — two slugs once differing by 5 points tied exactly on re-run. The only
+  non-proxy ground truth is `data/human_labels.jsonl`.
 - **Slack thread commands (`!applied`, `!triage`, `!trend`, …) are frozen** — they still work, but new post-triage functionality belongs in the CLI review surface, not `sweeper.py`. Slack *reactions* (👍 👎 ✏️ ❓) are unaffected. See `docs/CHATOPS.md`.
 - **Every human decision must append to `data/human_labels.jsonl`** via `src/human_labels.py::append_human_label` (pass `surface=`). That ledger is the only input to the preference-pair extractor behind the ranking evals — a surface that skips it is invisible to that work, silently.
 - **Metered spend must be auditable.** Any code path that calls OpenRouter routes its token count through `src/model_usage.py::log_model_usage` (model, stage, tokens — never prompt or response content). `logs/model_usage.log` is the audit trail and the basis for spend ceilings (`src/budget.py`); a spending path missing from it makes the budget unenforceable. All nine call sites comply, and `tests/test_model_usage.py::TestMeteringCoverage` fails the suite if a new one doesn't. In-session (subscription-billed) work is exempt: it has no metered cost to record.
