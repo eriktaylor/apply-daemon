@@ -161,6 +161,7 @@ Everything above converges on SQLite. Everything below fans back out of it:
 Slack — ambient surface                  CLI + Claude skill — work surface
 ───────────────────────────              ──────────────────────────────────
 digest.py → Block Kit card               python -m src.cli <verb> --json
+                                         sweep      → Slack reactions, free
 reactions: 👍 save · 👎 pass               next       → top 3 (auto tier
            ✏️ tailor · ❓ route                          first: deep-dive
 sweeper.py polls + backstops                           is token-free)
@@ -173,9 +174,10 @@ thread ChatOps: frozen                   deep-dive  → Stage 5 vs post-
         └─────────────────────┬─────────────────┘
                               │
               SQLite — single source of truth
-              pipeline_status + presented_at  ← paging state, not a
-                              │                 gate: undecided rows
-                              │                 reappear next session
+              pipeline_status + presented_at  ← delivery ledger: a listing
+                              │                 shown once retires from `next`;
+                              │                 `next --seen` / `status` still
+                              │                 reach it
               data/human_labels.jsonl  ← every decision, both surfaces
                                          → preference pairs → ranking evals
 ```
@@ -333,6 +335,7 @@ python -m src.cli status         # Queue freshness, enrichment capacity, spend
 python -m src.cli refresh        # Run the pipeline (--dry-run / --top-n N / --force)
 python -m src.cli next --top 3   # Next page of new candidates (--seen for the backlog)
 python -m src.cli saved          # Listings you saved or tailored
+python -m src.cli show <id>      # One listing in full (no research dossier)
 python -m src.cli deep-dive <id> # Stage 5 vs post-research verdict + dossier
 python -m src.cli save <id>      # or: pass <id> / pass --all
 python -m src.cli tailor <id>    # Tailor in-session (--via api to spend)
@@ -350,22 +353,11 @@ The CLI reads `$APPLY_DAEMON_DB` (falling back to `./apply_daemon.db`), so it wo
 
 ## ChatOps & Commands
 
-Post-triage work happens on two surfaces.
+Thread commands are **frozen** — new post-triage functionality goes to the CLI (see the two-surface split under [Review & apply](#how-it-works) above), not `sweeper.py`.
 
-**The CLI** (`python -m src.cli`, command list in step H) is where new work goes. A bundled Claude Code skill (`.claude/skills/apply-daemon/`) drives it conversationally: ask Claude "what's new?" and it walks you through the top matches, deep-dives whichever you pick, and records your decisions. Reviewing never spends tokens — enrichment is pre-cached by autopilot, and in-session tailoring is billed to your Claude session, not an API.
+`python -m src.cli sweep` applies your Slack reactions from the CLI — the same dispatch logic as unattended `python -m src.sweeper`, so a reaction means the same thing either way. The only difference is who pays: ✏️ tailor and the on-demand assets bill the metered API when triggered from Slack (it has no session to hand a prompt to), and run free on your subscription from the CLI.
 
-**Slack** is the ambient surface: the digest plus four reactions, triageable from a phone. Thread commands are **frozen** — new verbs land in the CLI.
-
-**The two surfaces share one set of decisions.** `python -m src.cli sweep` reads your Slack reactions and applies them here — it *is* the sweeper's dispatch logic, so 👍/👎 mean exactly what they mean unattended. The one difference is who pays for ✏️:
-
-| Reaction / command | Unattended (`src.sweeper`) | From the CLI (`cli sweep`) |
-|---|---|---|
-| 👍 save · 👎 pass | applied, free | applied, free |
-| ✏️ tailor | runs immediately, **~$0.11 via OpenRouter** | returned as `pending_tailors` → `cli tailor <id>`, **$0** |
-
-Same for the on-demand assets: `!polish` / `!coverletter` / `!prep` / `!answer` each cost $0.04–$0.09 through the API, while `cli polish` / `cover-letter` / `interview-prep` / `answers` produce identical artifacts on your Claude subscription. Slack has no session to hand a prompt to, which is the whole reason for the split — **react from your phone, tailor from the CLI.**
-
-Full reference: [`docs/CHATOPS.md`](docs/CHATOPS.md).
+Full reference — reaction legend, priority order, thread commands, and the per-surface cost breakdown: [`docs/CHATOPS.md`](docs/CHATOPS.md).
 
 ## Running tests
 
@@ -381,7 +373,7 @@ Test extraction + matching accuracy on labeled emails:
 python -m eval.eval --input eval/eval_example.csv --model google/gemini-3.1-flash-lite
 ```
 
-Full guide (datasets, per-stage model overrides, the listwise-vs-pointwise comparison harness): [`docs/EVAL_GUIDE.md`](docs/EVAL_GUIDE.md).
+Full guide: [`docs/EVAL_GUIDE.md`](docs/EVAL_GUIDE.md).
 
 ## Security
 
@@ -404,9 +396,10 @@ Shipped features are catalogued in [`CHANGELOG.md`](CHANGELOG.md).
 
 - [ ] **Lite mode — drop in your resume, and Claude does the rest.** No API
   keys at all: scoring runs in your Claude Code session (subscription-billed)
-  instead of OpenRouter. Honest trade, measured: in-session scoring agrees
-  with the reference standard 64–71% vs 78–88% for the OpenRouter path — lite
-  is for zero setup cost, full mode is for best results. Gated on in-session
+  instead of OpenRouter. Honest trade, measured: every subscription-routed
+  scorer tested so far has tied or trailed the metered path on accuracy and
+  run slower — lite is for zero setup cost, full mode is for best results.
+  Numbers and method in [docs/MODELS.md](docs/MODELS.md). Gated on in-session
   Stage 5 landing.
 
 - [ ] **The Command Center GUI (Next.js)** — A lightweight local web dashboard that connects to the SQLite DB to visualize the full application funnel (ingested → triaged → saved → tailored → applied). Provides an interface to review and curate the `human_labels.jsonl` dataset for future model fine-tuning. Triage stays in chat/Slack; management and analytics move to this GUI.

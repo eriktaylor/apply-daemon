@@ -30,6 +30,17 @@ Each digest message includes a reaction legend. No buttons or Socket Mode requir
 > `pending_tailors` so `cli tailor <id>` can run them on the subscription
 > instead. Same decisions either way; only who pays for tailoring differs.
 
+**Cost by surface.** 👍/👎 are always free (no LLM call). ✏️ tailor, triggered
+unattended by `src.sweeper`, runs immediately and bills OpenRouter — about
+$0.11 (see the `cmd_sweep` docstring in `src/cli.py`). Deferred through
+`cli sweep` and run via `cli tailor <id>` instead, it costs $0 metered — the
+work happens on your Claude subscription. The four on-demand assets
+(`!polish`/`!coverletter`/`!prep`/`!answer` vs. `cli polish`/`cover-letter`/
+`interview-prep`/`answers`) follow the same split — a smaller fraction of the
+token cost (see [Token-Optimized Default Pipeline](#token-optimized-default-pipeline)
+below) — billed to the API from a Slack thread, free on the subscription from
+the CLI.
+
 | Reaction | Action | Result |
 |----------|--------|--------|
 | :thumbsup: | **Save** | Status → `saved`, bot adds :white_check_mark: receipt |
