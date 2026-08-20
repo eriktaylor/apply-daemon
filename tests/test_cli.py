@@ -8,6 +8,8 @@ change that must fail loudly. Synthetic fixtures only.
 from __future__ import annotations
 
 import json
+import subprocess
+from pathlib import Path
 
 import pytest
 
@@ -890,22 +892,50 @@ class TestLocationOrdering:
         assert payload["listings"][0]["id"] == auto
 
 
-class TestRefreshVerb:
-    """C-2 — the only money-spending verb. Every test mocks subprocess; none
-    of these may actually launch a pipeline stage."""
+class _RefreshFixtures:
+    """Shared setup for the two refresh classes — fixtures only, no tests.
+
+    They run in the *production* configuration — `AUTOPILOT_POST_STAGE_5`
+    unset/false — because that is the one where the digests detach (C-10). The
+    suite-wide default in conftest.py pins the funnel-mode value instead, which
+    would quietly test the in-line path only.
+    """
 
     @pytest.fixture(autouse=True)
     def _budget_env(self, tmp_path, monkeypatch):
         monkeypatch.setenv("RUN_LOG_PATH", str(tmp_path / "run_log"))
         monkeypatch.setenv("MODEL_USAGE_LOG_PATH", str(tmp_path / "usage.log"))
+        monkeypatch.setenv("AUTOPILOT_POST_STAGE_5", "false")
         for k in ("DAILY_USD_BUDGET", "MIN_RUN_INTERVAL_MINUTES",
                   "RUN_USD_ESTIMATE", "BUDGET_ALLOW_UNPRICED"):
             monkeypatch.delenv(k, raising=False)
+
+    @pytest.fixture(autouse=True)
+    def popen(self, tmp_path, monkeypatch, mocker):
+        """Never let a detached stage actually start, and never write to logs/.
+
+        Autouse rather than opt-in: `refresh` launches the digests through
+        Popen, so a test that forgot to mock it would post to Slack for real.
+        """
+        import src.cli as cli
+        monkeypatch.setattr(cli, "LOG_DIR", tmp_path / "logs")
+        return mocker.patch("subprocess.Popen")
 
     def _ok(self, mocker):
         import subprocess
         return mocker.patch("subprocess.run", return_value=subprocess.CompletedProcess(
             args=[], returncode=0, stdout="", stderr=""))
+
+    def _blocking(self):
+        """The three stages that stay on the critical path."""
+        from src.cli import _DETACHABLE_MODULES, REFRESH_STAGES
+        return [m for _, m in REFRESH_STAGES if m not in _DETACHABLE_MODULES]
+
+
+class TestRefreshVerb(_RefreshFixtures):
+    """C-2 — the only money-spending verb, and C-9's failure policy. Every
+    test mocks subprocess; none of these may actually launch a pipeline
+    stage."""
 
     def test_runs_every_stage_in_order(self, db, capsys, mocker):
         from src.cli import REFRESH_STAGES
@@ -913,7 +943,8 @@ class TestRefreshVerb:
         code, payload = _run_json(capsys, "refresh")
         assert code == 0 and payload["ok"] is True
         assert [s["module"] for s in payload["stages"]] == [m for _, m in REFRESH_STAGES]
-        assert run.call_count == len(REFRESH_STAGES)
+        # Every stage is reported; only the blocking ones are waited on.
+        assert run.call_count == len(self._blocking())
 
     def test_records_the_run_before_stages(self, db, capsys, mocker):
         """Cooldown must apply to an attempt, not only a success — otherwise a
@@ -962,17 +993,90 @@ class TestRefreshVerb:
         assert code == 0
         assert payload["allowed"] is False
 
-    def test_stops_at_first_failing_stage(self, db, capsys, mocker):
+    def test_continues_past_a_failing_stage(self, db, capsys, mocker):
+        """Rewritten from `test_stops_at_first_failing_stage` (C-9).
+
+        That test asserted `run.call_count == 2` — the fail-fast this item
+        removed. No stage feeds another: all five talk only through SQLite, and
+        autopilot runs last on already-stored rows, so cancelling the chain on
+        a routine Track A proxy failure cost the day's enrichment. The new
+        policy is "continue, and report honestly", so the assertion is now the
+        opposite one: every later stage still runs.
+        """
         import subprocess
-        outcomes = [
-            subprocess.CompletedProcess(args=[], returncode=0, stdout="", stderr=""),
+        run = mocker.patch("subprocess.run", side_effect=[
             subprocess.CompletedProcess(args=[], returncode=1, stdout="", stderr="boom"),
-        ]
-        run = mocker.patch("subprocess.run", side_effect=outcomes)
+            subprocess.CompletedProcess(args=[], returncode=0, stdout="", stderr=""),
+            subprocess.CompletedProcess(args=[], returncode=0, stdout="", stderr=""),
+        ])
         code, payload = _run_json(capsys, "refresh")
-        assert code == 1 and payload["ok"] is False
-        assert payload["failed_stage"] == payload["stages"][-1]["stage"]
-        assert run.call_count == 2       # later stages skipped
+        assert run.call_count == len(self._blocking())   # nothing was cancelled
+        assert payload["ok"] is False and payload["partial"] is True
+        assert payload["failed_stage"] == "track A scrape"
+        assert payload["failed_stages"] == ["track A scrape"]
+        assert payload["skipped_stages"] == []
+        assert code == 0                 # work landed; not a failed run
+
+    def test_partial_run_says_later_stages_ran(self, db, capsys, mocker):
+        """The human rendering has to say what failed AND that the rest ran —
+        the old text ("Later stages did not run") is now the wrong story."""
+        import subprocess
+        mocker.patch("subprocess.run", side_effect=[
+            subprocess.CompletedProcess(args=[], returncode=1, stdout="", stderr="boom"),
+            subprocess.CompletedProcess(args=[], returncode=0, stdout="", stderr=""),
+            subprocess.CompletedProcess(args=[], returncode=0, stdout="", stderr=""),
+        ])
+        _, out = _run(capsys, "refresh")
+        assert "track A scrape failed" in out
+        assert "Every later stage still ran." in out
+
+    def test_breaker_trips_after_two_consecutive_failures(self, db, capsys, mocker):
+        """Two in a row is the systemic signal — bad credential, provider down
+        — and stopping there is the spend containment fail-fast was buying."""
+        import subprocess
+        run = mocker.patch("subprocess.run", return_value=subprocess.CompletedProcess(
+            args=[], returncode=1, stdout="", stderr="boom"))
+        code, payload = _run_json(capsys, "refresh")
+        assert run.call_count == 2
+        assert payload["failed_stages"] == ["track A scrape", "track B email"]
+        assert payload["skipped_stages"] == ["digest (B)", "autopilot"]
+        assert payload["partial"] is False       # nothing succeeded
+        assert code == 1
+
+    def test_breaker_message_names_what_did_not_run(self, db, capsys, mocker):
+        import subprocess
+        mocker.patch("subprocess.run", return_value=subprocess.CompletedProcess(
+            args=[], returncode=1, stdout="", stderr="boom"))
+        _, out = _run(capsys, "refresh")
+        assert "Stopped after 2 stages failed in a row" in out
+        assert "digest (B), autopilot did not run" in out
+
+    def test_non_consecutive_failures_do_not_trip_the_breaker(self, db, capsys,
+                                                              mocker):
+        """A success resets the count — two unrelated bad days are not a
+        systemic failure."""
+        import subprocess
+        run = mocker.patch("subprocess.run", side_effect=[
+            subprocess.CompletedProcess(args=[], returncode=1, stdout="", stderr="a"),
+            subprocess.CompletedProcess(args=[], returncode=0, stdout="", stderr=""),
+            subprocess.CompletedProcess(args=[], returncode=1, stdout="", stderr="b"),
+        ])
+        code, payload = _run_json(capsys, "refresh")
+        assert run.call_count == len(self._blocking())
+        assert payload["failed_stages"] == ["track A scrape", "autopilot"]
+        assert payload["skipped_stages"] == []
+        assert payload["partial"] is True and code == 0
+
+    def test_exit_code_is_zero_when_anything_succeeded(self, db, capsys, mocker):
+        import subprocess
+        mocker.patch("subprocess.run", side_effect=[
+            subprocess.CompletedProcess(args=[], returncode=0, stdout="", stderr=""),
+            subprocess.CompletedProcess(args=[], returncode=1, stdout="", stderr="x"),
+            subprocess.CompletedProcess(args=[], returncode=0, stdout="", stderr=""),
+        ])
+        code, payload = _run_json(capsys, "refresh")
+        assert code == 0 and payload["ok"] is False and payload["partial"] is True
+
 
     def test_top_n_overrides_env_for_this_run_only(self, db, capsys, mocker,
                                                    monkeypatch):
@@ -1003,10 +1107,23 @@ class TestRefreshVerb:
         assert payload["spent_usd_today"] > payload["spent_usd_this_run"]
 
     def test_json_envelope_keys(self, db, capsys, mocker):
+        """Updated for C-9: `ok` still means "everything succeeded", so the
+        partial state it used to hide needed keys of its own. `failed_stage`
+        (singular, first failure) stays for the existing contract."""
         self._ok(mocker)
         _, payload = _run_json(capsys, "refresh")
-        assert set(payload) == {"verb", "ok", "stages", "failed_stage",
-                                "spent_usd_this_run", "spent_usd_today", "page"}
+        assert set(payload) == {"verb", "ok", "partial", "stages",
+                                "failed_stage", "failed_stages",
+                                "skipped_stages", "spent_usd_this_run",
+                                "spent_usd_today", "page"}
+
+    def test_stage_record_keys(self, db, capsys, mocker):
+        self._ok(mocker)
+        _, payload = _run_json(capsys, "refresh")
+        for record in payload["stages"]:
+            assert set(record) == {"stage", "module", "status", "returncode",
+                                   "seconds", "log"}
+            assert record["status"] in {"ok", "failed", "detached"}
 
     def test_chains_into_the_first_page(self, db, capsys, mocker):
         """C-5: the batch exists for the listings it produced — making the
@@ -1029,14 +1146,137 @@ class TestRefreshVerb:
         _, payload = _run_json(capsys, "refresh", "--no-next")
         assert payload["page"] is None
 
-    def test_no_chain_when_a_stage_failed(self, db, capsys, mocker):
-        """A half-run batch's "top 3" would be misleading."""
+    def test_partial_run_still_chains_into_the_page(self, db, capsys, mocker):
+        """Rewritten from `test_no_chain_when_a_stage_failed` (C-9).
+
+        That test asserted `page is None` on any failure, on the theory that a
+        half-run batch's top 3 is misleading. It isn't: the listings that
+        landed are real, and C-5's whole point is not making the user issue a
+        second command. A failed Slack post must not hide the day's matches.
+        """
+        import subprocess
+        mocker.patch("subprocess.run", side_effect=[
+            subprocess.CompletedProcess(args=[], returncode=1, stdout="", stderr="boom"),
+            subprocess.CompletedProcess(args=[], returncode=0, stdout="", stderr=""),
+            subprocess.CompletedProcess(args=[], returncode=0, stdout="", stderr=""),
+        ])
+        job_id = _seed(db, title="Fresh Match", company="Acme", status="auto")
+        _, payload = _run_json(capsys, "refresh")
+        assert payload["ok"] is False and payload["partial"] is True
+        assert [c["id"] for c in payload["page"]["listings"]] == [job_id]
+
+    def test_breaker_run_still_chains_into_the_page(self, db, capsys, mocker):
+        """Even an abandoned chain shows the queue — the user asked what's
+        good today, and the existing rows can still answer that."""
         import subprocess
         mocker.patch("subprocess.run", return_value=subprocess.CompletedProcess(
             args=[], returncode=1, stdout="", stderr="boom"))
-        _seed(db, title="Fresh Match", company="Acme", status="auto")
+        job_id = _seed(db, title="Fresh Match", company="Acme", status="auto")
+        code, payload = _run_json(capsys, "refresh")
+        assert code == 1 and payload["skipped_stages"]
+        assert [c["id"] for c in payload["page"]["listings"]] == [job_id]
+
+
+class TestRefreshDetachesTheDigests(_RefreshFixtures):
+    """C-10 #1 — Slack posting was 155s of a measured 988s chain (16%) and
+    nothing downstream reads it. It leaves the critical path without leaving
+    the product: launched, never awaited, output to a log file."""
+
+    def _digest_stages(self, payload):
+        return [s for s in payload["stages"] if s["module"] == "src.digest"]
+
+    def test_digests_are_launched_not_awaited(self, db, capsys, mocker, popen):
+        run = self._ok(mocker)
         _, payload = _run_json(capsys, "refresh")
-        assert payload["ok"] is False and payload["page"] is None
+        digests = self._digest_stages(payload)
+        assert len(digests) == 2
+        assert [s["status"] for s in digests] == ["detached", "detached"]
+        assert popen.call_count == 2
+        # The blocking stages went through subprocess.run; the digests did not.
+        assert run.call_count == len(self._blocking())
+        # Nothing waited on the handle — that is the whole point.
+        handle = popen.return_value
+        assert not handle.wait.called and not handle.communicate.called
+
+    def test_detached_output_goes_to_a_log_file(self, db, capsys, mocker,
+                                                tmp_path, popen):
+        self._ok(mocker)
+        _, payload = _run_json(capsys, "refresh")
+        logs = [s["log"] for s in self._digest_stages(payload)]
+        # One file per stage, so the two runs never interleave.
+        assert len(set(logs)) == 2
+        for path in logs:
+            assert str(tmp_path) in path
+            assert Path(path).exists()
+        kwargs = popen.call_args.kwargs
+        assert kwargs["stdout"] is not None          # a file, not an inherited pipe
+        assert kwargs["stderr"] == subprocess.STDOUT
+        assert kwargs["start_new_session"] is True   # survives refresh exiting
+
+    def test_human_output_points_at_the_log(self, db, capsys, mocker):
+        self._ok(mocker)
+        _, out = _run(capsys, "refresh")
+        assert "Slack posting is still running in the background" in out
+        assert "refresh-digest-a.log" in out
+
+    def test_wait_runs_the_digests_in_line(self, db, capsys, mocker, popen):
+        from src.cli import REFRESH_STAGES
+        run = self._ok(mocker)
+        _, payload = _run_json(capsys, "refresh", "--wait")
+        assert run.call_count == len(REFRESH_STAGES)
+        assert popen.call_count == 0
+        assert all(s["status"] == "ok" for s in payload["stages"])
+
+    def test_funnel_mode_keeps_the_digests_in_line(self, db, capsys, mocker,
+                                                  monkeypatch, popen):
+        """AUTOPILOT_POST_STAGE_5 puts auto_queued rows in the digest — the
+        same rows autopilot enriches. A concurrent digest could then post a
+        second card for one listing, so detaching is off in that mode."""
+        monkeypatch.setenv("AUTOPILOT_POST_STAGE_5", "true")
+        from src.cli import REFRESH_STAGES
+        run = self._ok(mocker)
+        _run_json(capsys, "refresh")
+        assert run.call_count == len(REFRESH_STAGES)
+        assert popen.call_count == 0
+
+    def test_a_detached_failure_never_reaches_the_envelope(self, db, capsys,
+                                                           mocker, popen):
+        """A detached stage is not observed, so it can neither fail the run nor
+        trip the breaker — its outcome lives in its log."""
+        self._ok(mocker)
+        popen.return_value.returncode = 1
+        popen.return_value.poll.return_value = 1
+        code, payload = _run_json(capsys, "refresh")
+        assert code == 0 and payload["ok"] is True
+        assert payload["failed_stages"] == []
+        assert all(s["returncode"] is None for s in self._digest_stages(payload))
+
+    def test_a_detached_stage_neither_trips_nor_resets_the_breaker(
+            self, db, capsys, mocker, popen):
+        """Track A fails, digest (A) detaches, track B fails: the two observed
+        failures are consecutive, so the chain stops even though a stage ran
+        between them."""
+        run = mocker.patch("subprocess.run", return_value=subprocess.CompletedProcess(
+            args=[], returncode=1, stdout="", stderr="boom"))
+        _, payload = _run_json(capsys, "refresh")
+        assert run.call_count == 2
+        assert payload["failed_stages"] == ["track A scrape", "track B email"]
+        assert popen.call_count == 1                  # digest (A) still launched
+        assert payload["skipped_stages"] == ["digest (B)", "autopilot"]
+
+    def test_launch_failure_is_a_normal_stage_failure(self, db, capsys, mocker,
+                                                      popen):
+        """If Popen itself can't start, that IS observed — report it."""
+        self._ok(mocker)
+        popen.side_effect = OSError("no exec")
+        _, payload = _run_json(capsys, "refresh")
+        assert payload["failed_stages"] == ["digest (A)", "digest (B)"]
+        assert payload["ok"] is False and payload["partial"] is True
+
+    def test_dry_run_says_which_stages_detach(self, db, capsys, mocker):
+        self._ok(mocker)
+        _, out = _run(capsys, "refresh", "--dry-run")
+        assert "digest (A) [detached]" in out
 
 
 class TestScriptShIsAWrapper:

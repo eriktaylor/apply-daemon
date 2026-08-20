@@ -117,6 +117,32 @@ REFRESH_STAGES: tuple[tuple[str, str], ...] = (
     ("autopilot", "src.process_queue"),
 )
 
+# Consecutive stage failures that abandon the chain. No stage feeds another —
+# all five talk only through SQLite, and none reads a predecessor's exit code
+# — so one failure says nothing about the next stage and the rest of the run
+# is still worth having. Autopilot in particular runs last on already-stored
+# rows, so fail-fast spent a routine Track A proxy error on the day's
+# enrichment. Two failures in a row is the *systemic* signal (bad credential,
+# provider down), and stopping there preserves the spend containment
+# fail-fast was really buying.
+#
+# Same shape as triage._MAX_CONSECUTIVE_REJECTIONS, deliberately not the same
+# constant: unrelated domains, and one number serving both would be drift the
+# first time either is tuned.
+_MAX_CONSECUTIVE_STAGE_FAILURES = 2
+
+# Stages taken off the critical path: launched and never waited on. Slack
+# posting is ~155s of a ~990s chain (measured 2026-08-20) and nothing
+# downstream reads it — I-9 made autopilot Slack-independent on purpose.
+# `--wait` restores in-line behavior for cron/CI.
+_DETACHABLE_MODULES = frozenset({"src.digest"})
+
+# Where a detached stage's output goes. It must be a file: a detached child
+# that inherits the parent's pipes dies on its next write once `refresh`
+# returns. Module-level so tests can redirect it; logs/ is gitignored, same
+# as logs/model_usage.log and logs/run_log.
+LOG_DIR = Path("logs")
+
 
 def _json_list(raw: object) -> list:
     """Parse a TEXT column holding a JSON array; [] on anything unusable."""
@@ -658,8 +684,54 @@ def cmd_status(db: Database, as_json: bool) -> int:
     return 0
 
 
+def _detached_log_path(stage: str) -> Path:
+    """One log file per detachable stage, e.g. ``logs/refresh-digest-a.log``.
+
+    Per stage rather than per run so the two digests never interleave, and
+    append rather than truncate so yesterday's failure is still there when
+    someone finally reads it (same convention as logs/model_usage.log).
+    """
+    slug = "-".join("".join(c if c.isalnum() else " " for c in stage).split())
+    return LOG_DIR / f"refresh-{slug.lower()}.log"
+
+
+def _launch_detached(stage: str, module: str, env: dict) -> dict:
+    """Start a stage and return without waiting for it.
+
+    Output goes to a file, never to an inherited pipe: the pipe closes when
+    ``refresh`` returns and the child dies on its next write. ``start_new_session``
+    puts the child in its own process group so a Ctrl-C in the terminal — or
+    cron reaping the shell — doesn't take Slack posting with it.
+    """
+    path = _detached_log_path(stage)
+    path.parent.mkdir(parents=True, exist_ok=True)
+    stamp = datetime.now(timezone.utc).isoformat()
+    with open(path, "a", encoding="utf-8") as log:
+        log.write(f"\n=== {stamp} refresh detached {module} ===\n")
+        log.flush()
+        subprocess.Popen(
+            [sys.executable, "-m", module],
+            env=env,
+            stdin=subprocess.DEVNULL,
+            stdout=log,
+            stderr=subprocess.STDOUT,
+            start_new_session=True,
+        )
+    return {"stage": stage, "module": module, "status": "detached",
+            "returncode": None, "seconds": 0.0, "log": str(path)}
+
+
+def _fmt_stage(result: dict) -> str:
+    marks = {"ok": "ok", "failed": "FAIL", "detached": ".."}
+    line = f"  {marks[result['status']]:<4}  {result['stage']}"
+    if result["status"] == "detached":
+        line += f" — detached → {result['log']}"
+    return line
+
+
 def cmd_refresh(db: Database, *, top_n: int | None, force: bool,
-                dry_run: bool, as_json: bool, no_next: bool = False) -> int:
+                dry_run: bool, as_json: bool, no_next: bool = False,
+                wait: bool = False) -> int:
     """Fire the ingestion pipeline, budget permitting.
 
     **Owns the stage sequence.** ``script.sh`` is a thin wrapper over this verb
@@ -669,13 +741,36 @@ def cmd_refresh(db: Database, *, top_n: int | None, force: bool,
     Orchestrates, never reimplements — each stage runs as its own subprocess
     exactly as ``script.sh`` used to invoke it, so a stage's behavior is
     unchanged and a crash is attributable to one module.
+
+    **Failure policy (C-9).** A failed stage does not cancel the ones after it;
+    see ``_MAX_CONSECUTIVE_STAGE_FAILURES`` for why, and for the one case that
+    does stop the chain. The budget is deliberately *not* re-checked between
+    stages: it is a pre-run admission gate, ``record_run`` has already fired,
+    and killing an admitted run halfway on its own spending is a different
+    policy nobody asked for.
+
+    **Detached stages (C-10).** Slack posting leaves the critical path but not
+    the product: the digests are launched and not awaited, so Track B and
+    autopilot start immediately. Their outcome lands in their log, not in this
+    verb's envelope — which is why they can neither trip nor reset the breaker.
     """
     from src.budget import check_run_allowed, record_run
 
     decision = check_run_allowed()
     stages = list(REFRESH_STAGES)
+    # Detaching lets the digest post while autopilot works. Safe only while the
+    # two are looking at different rows: high-signal mode posts triaged/saved
+    # and autopilot enriches auto_queued, so the populations are disjoint. With
+    # AUTOPILOT_POST_STAGE_5=true the digest also posts auto_queued rows, and a
+    # concurrent autopilot that read `slack_message_ts` before the digest wrote
+    # it would post a second card for the same listing — a window only
+    # process_queue can close. Run them in-line instead until it does.
+    detach = not wait and high_signal_only()
 
     if dry_run:
+        def _label(name: str, module: str) -> str:
+            return (f"{name} [detached]"
+                    if detach and module in _DETACHABLE_MODULES else name)
         _emit(
             {"verb": "refresh", "ok": True, "dry_run": True,
              "would_run": [s[0] for s in stages],
@@ -683,7 +778,7 @@ def cmd_refresh(db: Database, *, top_n: int | None, force: bool,
              "spent_usd_today": decision.spent_usd,
              "budget_usd": decision.budget_usd},
             as_json,
-            f"Would run: {' → '.join(s[0] for s in stages)}\n"
+            f"Would run: {' → '.join(_label(n, m) for n, m in stages)}\n"
             f"Budget: {decision.reason}\n"
             + ("Allowed." if decision.allowed else "BLOCKED — would refuse."),
         )
@@ -721,29 +816,65 @@ def cmd_refresh(db: Database, *, top_n: int | None, force: bool,
         print(text, file=sys.stderr, flush=True)
 
     _progress(f"Running {len(stages)} stages — {' → '.join(n for n, _ in stages)}\n")
+    if not detach and not wait:
+        _progress("Digests run in-line: AUTOPILOT_POST_STAGE_5 posts the same "
+                  "rows autopilot enriches.\n")
 
-    results = []
-    failed = None
+    results: list[dict] = []
+    failed: list[str] = []
+    skipped: list[str] = []
+    consecutive = 0
+    broke = False
     for i, (name, module) in enumerate(stages, 1):
         _progress(f"[{i}/{len(stages)}] {name} ({module}) …")
-        started = time.monotonic()
-        proc = subprocess.run(
-            [sys.executable, "-m", module],
-            env=env,
-            capture_output=not stream,
-            text=True,
-        )
-        elapsed = time.monotonic() - started
-        results.append({"stage": name, "module": module,
-                        "returncode": proc.returncode,
-                        "seconds": round(elapsed, 1)})
-        mark = "ok" if proc.returncode == 0 else f"FAILED rc={proc.returncode}"
-        _progress(f"[{i}/{len(stages)}] {name} — {mark} in {elapsed:.0f}s\n")
-        if proc.returncode != 0:
-            failed = name
+
+        if detach and module in _DETACHABLE_MODULES:
+            try:
+                record = _launch_detached(name, module, env)
+            except OSError:
+                logger.error("Stage %s could not be launched", name, exc_info=True)
+                record = {"stage": name, "module": module, "status": "failed",
+                          "returncode": -1, "seconds": 0.0, "log": None}
+            results.append(record)
+            if record["status"] == "detached":
+                _progress(f"[{i}/{len(stages)}] {name} — detached, logging to "
+                          f"{record['log']}\n")
+                # Not observed, so neither trips nor resets the breaker.
+                continue
+            failed.append(name)
+            consecutive += 1
+        else:
+            started = time.monotonic()
+            proc = subprocess.run(
+                [sys.executable, "-m", module],
+                env=env,
+                capture_output=not stream,
+                text=True,
+            )
+            elapsed = time.monotonic() - started
+            ok = proc.returncode == 0
+            results.append({"stage": name, "module": module,
+                            "status": "ok" if ok else "failed",
+                            "returncode": proc.returncode,
+                            "seconds": round(elapsed, 1), "log": None})
+            mark = "ok" if ok else f"FAILED rc={proc.returncode}"
+            _progress(f"[{i}/{len(stages)}] {name} — {mark} in {elapsed:.0f}s\n")
+            if ok:
+                consecutive = 0
+                continue
+            failed.append(name)
+            consecutive += 1
             if not stream and proc.stderr:
                 _progress(proc.stderr[-800:])
             logger.error("Stage %s failed (rc=%d)", name, proc.returncode)
+
+        if consecutive >= _MAX_CONSECUTIVE_STAGE_FAILURES:
+            broke = True
+            skipped = [s for s, _ in stages[i:]]
+            logger.error("Circuit breaker: %d consecutive stage failures — "
+                         "abandoning %s", consecutive, ", ".join(skipped) or "nothing")
+            _progress(f"Circuit breaker: {consecutive} stages failed in a row — "
+                      "stopping.\n")
             break
 
     after = check_run_allowed()
@@ -751,36 +882,58 @@ def cmd_refresh(db: Database, *, top_n: int | None, force: bool,
     if after.spent_usd is not None and decision.spent_usd is not None:
         spent = round(after.spent_usd - decision.spent_usd, 4)
 
-    payload = {"verb": "refresh", "ok": failed is None, "stages": results,
-               "failed_stage": failed, "spent_usd_this_run": spent,
+    succeeded = [r["stage"] for r in results if r["status"] == "ok"]
+    detached = [r for r in results if r["status"] == "detached"]
+    # `ok` still means "everything succeeded", so the existing contract holds.
+    # `partial` is the new state fail-fast used to hide: work landed AND
+    # something broke. Detached stages are neither — their result is in their
+    # log, not here.
+    payload = {"verb": "refresh", "ok": not failed,
+               "partial": bool(failed and succeeded),
+               "stages": results,
+               "failed_stage": failed[0] if failed else None,
+               "failed_stages": failed,
+               "skipped_stages": skipped,
+               "spent_usd_this_run": spent,
                "spent_usd_today": after.spent_usd, "page": None}
 
-    # C-5: chain straight into the first page. The whole point of the batch is
-    # the listings it produced, so making the user issue a second command was
-    # the automation regression this closes. --no-next opts out for scripting.
+    # C-5: chain straight into the first page, partial run included. The
+    # listings that did land are real, and the user asked what's good today —
+    # reporting a failure with nothing to show is the regression C-5 closed.
+    # --no-next opts out for scripting.
     page = None
-    if failed is None and not no_next:
+    if not no_next:
         page = review_page(db, top=DEFAULT_TOP)
         payload["page"] = page
 
-    human = "\n".join(
-        f"  {'ok ' if r['returncode'] == 0 else 'FAIL'}  {r['stage']}"
-        for r in results
-    )
+    human = "\n".join(_fmt_stage(r) for r in results)
+    if broke:
+        tail = f"{', '.join(skipped)} did not run" if skipped else "nothing was left to run"
+        human += (f"\n\nStopped after {_MAX_CONSECUTIVE_STAGE_FAILURES} stages "
+                  f"failed in a row ({', '.join(failed[-2:])}) — {tail}. "
+                  "Consecutive failures usually mean a credential or a "
+                  "provider, not a bad listing.")
+    elif failed:
+        human += (f"\n\n{', '.join(failed)} failed — see the logs. "
+                  "Every later stage still ran.")
+    if detached:
+        human += ("\n\nSlack posting is still running in the background — "
+                  "this verb does not wait for it.")
     if spent is not None:
         human += f"\n\nThis run cost ~${spent:.4f}"
         if after.budget_usd > 0 and after.spent_usd is not None:
             human += f" (${after.spent_usd:.2f} of ${after.budget_usd:.2f} today)"
-    if failed:
-        human += f"\n\nStopped at {failed} — see logs. Later stages did not run."
-    elif page is not None:
+    if page is not None:
         human += "\n\n" + _fmt_page(page)
         if page["listings"]:
             human += "\n\nDeep-dive one, or pass what doesn't fit."
     else:
         human += "\n\nRun `next` to review what came in."
     _emit(payload, as_json, human)
-    return 0 if failed is None else 1
+    # Non-zero only when nothing worked or the breaker abandoned the chain. A
+    # run that scraped and enriched but failed to post to Slack is not a failed
+    # run — script.sh execs this verb, so this is also the shell's exit code.
+    return 0 if succeeded and not broke else 1
 
 
 def cmd_deep_dive(db: Database, job_id: str, as_json: bool) -> int:
@@ -1136,6 +1289,9 @@ def build_parser() -> argparse.ArgumentParser:
                            help="Show the stages and budget verdict, run nothing")
     p_refresh.add_argument("--no-next", action="store_true", dest="no_next",
                            help="Don't show the first page afterwards")
+    p_refresh.add_argument("--wait", action="store_true",
+                           help="Run the Slack digests in-line instead of "
+                                "detaching them (cron/CI)")
 
     p_show = sub.add_parser("show", parents=[common],
                             help="Show one listing in full")
@@ -1204,7 +1360,7 @@ def main(argv: list[str] | None = None) -> int:
         if args.verb == "refresh":
             return cmd_refresh(db, top_n=args.top_n, force=args.force,
                                dry_run=args.dry_run, as_json=args.json,
-                               no_next=args.no_next)
+                               no_next=args.no_next, wait=args.wait)
         if args.verb == "next":
             return cmd_next(db, args.top, args.json, args.max_age,
                             args.all_tiers, args.seen)

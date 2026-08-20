@@ -10,8 +10,13 @@
 #     ./script.sh --dry-run       # show the stages and budget verdict
 #     ./script.sh --top-n 5       # raise autopilot enrichment for this run
 #     ./script.sh --force         # run even if the budget check refuses
+#     ./script.sh --wait          # keep Slack posting on the critical path
 #
-# Exits non-zero if a stage fails or the budget refuses the run.
+# `exec`, so the verb's exit code is this script's: non-zero if the budget
+# refuses the run, if no stage succeeded, or if two stages failed in a row.
+# A single failed stage does not stop the chain and does not fail the run —
+# see cmd_refresh's failure policy. The Slack digests are launched detached,
+# so this returns while they may still be posting; --wait for cron/CI.
 
 set -euo pipefail
 

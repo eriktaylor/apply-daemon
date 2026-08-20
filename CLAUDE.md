@@ -66,6 +66,17 @@ Load-bearing behaviors a change can easily break:
   Push conditional judgement to the stage that has the context for it.
 - **`presented_at` is a delivery ledger, and the feed retires what it shows.** Re-showing was the defect: confidence is stable, so re-ranking one pool returns the same winners forever. Retirement is only safe because `next --seen` and `status.backlog` keep those rows reachable — see `db.get_review_queue`'s docstring, the only copy.
 - **The re-score prefers the session route.** `AUTOPILOT_RESCORE_VIA=session` shells out through `src/claude_cli.py` (subscription-billed, never written to `logs/model_usage.log` — that file drives the spend ceiling). Falls back to OpenRouter on any failure. Stage 5 deliberately stays metered: the CLI's ~23k-token startup overhead is decisive against 100+ small calls — though note that argument is about *this* transport, not all of them (`src/gemini_cli.py` parallelises 8-wide at ~100% efficiency and still lost, on latency and dropped batches rather than overhead). See [docs/MODELS.md](docs/MODELS.md#the-session-route-subscription-billed).
+- **`refresh` contains a stage failure instead of cancelling the chain, and
+  returns before Slack does.** No stage reads another's exit code — all five
+  communicate only through SQLite — so one failure says nothing about the
+  next; *two consecutive* failures trip a circuit breaker and abandon the
+  rest. `ok` still means "everything succeeded", which is why `partial` and
+  `failed_stages` exist. Both `digest` stages are launched detached, so
+  autopilot may be posting Slack cards while a digest is: that is what
+  `digest._already_delivered` guards, and why detaching is off when
+  `AUTOPILOT_POST_STAGE_5` puts both on the same rows. `--wait` restores the
+  fully in-line chain for cron/CI.
+- **The re-score prefers the session route.** `AUTOPILOT_RESCORE_VIA=session` shells out through `src/claude_cli.py` (subscription-billed, never written to `logs/model_usage.log` — that file drives the spend ceiling). Falls back to OpenRouter on any failure. Stage 5 deliberately stays metered: the CLI's ~23k-token startup overhead is decisive against 100+ small calls. See [docs/MODELS.md](docs/MODELS.md#the-session-route-subscription-billed).
 
 ### Project structure
 

@@ -159,15 +159,12 @@ and returns any ✏️ ids in `pending_tailors`. It is free and fast.
 **`refresh`** runs the pipeline and returns the first page. It, and any verb
 given `--via api`, are the only ways to spend metered money.
 
-- `page` holds the first page of results; render it rather than calling
-  `next` again, which would skip past those listings.
-
 - Check `status` first — see "Default motion" above. Refreshing a stocked
   queue costs minutes and money for listings that are not yet reviewable.
 - `--dry-run` shows the stages and the budget verdict without spending; use it
   when the user asks "what would that cost?".
 - `ok: false` with `error: "budget_blocked"` means a cap or the cooldown
-  refused it. Report `reason` verbatim, then **fall back to `next`** — the
+  refused it — the one `ok: false` where nothing ran at all. Report `reason` verbatim, then **fall back to `next`** — the
   user asked what's good, and the existing queue can still answer that. Say
   when the cooldown lifts. **Do not pass `--force`** unless the user
   explicitly asks — it exists for them, not for you.
@@ -179,6 +176,27 @@ given `--via api`, are the only ways to spend metered money.
   daily cap was already spent. If the page looks unchanged, check
   `status.enrichment_remaining` and say so plainly rather than implying the
   run failed.
+
+**A stage can fail without the run failing.** `ok` means every stage
+succeeded; it is not the same question as "did anything come in?".
+
+- **`partial: true` is a run that worked with a hole in it.** One stage broke
+  and every later stage still ran, so `page` holds real listings. Render the
+  page and name the break in one clause — "3 came in; the Slack digest
+  failed" — never "the refresh failed". `failed_stages` lists what broke;
+  `failed_stage` is the first of them.
+- **`skipped_stages` non-empty means the chain was abandoned** after two
+  stages failed in a row, which points at a credential or a provider rather
+  than a bad listing. Say what did not run — if `autopilot` is in that list,
+  nothing new was enriched today — report `failed_stages`, and still show
+  `page`. The queue can answer the user's question even when the run couldn't.
+- A stage with `status: "detached"` has **no result to report**. Do not call
+  it failed, and do not call it done.
+
+**`refresh` returns before Slack posting finishes.** The two digest stages are
+launched in the background (they were 16% of a measured run) and this verb
+does not wait for them. Their cards land a minute or two later, so don't tell
+the user Slack is up to date — the CLI page you just rendered is.
 
 **`deep-dive`** returns `{verb, ok, listing, research, post_research}`.
 

@@ -90,6 +90,11 @@ OWNERSHIP: list[tuple[str, str, str]] = [
         "file_logger.py",
         r"logging\.FileHandler\(",
     ),
+    (
+        "detached stage launch (fire-and-forget subprocess)",
+        "cli.py",
+        r"start_new_session\s*=\s*True",
+    ),
 ]
 
 # Patterns no module may contain, with the reason. Distinct from OWNERSHIP:

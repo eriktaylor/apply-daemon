@@ -294,9 +294,10 @@ Walks the checklist, reporting which components are configured and reachable. In
 ./script.sh              # budget-gated run of both tracks + autopilot
 ./script.sh --dry-run    # show the stages and budget verdict, run nothing
 ./script.sh --top-n 5    # raise autopilot enrichment for this run only
+./script.sh --wait       # keep Slack posting on the critical path
 ```
 
-`script.sh` is a thin wrapper over `python -m src.cli refresh`, which owns the stage sequence and checks your spend ceiling first (see `DAILY_USD_BUDGET` and `MIN_RUN_INTERVAL_MINUTES` in `.env.example`). It refuses rather than half-running, reports what the run cost, and exits non-zero if a stage fails. Then review with `python -m src.cli next` — or `python -m src.sweeper` if you triage from Slack.
+`script.sh` is a thin wrapper over `python -m src.cli refresh`, which owns the stage sequence and checks your spend ceiling first (see `DAILY_USD_BUDGET` and `MIN_RUN_INTERVAL_MINUTES` in `.env.example`). It refuses rather than half-running and reports what the run cost. A failed stage does not cancel the ones after it — no stage feeds another, so one bad scrape shouldn't cost you the day's enrichment — but two failures in a row stop the run, and it exits non-zero if nothing succeeded. Slack posting is launched in the background, so the command returns without waiting for it. Then review with `python -m src.cli next` — or `python -m src.sweeper` if you triage from Slack.
 
 **Manual run:**
 

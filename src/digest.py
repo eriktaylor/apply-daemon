@@ -279,6 +279,33 @@ def build_digest_listing_attachment(listing: dict, history: str = "") -> dict:
     return {"color": color, "blocks": blocks}
 
 
+def _already_delivered(db: Database, listing_id: str) -> bool:
+    """Has something else posted a card for this row since the query ran?
+
+    The digest selects its rows once and then spends ~1.5s per card, so the
+    selection is stale by the time the last one posts. Autopilot posts a card
+    of its own whenever a listing has no ``slack_message_ts`` — so without this
+    re-read, a row it claimed mid-loop gets a second card. That window opened
+    when `cli refresh` stopped waiting for the digest (C-10); it was
+    previously closed only by the two never running at the same time.
+
+    Same shape as ``process_queue._process_one``'s "re-check state at the
+    moment of work" — a fresh read on this connection, which sees the other
+    process's commits (WAL). ``slack_notified`` alone is not enough: autopilot
+    writes the timestamp and the flag in separate transactions, so the gap
+    between them is exactly the window this guards.
+    """
+    if not listing_id:
+        return False
+    row = db.get_listing_by_id(listing_id)
+    if row is None:
+        return True                      # gone since the query — nothing to post
+    if not (row["slack_notified"] or row["slack_message_ts"]):
+        return False
+    logger.info("Digest: %s already has a Slack card — skipping", listing_id[:8])
+    return True
+
+
 def post_digest() -> bool:
     """Query DB and post the daily digest to Slack.
 
@@ -344,6 +371,8 @@ def post_digest() -> bool:
 
             # Post each listing as a color-coded attachment with job_id metadata
             for listing in listings:
+                if _already_delivered(db, listing.get("id", "")):
+                    continue
                 history = db.get_listing_history(
                     listing.get("title", ""),
                     listing.get("company", ""),

@@ -370,6 +370,10 @@ class TestPostDigestPacing:
         }
         db_instance.get_digest_listings.return_value = [row1, row2]
         db_instance.get_listing_history.return_value = ""
+        # The pre-post re-check reads each row again; neither is delivered yet.
+        db_instance.get_listing_by_id.side_effect = lambda job_id: {
+            "slack_notified": 0, "slack_message_ts": None,
+        }
         MockDB.return_value.__enter__ = MagicMock(return_value=db_instance)
         MockDB.return_value.__exit__ = MagicMock(return_value=False)
 
@@ -398,6 +402,120 @@ class TestPostDigestPacing:
         assert len(app.client.retry_handlers) == 1
         from slack_sdk.http_retry.builtin_handlers import RateLimitErrorRetryHandler
         assert isinstance(app.client.retry_handlers[0], RateLimitErrorRetryHandler)
+
+
+class TestAlreadyDeliveredReadsRealColumns:
+    """The mocked loop above cannot catch a wrong column name — this can."""
+
+    def test_against_a_real_row(self, tmp_path):
+        from src.db import Database
+        from src.digest import _already_delivered
+        from src.models import JobListing
+
+        listing = JobListing(
+            source="linkedin", email_classification="JOB_DIGEST",
+            title="ML Engineer", company="Acme", verdict="YES",
+            confidence=90, model_used="test",
+        )
+        with Database(tmp_path / "digest.db") as db:
+            db.insert_listing(listing)
+            assert _already_delivered(db, listing.id) is False
+            db.set_slack_message_ts(listing.id, "1720.5")
+            assert _already_delivered(db, listing.id) is True
+            assert _already_delivered(db, "not-a-row") is True
+            assert _already_delivered(db, "") is False
+
+
+class TestPostDigestSkipsRowsClaimedMidLoop:
+    """The digest selects its rows once, then spends ~1.5s per card. With
+    `cli refresh` no longer waiting for it (C-10), autopilot can claim one of
+    those rows and post its own card in between — so every post re-reads
+    delivery state first, or the listing gets two cards."""
+
+    def _row(self, job_id, title):
+        return {
+            "id": job_id, "title": title, "company": "Co",
+            "verdict": "YES", "confidence": 80, "pipeline_status": "auto_queued",
+            "location": "", "salary": "", "job_summary": "", "model_scores": "",
+            "skills_extracted": 0, "matching_skills": "", "missing_skills": "",
+            "links": "",
+        }
+
+    @patch("src.digest.time")
+    @patch("src.digest.Database")
+    @patch("src.digest._import_slack_app")
+    @patch("src.digest._get_slack_config", return_value=("xoxb-token", "C123"))
+    def test_row_posted_by_autopilot_mid_loop_is_skipped(
+            self, mock_config, mock_import, MockDB, mock_time):
+        app = MagicMock()
+        app.client.retry_handlers = []
+        mock_import.return_value = app
+
+        db_instance = MagicMock()
+        db_instance.get_digest_listings.return_value = [
+            self._row("job_1", "Still Unposted"),
+            self._row("job_2", "Claimed By Autopilot"),
+        ]
+        db_instance.get_listing_history.return_value = ""
+        # job_2 acquired a card between the query and its turn in the loop.
+        db_instance.get_listing_by_id.side_effect = lambda job_id: {
+            "job_1": {"slack_notified": 0, "slack_message_ts": None},
+            "job_2": {"slack_notified": 1, "slack_message_ts": "1720.5"},
+        }[job_id]
+        MockDB.return_value.__enter__ = MagicMock(return_value=db_instance)
+        MockDB.return_value.__exit__ = MagicMock(return_value=False)
+
+        assert post_digest() is True
+
+        posted = [c for c in app.client.chat_postMessage.call_args_list
+                  if c.kwargs.get("attachments")]
+        assert len(posted) == 1
+        assert "Still Unposted" in posted[0].kwargs["text"]
+        db_instance.mark_slack_notified.assert_called_once_with("job_1")
+
+    @patch("src.digest.time")
+    @patch("src.digest.Database")
+    @patch("src.digest._import_slack_app")
+    @patch("src.digest._get_slack_config", return_value=("xoxb-token", "C123"))
+    def test_timestamp_alone_is_enough_to_skip(
+            self, mock_config, mock_import, MockDB, mock_time):
+        """Autopilot writes the timestamp and the notified flag in separate
+        transactions; a card exists as soon as the first one lands."""
+        app = MagicMock()
+        app.client.retry_handlers = []
+        mock_import.return_value = app
+
+        db_instance = MagicMock()
+        db_instance.get_digest_listings.return_value = [self._row("job_1", "Mid Write")]
+        db_instance.get_listing_history.return_value = ""
+        db_instance.get_listing_by_id.return_value = {
+            "slack_notified": 0, "slack_message_ts": "1720.5",
+        }
+        MockDB.return_value.__enter__ = MagicMock(return_value=db_instance)
+        MockDB.return_value.__exit__ = MagicMock(return_value=False)
+
+        assert post_digest() is True
+        assert not db_instance.mark_slack_notified.called
+
+    @patch("src.digest.time")
+    @patch("src.digest.Database")
+    @patch("src.digest._import_slack_app")
+    @patch("src.digest._get_slack_config", return_value=("xoxb-token", "C123"))
+    def test_row_deleted_mid_loop_is_skipped(
+            self, mock_config, mock_import, MockDB, mock_time):
+        app = MagicMock()
+        app.client.retry_handlers = []
+        mock_import.return_value = app
+
+        db_instance = MagicMock()
+        db_instance.get_digest_listings.return_value = [self._row("job_1", "Gone")]
+        db_instance.get_listing_history.return_value = ""
+        db_instance.get_listing_by_id.return_value = None
+        MockDB.return_value.__enter__ = MagicMock(return_value=db_instance)
+        MockDB.return_value.__exit__ = MagicMock(return_value=False)
+
+        assert post_digest() is True
+        assert not db_instance.mark_slack_notified.called
 
 
 class TestSweeperRateLimitHandler:
