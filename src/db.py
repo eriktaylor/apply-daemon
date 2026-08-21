@@ -62,6 +62,32 @@ SEEN_ONLY = "seen"
 _BUSY_TIMEOUT_MS = 5000
 
 
+def _norm(value: str | None) -> str:
+    """Normalize a title/company for fuzzy comparison."""
+    return (value or "").strip().lower()
+
+
+def _fuzzy_same_listing(
+    incoming_title: str | None,
+    incoming_company: str | None,
+    existing_title: str | None,
+    existing_company: str | None,
+    threshold: float,
+) -> bool:
+    """Do these two rows describe the same job?
+
+    Title *and* company must both score at/above ``threshold`` under
+    rapidfuzz ``token_set_ratio``. This is the module's single definition of
+    "same listing" — pre-Stage-5 dedup, the Smart Upsert and the history
+    timeline all ask here rather than re-implementing the comparison
+    (CLAUDE.md -> Anti-drift in code).
+    """
+    return (
+        token_set_ratio(_norm(incoming_title), _norm(existing_title)) >= threshold
+        and token_set_ratio(_norm(incoming_company), _norm(existing_company)) >= threshold
+    )
+
+
 def resolve_db_path(db_path: Path | None = None) -> Path:
     """Resolve the database path: explicit arg → $APPLY_DAEMON_DB → default.
 
@@ -281,8 +307,6 @@ class Database:
             UPDATE was performed, False + None for a fresh INSERT.
         """
         now = datetime.now(timezone.utc).isoformat()
-        incoming_title = (listing.title or "").strip().lower()
-        incoming_company = (listing.company or "").strip().lower()
 
         # Search across the wider pass_window so we can also catch pass/expired rows.
         search_window = max(window_days, pass_window_days)
@@ -300,11 +324,9 @@ class Database:
         matched_status = None
         matched_date = None
         for row in rows:
-            existing_title = (row["title"] or "").strip().lower()
-            existing_company = (row["company"] or "").strip().lower()
-            title_score = token_set_ratio(incoming_title, existing_title)
-            company_score = token_set_ratio(incoming_company, existing_company)
-            if title_score >= threshold and company_score >= threshold:
+            if _fuzzy_same_listing(
+                listing.title, listing.company, row["title"], row["company"], threshold
+            ):
                 matched_id = row["id"]
                 matched_status = row["pipeline_status"]
                 matched_date = row["date_ingested"]
@@ -360,35 +382,44 @@ class Database:
         self.insert_listing(listing)
         return False, None
 
-    def is_duplicate_listing(
+    def find_duplicate_listing(
         self, title: str, company: str, window_days: int = 30, threshold: float = 85.0
-    ) -> bool:
-        """Check if a similar listing exists within the dedup window using fuzzy matching.
+    ) -> str | None:
+        """Id of the listing this one duplicates within the dedup window, else None.
 
-        Uses rapidfuzz token_set_ratio to compare incoming title and company
-        against recent entries. Both must score above threshold to be a duplicate.
+        Source-agnostic by design: the fuzzy match runs against every row
+        ingested in the window, whichever track stored it. Both tracks call
+        this before Stage 5 so a known listing costs no tokens (CLAUDE.md ->
+        "Dedup runs *before* Stage 5"). It returns the id rather than a bool
+        so the skip can name what it matched in the audit log — a dedup drop
+        that says only "duplicate" cannot answer which track shadowed which
+        (docs/AUDIT.md, gate ``dedup``).
         """
         cutoff = (datetime.now(timezone.utc) - timedelta(days=window_days)).isoformat()
         rows = self.conn.execute(
             """
-            SELECT title, company FROM listings
+            SELECT id, title, company FROM listings
             WHERE date_ingested >= ?
             """,
             (cutoff,),
         ).fetchall()
 
-        incoming_title = (title or "").strip().lower()
-        incoming_company = (company or "").strip().lower()
-
         for row in rows:
-            existing_title = (row["title"] or "").strip().lower()
-            existing_company = (row["company"] or "").strip().lower()
-            title_score = token_set_ratio(incoming_title, existing_title)
-            company_score = token_set_ratio(incoming_company, existing_company)
-            if title_score >= threshold and company_score >= threshold:
-                return True
+            if _fuzzy_same_listing(
+                title, company, row["title"], row["company"], threshold
+            ):
+                return row["id"]
 
-        return False
+        return None
+
+    def is_duplicate_listing(
+        self, title: str, company: str, window_days: int = 30, threshold: float = 85.0
+    ) -> bool:
+        """Bool-only view of :meth:`find_duplicate_listing` — one implementation."""
+        return (
+            self.find_duplicate_listing(title, company, window_days, threshold)
+            is not None
+        )
 
     def get_recent_titles(self, days: int = 30) -> list[str]:
         """Titles of recently ingested listings — novelty corpus for Track B
@@ -755,18 +786,13 @@ class Database:
             "FROM listings ORDER BY date_ingested ASC",
         ).fetchall()
 
-        incoming_title = (title or "").strip().lower()
-        incoming_company = (company or "").strip().lower()
-
         matches = []
         for row in rows:
             if row["id"] == current_job_id:
                 continue
-            existing_title = (row["title"] or "").strip().lower()
-            existing_company = (row["company"] or "").strip().lower()
-            title_score = token_set_ratio(incoming_title, existing_title)
-            company_score = token_set_ratio(incoming_company, existing_company)
-            if title_score >= threshold and company_score >= threshold:
+            if _fuzzy_same_listing(
+                title, company, row["title"], row["company"], threshold
+            ):
                 matches.append(row)
 
         if not matches:

@@ -1,8 +1,9 @@
 """Pipe-delimited audit log for silent drops.
 
-Used by the mismatch gate (Fix 2a) and the expired-listing gates (Fix 4a
-Stage 5, Fix 4b HTTP probe) to leave a stable, greppable trail when a
-listing is dropped without reaching Slack. Schema is documented in
+Used by the mismatch gate (Fix 2a), the expired-listing gates (Fix 4a
+Stage 5, Fix 4b HTTP probe) and the pre-Stage-5 dedup skip in both
+ingestion tracks (A-8) to leave a stable, greppable trail when a listing
+is dropped without reaching Slack. Schema is documented in
 ``docs/AUDIT.md``.
 
 Writes to its own file (``logs/audit.log`` by default) via
@@ -93,7 +94,8 @@ def log_drop(
     Args:
         listing_id: ``listings.id`` UUID.
         source: Track-A site or Track-B classification (e.g. "linkedin").
-        gate: which check fired the drop. One of: stage5, substring, llm, probe.
+        gate: which check fired the drop. One of: stage5, substring, llm,
+            probe, dedup.
         anchor_company: company name from the row metadata.
         observed_company: company name detected from body/URL, or "".
         url: ``links[0]`` for host extraction; host is logged, not the full URL.
@@ -112,3 +114,33 @@ def log_drop(
         _safe(reason),
     ]
     logger.info("audit.mismatch_drops | " + " | ".join(fields))
+
+
+def log_dedup_drop(
+    *,
+    source: str,
+    anchor_company: str,
+    matched_id: str,
+    url: str = "",
+) -> None:
+    """Audit row for a listing skipped by the pre-Stage-5 dedup check.
+
+    Both ingestion tracks drop already-known listings before spending Stage 5
+    tokens, and until this existed the drop was silent — leaving "Track B has
+    ingested nothing since June" un-diagnosable from the log alone
+    (``plans/cli_skill_interface.md`` A-8).
+
+    Owns the ``dedup`` gate's row shape so the two tracks cannot drift apart:
+    ``listing_id`` is empty because the incoming row was never inserted (the
+    convention Stage 5's expired path already uses), and the matched row is
+    named by its id prefix only — an id resolves to a source with one query,
+    while a title would put listing content in the log.
+    """
+    log_drop(
+        listing_id="",  # never inserted — the match's id is the identifier
+        source=source,
+        gate="dedup",
+        anchor_company=anchor_company,
+        url=url,
+        reason=f"dedup: matches {(matched_id or '')[:8]}",
+    )

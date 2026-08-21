@@ -1,4 +1,4 @@
-# Audit Log — Mismatch Drops and Expired Listings
+# Audit Log — Silent Drops
 
 A subset of pipeline decisions silently drop listings before they reach Slack
 or before autopilot enriches them. Without an audit trail those drops are
@@ -46,9 +46,9 @@ audit.mismatch_drops | <iso_timestamp> | <listing_id> | <source> | <gate> | <anc
 | Column | Description | Example |
 |--------|-------------|---------|
 | `iso_timestamp` | UTC ISO-8601 | `2026-06-15T18:00:00+00:00` |
-| `listing_id` | UUID from `listings.id` | `9ad4143b-3617-…` |
+| `listing_id` | UUID from `listings.id`; empty for a row dropped before it was inserted | `9ad4143b-3617-…` |
 | `source` | Track-A site (`linkedin`, `indeed`, `jobspy`) or Track-B classification | `linkedin` |
-| `gate` | Which check fired the drop | `stage5`, `substring`, `llm`, `probe` |
+| `gate` | Which check fired the drop | `stage5`, `substring`, `llm`, `probe`, `dedup` |
 | `anchor_company` | What the row metadata claimed | `Handshake` |
 | `observed_company` | What the body or URL actually points at; `""` when N/A | `OpenAI` |
 | `links_host` | Resolved host of `links[0]`, stripped of `www.` | `thehomebase.ai` |
@@ -68,6 +68,7 @@ emitting.
 | `substring` | Hybrid mismatch gate: token check failed in both `job_summary` and URL host, fallback LLM was bypassed (e.g. `MISMATCH_GATE_MODE=substring_only`) | Fix 2a Stage 1 |
 | `llm` | Hybrid mismatch gate: token check missed and the LLM fallback returned `matches=false` | Fix 2a Stage 2 |
 | `probe` | HTTP probe returned 404/410 or matched an expired-page stop-phrase | Fix 4b |
+| `dedup` | Pre-Stage-5 dedup: the incoming row fuzzy-matched a listing already in the window, so it was skipped before Stage 5 spent tokens. `listing_id` is empty (nothing was inserted); `reason` names the matched row by id prefix | A-8 |
 
 ## How to audit
 
@@ -98,6 +99,15 @@ grep "audit.mismatch_drops" logs/audit.log \
 A host that shows up repeatedly with `gate=llm` is a strong signal we
 should add it to the blocklist, eliminating the LLM call entirely for
 that domain on future runs.
+
+For a `dedup` row, the `source` column is the track that lost the race and the
+`reason`'s id prefix is the row that won it — resolve the prefix to see
+which track got there first:
+
+```bash
+sqlite3 apply_daemon.db \
+  "SELECT source, title, company, date_ingested FROM listings WHERE id LIKE '9ad4143b%'"
+```
 
 If `AUDIT_LOG_ENABLED=false` or the path was overridden, substitute
 `$AUDIT_LOG_PATH` (or a cron-redirected stdout file, if that's still the

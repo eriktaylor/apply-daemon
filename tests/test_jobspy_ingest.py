@@ -7,13 +7,15 @@ the urllib3 block observer, and the scrape-retry loop. No external calls.
 from __future__ import annotations
 
 import logging
-from unittest.mock import MagicMock
+from unittest.mock import MagicMock, patch
 
 import pandas as pd
 import pytest
 
+from src.db import Database
 from src.jobspy_ingest import (
     MAX_BLOCK_RETRIES,
+    _dedup_skip,
     _format_salary,
     _is_indeed_detail_url,
     _is_truncated,
@@ -22,6 +24,7 @@ from src.jobspy_ingest import (
     _scrape_with_block_detection,
     _Urllib3BlockObserver,
 )
+from src.models import JobListing
 
 
 def _make_row(**kwargs) -> pd.Series:
@@ -511,3 +514,82 @@ class TestScrapeRetry:
 
         # One proxies_list() call per attempt.
         assert proxy_mgr.proxies_list.call_count == MAX_BLOCK_RETRIES + 1
+
+
+# ---------------------------------------------------------------------------
+# _dedup_skip() — A-8 instrumentation
+# ---------------------------------------------------------------------------
+
+class TestDedupSkipAudit:
+    """Track A re-finds the same jobs every run by design, so a dedup row per
+    re-found listing is expected — but exactly one row per dropped listing."""
+
+    def _db_with_existing(self, tmp_path):
+        db = Database(tmp_path / "dedup.db")
+        existing = JobListing(
+            source="linkedin", email_classification="JOB_DIGEST",
+            title="Senior ML Engineer", company="Acme Corp",
+            verdict="YES", confidence=90, reason="match", model_used="test",
+        )
+        db.insert_listing(existing)
+        return db, existing
+
+    def test_duplicate_logs_exactly_one_dedup_row(self, tmp_path):
+        db, existing = self._db_with_existing(tmp_path)
+        anchor = _row_to_extracted_listing(_make_row())
+
+        with patch("src.audit_log.log_drop") as log_drop:
+            assert _dedup_skip(db, anchor, "indeed", 30) is True
+
+        assert log_drop.call_count == 1
+        kwargs = log_drop.call_args.kwargs
+        assert kwargs["gate"] == "dedup"
+        assert kwargs["listing_id"] == ""
+        assert kwargs["source"] == "indeed"
+        assert kwargs["anchor_company"] == "Acme Corp"
+        assert kwargs["url"] == "https://jobs.acme.com/ml-engineer"
+        assert existing.id[:8] in kwargs["reason"]
+        db.close()
+
+    def test_one_row_per_skip_not_per_comparison(self, tmp_path):
+        """Two candidate matches in the window still produce a single row."""
+        db, _ = self._db_with_existing(tmp_path)
+        db.insert_listing(JobListing(
+            source="indeed", email_classification="JOB_DIGEST",
+            title="Senior ML Engineer", company="Acme Corp",
+            verdict="YES", confidence=88, reason="match", model_used="test",
+        ))
+        anchor = _row_to_extracted_listing(_make_row())
+
+        with patch("src.audit_log.log_drop") as log_drop:
+            assert _dedup_skip(db, anchor, "indeed", 30) is True
+
+        assert log_drop.call_count == 1
+        db.close()
+
+    def test_non_duplicate_logs_nothing(self, tmp_path):
+        db, _ = self._db_with_existing(tmp_path)
+        anchor = _row_to_extracted_listing(
+            _make_row(title="Warehouse Associate", company="Other Corp")
+        )
+
+        with patch("src.audit_log.log_drop") as log_drop:
+            assert _dedup_skip(db, anchor, "indeed", 30) is False
+
+        log_drop.assert_not_called()
+        db.close()
+
+    def test_row_carries_no_listing_content(self, tmp_path):
+        """SECURITY.md: IDs, source, company, host — never the title or body."""
+        db, _ = self._db_with_existing(tmp_path)
+        anchor = _row_to_extracted_listing(
+            _make_row(description="Confidential internal description text")
+        )
+
+        with patch("src.audit_log.log_drop") as log_drop:
+            _dedup_skip(db, anchor, "indeed", 30)
+
+        emitted = " ".join(str(v) for v in log_drop.call_args.kwargs.values())
+        assert "Senior ML Engineer" not in emitted
+        assert "Confidential" not in emitted
+        db.close()

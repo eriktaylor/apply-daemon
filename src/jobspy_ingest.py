@@ -31,6 +31,7 @@ from dotenv import load_dotenv
 
 load_dotenv()
 
+from src.audit_log import log_dedup_drop
 from src.db import Database
 from src.models import JOB_DESCRIPTION_CHARS
 from src.pipeline import setup_logging
@@ -542,13 +543,8 @@ def run_jobspy_ingest() -> None:
 
                     # Pre-Stage-5 dedup: skip jobs already in the database to
                     # avoid wasting OpenRouter API credits on known listings.
-                    if db.is_duplicate_listing(
-                        anchor.title, anchor.company, window_days=dedup_window
-                    ):
-                        logger.info(
-                            "Dedup (pre-Stage5): skipping '%s at %s' — already in DB",
-                            anchor.title, anchor.company,
-                        )
+                    source_site = str(row.get("site") or "jobspy")
+                    if _dedup_skip(db, anchor, source_site, dedup_window):
                         stats["deduped"] += 1
                         continue
 
@@ -574,7 +570,6 @@ def run_jobspy_ingest() -> None:
                             )
 
                     # Stage 5: LLM scoring against candidate profile
-                    source_site = str(row.get("site") or "jobspy")
                     try:
                         listing = session.evaluate_listing(
                             anchor=anchor,
@@ -644,6 +639,33 @@ def run_jobspy_ingest() -> None:
 
 
 
+def _dedup_skip(db, anchor, source: str, window_days: int) -> bool:
+    """Is this row already in the DB? Skip it before Stage 5 spends tokens.
+
+    Returns True when the row was dropped, and leaves the audit row that
+    makes the drop visible (docs/AUDIT.md, gate ``dedup``). This is the only
+    site that logs: ``_prescore_search_batch`` runs the same check over the
+    same rows moments earlier, so logging there too would double-count every
+    duplicate.
+    """
+    matched_id = db.find_duplicate_listing(
+        anchor.title, anchor.company, window_days=window_days
+    )
+    if not matched_id:
+        return False
+    logger.info(
+        "Dedup (pre-Stage5): skipping '%s at %s' — already in DB (%s)",
+        anchor.title, anchor.company, matched_id[:8],
+    )
+    log_dedup_drop(
+        source=source,
+        anchor_company=anchor.company,
+        matched_id=matched_id,
+        url=(anchor.links[0] if anchor.links else ""),
+    )
+    return True
+
+
 def _prescore_search_batch(session, db, jobs_df, dedup_window: int) -> None:
     """Batch-score the rows of one search before the per-row loop (M-4).
 
@@ -663,6 +685,8 @@ def _prescore_search_batch(session, db, jobs_df, dedup_window: int) -> None:
                 continue
             if _is_truncated(anchor.description):
                 continue  # Stage 4b will change the text; score it pointwise
+            # Same dedup check as the per-row loop, but no audit row: that
+            # loop drops the row a moment later and logs it there, once.
             if db.is_duplicate_listing(
                 anchor.title, anchor.company, window_days=dedup_window
             ):

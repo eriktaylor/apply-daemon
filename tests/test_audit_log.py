@@ -8,7 +8,7 @@ import logging
 import pytest
 
 import src.audit_log as audit_log
-from src.audit_log import _LOGGER_NAME, _host, _safe, log_drop
+from src.audit_log import _LOGGER_NAME, _host, _safe, log_dedup_drop, log_drop
 
 
 def _reset_channel():
@@ -169,6 +169,57 @@ class TestFileSink:
         assert len(caplog.records) == 1
         assert log_path.exists()
         _reset_channel()
+
+
+class TestDedupDrop:
+    """gate=dedup — the pre-Stage-5 skip both ingestion tracks make (A-8)."""
+
+    def test_row_names_the_matched_id_and_nothing_else(self, tmp_path, monkeypatch):
+        log_path = tmp_path / "audit.log"
+        _enable(monkeypatch, log_path)
+
+        log_dedup_drop(
+            source="linkedin",
+            anchor_company="Acme Corp",
+            matched_id="9ad4143b-3617-4c1e-9a2b-000000000000",
+            url="https://www.indeed.com/viewjob?jk=1",
+        )
+
+        line = log_path.read_text(encoding="utf-8").strip()
+        fields = [f.strip() for f in line.split("|")]
+        # audit.mismatch_drops | ts | listing_id | source | gate | ...
+        assert fields[2] == ""  # never inserted, so there is no listing id
+        assert fields[3] == "linkedin"
+        assert fields[4] == "dedup"
+        assert fields[5] == "Acme Corp"
+        assert fields[7] == "indeed.com"
+        assert fields[8] == "dedup: matches 9ad4143b"
+        _reset_channel()
+
+    def test_short_or_empty_matched_id_does_not_raise(self, caplog):
+        with caplog.at_level(logging.INFO, logger=_LOGGER_NAME):
+            log_dedup_drop(source="s", anchor_company="c", matched_id="")
+        assert "dedup: matches" in caplog.text
+
+    def test_gate_vocabulary_matches_the_doc(self):
+        """docs/AUDIT.md owns the vocabulary; log_drop's docstring must agree.
+
+        Two copies of a list is the drift shape CLAUDE.md names — this is the
+        cheap guard that they stay one vocabulary.
+        """
+        import re
+        from pathlib import Path
+
+        doc = Path("docs/AUDIT.md").read_text(encoding="utf-8")
+        table = doc.split("## Gate values", 1)[1].split("##", 1)[0]
+        documented = set(re.findall(r"^\| `([a-z0-9]+)` \|", table, re.MULTILINE))
+
+        listed = log_drop.__doc__.split("One of:", 1)[1].split(".", 1)[0]
+        declared = {g.strip() for g in listed.replace("\n", " ").split(",") if g.strip()}
+
+        assert declared == documented, (
+            f"gate vocabulary drift: docstring={declared}, docs/AUDIT.md={documented}"
+        )
 
 
 class TestNoRawContent:

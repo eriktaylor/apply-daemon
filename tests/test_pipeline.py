@@ -18,7 +18,7 @@ from src.db import Database
 from src.email_config import EmailConfig, SenderGroup
 from src.email_fetcher import FetchedEmail
 from src.models import JobListing
-from src.pipeline import run_pipeline
+from src.pipeline import _make_duplicate_check, run_pipeline
 
 DIGEST_HTML = """
 <html><body>
@@ -287,3 +287,66 @@ class TestEmailLevelPath:
         run_pipeline()
         assert _classification_of(env["db"], "<dup-2@x>") == "DUPLICATE"
         assert b"11" in env["archive_emails"].call_args.args[0]
+
+
+class TestDedupAudit:
+    """A-8: the pre-Stage-5 dedup skip must leave a row in logs/audit.log.
+
+    Track B ingested nothing for two months and the log could not say why,
+    because this skip was silent. The drop is what gets instrumented — not
+    the check.
+    """
+
+    def _db_with(self, tmp_path, listing):
+        db = Database(tmp_path / "dedup.db")
+        db.insert_listing(listing)
+        return db
+
+    def test_duplicate_logs_exactly_one_dedup_row(self, tmp_path):
+        existing = _listing(title="Senior ML Engineer", company="Acme Robotics")
+        db = self._db_with(tmp_path, existing)
+        check = _make_duplicate_check(db, source="linkedin", window_days=30)
+
+        with patch("src.audit_log.log_drop") as log_drop:
+            assert check("Senior ML Engineer", "Acme Robotics") is True
+
+        assert log_drop.call_count == 1
+        kwargs = log_drop.call_args.kwargs
+        assert kwargs["gate"] == "dedup"
+        assert kwargs["listing_id"] == ""  # nothing was inserted
+        assert kwargs["source"] == "linkedin"
+        assert kwargs["anchor_company"] == "Acme Robotics"
+        assert existing.id[:8] in kwargs["reason"]
+        db.close()
+
+    def test_non_duplicate_logs_nothing(self, tmp_path):
+        db = self._db_with(tmp_path, _listing(title="Senior ML Engineer",
+                                              company="Acme Robotics"))
+        check = _make_duplicate_check(db, source="linkedin", window_days=30)
+
+        with patch("src.audit_log.log_drop") as log_drop:
+            assert check("Warehouse Associate", "Other Corp") is False
+
+        log_drop.assert_not_called()
+        db.close()
+
+    def test_row_carries_no_listing_content(self, tmp_path):
+        """SECURITY.md: IDs and decisions, never titles or body text."""
+        existing = _listing(
+            title="Senior ML Engineer",
+            company="Acme Robotics",
+            job_summary="Confidential body text from the alert email",
+        )
+        db = self._db_with(tmp_path, existing)
+        check = _make_duplicate_check(
+            db, source="linkedin", window_days=30,
+            url="https://www.linkedin.com/jobs/view/4001",
+        )
+
+        with patch("src.audit_log.log_drop") as log_drop:
+            check("Senior ML Engineer", "Acme Robotics")
+
+        emitted = " ".join(str(v) for v in log_drop.call_args.kwargs.values())
+        assert "Senior ML Engineer" not in emitted
+        assert "Confidential" not in emitted
+        db.close()

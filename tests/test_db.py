@@ -95,6 +95,32 @@ class TestListingDedup:
         db.insert_listing(_make_listing())
         assert not db.is_duplicate_listing(None, None)
 
+    def test_find_duplicate_returns_matched_id(self, db):
+        """The id is what the audit row names — a bool cannot say what matched."""
+        listing = _make_listing()
+        db.insert_listing(listing)
+        assert db.find_duplicate_listing("Sr. Backend Engineer", "Acme Corp") == listing.id
+
+    def test_find_duplicate_returns_none_when_no_match(self, db):
+        db.insert_listing(_make_listing())
+        assert db.find_duplicate_listing("Junior Frontend Developer", "Acme Corp") is None
+
+    def test_find_duplicate_respects_window(self, db):
+        old_date = (datetime.now(timezone.utc) - timedelta(days=60)).isoformat()
+        db.insert_listing(_make_listing(date_ingested=old_date))
+        assert db.find_duplicate_listing(
+            "Senior Backend Engineer", "Acme Corp", window_days=30
+        ) is None
+        assert db.find_duplicate_listing(
+            "Senior Backend Engineer", "Acme Corp", window_days=90
+        ) is not None
+
+    def test_is_duplicate_delegates_and_still_returns_bool(self, db):
+        """One implementation, two names: the bool view is the id view, coerced."""
+        db.insert_listing(_make_listing())
+        assert db.is_duplicate_listing("Senior Backend Engineer", "Acme Corp") is True
+        assert db.is_duplicate_listing("Junior Frontend Developer", "Acme Corp") is False
+
 
 class TestEmailDedup:
     def test_duplicate_email_detected(self):

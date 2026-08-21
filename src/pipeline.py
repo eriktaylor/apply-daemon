@@ -26,6 +26,7 @@ from dotenv import load_dotenv
 
 load_dotenv()
 
+from src.audit_log import log_dedup_drop
 from src.db import Database, is_duplicate_email
 from src.email_aggregator import parse_candidates, score_candidates, select_top_n
 from src.email_classifier import (
@@ -53,6 +54,26 @@ DEBUG_DIR = Path("debug")
 def _autopilot_enabled() -> bool:
     import os
     return os.getenv("AUTOPILOT_ENABLED", "false").strip().lower() in ("1", "true", "yes")
+
+
+def _make_duplicate_check(db, *, source: str, window_days: int, url: str = ""):
+    """Build the ``duplicate_check`` callback ``TriageSession.triage_email`` takes.
+
+    Two jobs: skip anchors already in the DB before Stage 3 scraping and
+    Stage 5 scoring, and leave one audit row per skip so the drop is not
+    silent. ``source`` is bound per email/candidate because that is what the
+    audit row needs — which board the shadowed listing came from.
+    """
+    def duplicate_check(title: str, company: str) -> bool:
+        matched_id = db.find_duplicate_listing(title, company, window_days=window_days)
+        if not matched_id:
+            return False
+        log_dedup_drop(
+            source=source, anchor_company=company, matched_id=matched_id, url=url,
+        )
+        return True
+
+    return duplicate_check
 
 
 def _source_from_classification(classification: str) -> str:
@@ -131,9 +152,6 @@ def run_pipeline() -> None:
         pool = []
         pooled_emails: list[tuple[FetchedEmail, str, str]] = []  # (item, text, classification)
         to_archive: list[bytes] = []
-
-        def duplicate_check(title: str, company: str) -> bool:
-            return db.is_duplicate_listing(title, company, window_days=dedup_window)
 
         def store_listings(listings) -> None:
             """Step 5: upsert with listing-level dedup + autopilot queueing."""
@@ -260,7 +278,10 @@ def run_pipeline() -> None:
                     stats["parse_fallback"] += 1
                     _triage_email_level(
                         session, db, item, msg, text, links, classification, source,
-                        duplicate_check, store_listings, ledger_and_archive,
+                        _make_duplicate_check(
+                            db, source=source, window_days=dedup_window
+                        ),
+                        store_listings, ledger_and_archive,
                         ledger_classification="PARSE_FALLBACK",
                     )
                     continue
@@ -268,7 +289,8 @@ def run_pipeline() -> None:
                 # Step 4b: no aggregation (top_n blank) — email-level triage.
                 _triage_email_level(
                     session, db, item, msg, text, links, classification, source,
-                    duplicate_check, store_listings, ledger_and_archive,
+                    _make_duplicate_check(db, source=source, window_days=dedup_window),
+                    store_listings, ledger_and_archive,
                     ledger_classification=classification,
                 )
 
@@ -288,7 +310,10 @@ def run_pipeline() -> None:
                     try:
                         listings = session.triage_email(
                             cand_text, [cand.url], "JOB_DIGEST", cand.source,
-                            duplicate_check=duplicate_check,
+                            duplicate_check=_make_duplicate_check(
+                                db, source=cand.source,
+                                window_days=dedup_window, url=cand.url,
+                            ),
                         )
                     except Exception:
                         logger.error(
