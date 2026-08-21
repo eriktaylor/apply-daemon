@@ -40,6 +40,7 @@ import logging
 import os
 from dataclasses import dataclass, field
 
+from src.claude_cli import strip_fence
 from src.model_usage import log_response_usage
 
 logger = logging.getLogger(__name__)
@@ -155,6 +156,54 @@ def _reorder_by_ids(
     return ordered
 
 
+def _parse_first_json_object(raw: str) -> dict:
+    """Return the first complete JSON object in a model response.
+
+    Two shapes have been observed from a call that asked for
+    ``response_format={"type": "json_object"}``: the object wrapped in a
+    markdown fence, and a valid object *followed by prose*
+    (``JSONDecodeError: Extra data: line 3 column 1``, 2026-08-21 — the whole
+    run's ranking was discarded over trailing chat). ``raw_decode`` stops at
+    the end of the first value and ignores whatever follows it; the fence is
+    handled by the repo's one fence stripper.
+
+    Raises rather than returning a default — the caller owns the fall-back
+    and needs the reason to log.
+    """
+    text = strip_fence(raw or "")
+    start = text.find("{")
+    if start == -1:
+        raise ValueError("no JSON object in response")
+    obj, _ = json.JSONDecoder().raw_decode(text, start)
+    if not isinstance(obj, dict):
+        raise ValueError(f"expected a JSON object, got {type(obj).__name__}")
+    return obj
+
+
+def _rank_fallback(
+    candidates: list[RankCandidate],
+    stage: str,
+    reason: str,
+    exc: BaseException | None = None,
+) -> list[RankCandidate]:
+    """Log one WARNING line, then return the input order (invariant 3).
+
+    Loud because it was silent. Failing open is correct — ranking may never
+    drop a survivor — but it makes a broken ranker indistinguishable from a
+    working one, and the last two failures left only a Traceback in a 100KB
+    log. The line carries the stage, the candidate count, and the reason;
+    never the response body, which is model output and may quote listing
+    text. The traceback stays reachable at DEBUG.
+    """
+    logger.warning(
+        "%s: ranking fell back to input order for %d candidate(s) — %s",
+        stage, len(candidates), reason,
+    )
+    if exc is not None:
+        logger.debug("%s: ranking failure detail", stage, exc_info=exc)
+    return candidates
+
+
 def rank_listwise(
     client,
     model: str,
@@ -168,6 +217,7 @@ def rank_listwise(
     """
     if client is None or len(candidates) < 2:
         return candidates
+    stage = _rank_stage(surface)
     block = "\n\n".join(
         _format_candidate(i, c) for i, c in enumerate(candidates, 1)
     )
@@ -185,17 +235,17 @@ def rank_listwise(
             temperature=0.0,
             response_format={"type": "json_object"},
         )
-        log_response_usage(resp, rank_model, _rank_stage(surface))
+        log_response_usage(resp, rank_model, stage)
         raw = resp.choices[0].message.content or "{}"
-        data = json.loads(raw)
+        data = _parse_first_json_object(raw)
         ordered_ids = data.get("order")
         if not isinstance(ordered_ids, list):
-            logger.warning("Listwise rank returned no 'order' list — keeping input order")
-            return candidates
+            return _rank_fallback(candidates, stage, "response had no 'order' list")
         return _reorder_by_ids(candidates, [str(x) for x in ordered_ids])
-    except Exception:
-        logger.warning("Listwise rank failed — keeping input order", exc_info=True)
-        return candidates
+    except Exception as exc:
+        return _rank_fallback(
+            candidates, stage, f"{type(exc).__name__}: {exc}", exc=exc,
+        )
 
 
 def rank_candidates(

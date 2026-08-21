@@ -3,10 +3,14 @@
 from __future__ import annotations
 
 import json
+import logging
 from unittest.mock import MagicMock
+
+import pytest
 
 from src.ranking import (
     RankCandidate,
+    _parse_first_json_object,
     _reorder_by_ids,
     rank_candidates,
     rank_listwise,
@@ -157,3 +161,90 @@ def test_output_budget_scales_with_candidates():
     rank_listwise(client, "m", cands)
     budget = client.chat.completions.create.call_args.kwargs["max_tokens"]
     assert budget >= 24 * n  # room for one id per candidate
+
+
+class TestListwiseResponseParsing:
+    """The ranking call gets prose it did not ask for (I-13, 2026-08-21).
+
+    ``response_format={"type": "json_object"}`` is a request, not a guarantee:
+    the model returned a valid object followed by a sentence of commentary,
+    ``json.loads`` raised ``Extra data``, and that run's whole top-10 fell
+    back to input order with nothing but a Traceback to say so.
+    """
+
+    @staticmethod
+    def _client(content):
+        client = MagicMock()
+        client.chat.completions.create.return_value.choices[0].message.content = content
+        return client
+
+    def test_trailing_prose_after_object_still_ranks(self):
+        client = self._client(
+            json.dumps({"order": ["b", "a"]})
+            + "\n\nI ranked b first because it is the closer seniority match."
+        )
+        out = rank_listwise(client, "m", _cands("a", "b"))
+        assert [c.id for c in out] == ["b", "a"]
+
+    def test_fenced_json_still_ranks(self):
+        client = self._client("```json\n" + json.dumps({"order": ["b", "a"]}) + "\n```")
+        out = rank_listwise(client, "m", _cands("a", "b"))
+        assert [c.id for c in out] == ["b", "a"]
+
+    def test_preamble_before_object_still_ranks(self):
+        client = self._client("Here is the ranking:\n" + json.dumps({"order": ["b", "a"]}))
+        out = rank_listwise(client, "m", _cands("a", "b"))
+        assert [c.id for c in out] == ["b", "a"]
+
+    def test_happy_path_unchanged(self):
+        client = self._client(json.dumps({"order": ["b", "a"]}))
+        out = rank_listwise(client, "m", _cands("a", "b"))
+        assert [c.id for c in out] == ["b", "a"]
+
+    def test_truncated_json_warns_once_and_keeps_input_order(self, caplog):
+        caplog.set_level(logging.WARNING, logger="src.ranking")
+        client = self._client('{"order": ["synthetic-listing-b", "synthe')
+        out = rank_listwise(client, "m", _cands("a", "b"), surface="STAGE5")
+        assert [c.id for c in out] == ["a", "b"]
+
+        warnings = [r for r in caplog.records if r.levelno >= logging.WARNING]
+        assert len(warnings) == 1
+        rec = warnings[0]
+        # A traceback at WARNING is what made the last two failures unreadable.
+        assert rec.exc_info is None
+        message = rec.getMessage()
+        assert "rank_stage5" in message          # which stage
+        assert "2 candidate(s)" in message       # how many listings lost their ranking
+        assert "JSONDecodeError" in message      # why
+        # Never the response body: it is model output and may quote listings.
+        assert "synthetic-listing-b" not in message
+
+    def test_missing_order_key_warns_once(self, caplog):
+        caplog.set_level(logging.WARNING, logger="src.ranking")
+        client = self._client(json.dumps({"ranking": ["b", "a"]}))
+        out = rank_listwise(client, "m", _cands("a", "b"), surface="TRACK_B")
+        assert [c.id for c in out] == ["a", "b"]
+
+        warnings = [r for r in caplog.records if r.levelno >= logging.WARNING]
+        assert len(warnings) == 1
+        assert "no 'order' list" in warnings[0].getMessage()
+        assert warnings[0].exc_info is None
+
+    def test_traceback_still_reachable_at_debug(self, caplog):
+        caplog.set_level(logging.DEBUG, logger="src.ranking")
+        rank_listwise(self._client("not json at all"), "m", _cands("a", "b"))
+        debugs = [r for r in caplog.records if r.levelno == logging.DEBUG]
+        assert any(r.exc_info for r in debugs)
+
+
+class TestParseFirstJsonObject:
+    def test_ignores_everything_after_the_first_object(self):
+        assert _parse_first_json_object('{"a": {"b": 1}} trailing text') == {"a": {"b": 1}}
+
+    def test_rejects_a_non_object_payload(self):
+        with pytest.raises(ValueError):
+            _parse_first_json_object("[1, 2, 3]")
+
+    def test_rejects_a_response_with_no_object(self):
+        with pytest.raises(ValueError):
+            _parse_first_json_object("sorry, I can't rank these")

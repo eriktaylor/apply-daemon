@@ -107,6 +107,14 @@ OWNERSHIP: list[tuple[str, str, str]] = [
         "cli.py",
         r"start_new_session\s*=\s*True",
     ),
+    (
+        "tolerant first-JSON-object parse of a model response",
+        # Interim home (plan I-13): the natural neighbour is claude_cli.py's
+        # strip_fence, which this imports, but that file was another agent's
+        # this round. Move both the helper and this row when I-13 lands.
+        "ranking.py",
+        r"JSONDecoder\(\)\.raw_decode",
+    ),
 ]
 
 # Patterns no module may contain, with the reason. Distinct from OWNERSHIP:
