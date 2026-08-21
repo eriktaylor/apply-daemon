@@ -20,11 +20,27 @@ Some work does not go through OpenRouter at all. `src/claude_cli.py` shells out 
 
 **Where it applies.** The autopilot post-research re-score (~97% of per-listing enrichment cost, at most `AUTOPILOT_TOP_N` calls a day), the `cli tailor` / `polish` / `cover-letter` / `interview-prep` / `answers` verbs, and `eval.listwise_compare --via-claude`.
 
-**Where it deliberately does not.** Stage 5 scoring. Each CLI invocation carries the harness's own system prompt (~23k tokens, measured 2026-07-30), which is irrelevant against a handful of large calls and decisive against 100+ small ones.
+**Where it deliberately does not.** Stage 5 scoring. Every invocation pays a fixed startup cost before the prompt is read, which is irrelevant against a handful of large calls and decisive against 100+ small ones.
+
+### Per-call overhead
+
+Measured with a trivial "Reply OK" prompt, 2026-08-21. This table is the one home for the number — `src/claude_cli.py` and `CLAUDE.md` point here rather than restating it, because the last copy went stale by a factor of two.
+
+| invocation | input tokens | what the difference is |
+|---|---|---|
+| repo cwd, default flags | 42,341 | harness system prompt + ~24k of tool definitions + ~9k of the repo's CLAUDE.md / skill / memory |
+| `/tmp` cwd, default flags | 33,352 | minus the repo context |
+| repo cwd, `--tools "" --no-session-persistence` | 17,500 | minus the tool definitions |
+| **`/tmp` cwd, `--tools "" --no-session-persistence`** — what `claude_cli.run` does | **8,784** | minus both |
+| `--bare` | *errors* — `is_error: true`, no completion | not usable; `run` treats such an envelope as a failure |
+
+The first row is what `run` did until 2026-08-21, and live autopilot re-scores show what it cost: 58k–122k input tokens for a prompt of roughly 10k, three to seven times what that prompt needs now. Tokens were not the whole of it — two of those eight re-scores took a **second turn** (~120k tokens, double the output) because the judge, having tools, called one. `run` now parses `num_turns` out of the envelope and warns on anything but 1, so a return to that costs a log line instead of going unnoticed.
+
+Nothing measured through this transport before 2026-08-21 compares to a measurement after it — including `eval.listwise_compare --via-claude`, which shares `run` and became cheaper, faster, and single-turn in the same change. Re-baseline before comparing.
 
 **Cost accounting.** Session spend is *not* written to `logs/model_usage.log`. That file is the basis for the daily ceiling in `src/budget.py`, and counting subscription work there would make the cap refuse runs over money nobody was charged. The reported cost is logged at INFO for visibility. `tests/test_model_usage.py::TestSubscriptionSpendIsNotMetered` pins this.
 
-**Failure behaviour.** Every caller has a metered fallback and `claude_cli.run` never raises — a missing binary, non-zero exit, timeout, or malformed envelope all return `ok=False`. A cron environment without the CLI on `PATH` silently pays OpenRouter instead of losing the listing.
+**Failure behaviour.** Every caller has a metered fallback and `claude_cli.run` never raises — a missing binary, non-zero exit, timeout, malformed envelope, or a well-formed envelope reporting `is_error` all return `ok=False`. A cron environment without the CLI on `PATH` silently pays OpenRouter instead of losing the listing.
 
 ## Pending: model-slot review
 

@@ -9,7 +9,9 @@ instead of losing the listing.
 from __future__ import annotations
 
 import json
+import logging
 import subprocess
+from pathlib import Path
 from unittest.mock import MagicMock, patch
 
 import pytest
@@ -64,6 +66,54 @@ class TestRun:
         assert sp.call_args.kwargs["input"] == "THE PROMPT"
         assert argv[:2] == ["claude", "-p"] and "haiku" in argv
 
+    def test_tools_are_disabled_so_the_call_is_one_completion(self):
+        """A scorer that can call a tool can take a second turn — twice the
+        tokens for one verdict, and the judge reads whatever is around it."""
+        with patch("src.claude_cli.is_available", return_value=True), \
+             patch("subprocess.run", return_value=_proc(_envelope("{}"))) as sp:
+            claude_cli.run("hi")
+        argv = sp.call_args.args[0]
+        assert argv[argv.index("--tools") + 1] == ""
+        assert "--no-session-persistence" in argv
+
+    def test_runs_outside_the_repo(self):
+        """The subprocess inherits its cwd, and inside the checkout that loads
+        this repo's CLAUDE.md into a judgement about job listings."""
+        with patch("src.claude_cli.is_available", return_value=True), \
+             patch("subprocess.run", return_value=_proc(_envelope("{}"))) as sp:
+            claude_cli.run("hi")
+        cwd = sp.call_args.kwargs.get("cwd")
+        assert cwd
+        repo = Path(__file__).resolve().parent.parent
+        assert Path(cwd).resolve() != repo
+        assert repo not in Path(cwd).resolve().parents
+
+    def test_parses_num_turns(self):
+        env = json.dumps({"result": "{}", "usage": {}, "num_turns": 3})
+        with patch("src.claude_cli.is_available", return_value=True), \
+             patch("subprocess.run", return_value=_proc(env)):
+            assert claude_cli.run("hi").turns == 3
+
+    def test_defaults_to_one_turn_when_the_envelope_omits_it(self):
+        with patch("src.claude_cli.is_available", return_value=True), \
+             patch("subprocess.run", return_value=_proc(_envelope("{}"))):
+            assert claude_cli.run("hi").turns == 1
+
+    def test_warns_when_the_call_took_more_than_one_turn(self, caplog):
+        env = json.dumps({"result": "{}", "usage": {}, "num_turns": 2})
+        with caplog.at_level(logging.WARNING, logger="src.claude_cli"), \
+             patch("src.claude_cli.is_available", return_value=True), \
+             patch("subprocess.run", return_value=_proc(env)):
+            claude_cli.run("hi")
+        assert [r for r in caplog.records if r.levelno == logging.WARNING]
+
+    def test_single_turn_does_not_warn(self, caplog):
+        with caplog.at_level(logging.WARNING, logger="src.claude_cli"), \
+             patch("src.claude_cli.is_available", return_value=True), \
+             patch("subprocess.run", return_value=_proc(_envelope("{}"))):
+            claude_cli.run("hi")
+        assert not [r for r in caplog.records if r.levelno == logging.WARNING]
+
 
 class TestNeverRaises:
     @pytest.mark.parametrize("failure,marker", [
@@ -71,6 +121,11 @@ class TestNeverRaises:
         ({"return_value": _proc("not json")}, "non-JSON"),
         ({"side_effect": subprocess.TimeoutExpired("claude", 300)}, "timed out"),
         ({"side_effect": OSError("no such file")}, "could not run"),
+        # A refused invocation exits 0 with a well-formed envelope saying so
+        # (`--bare` does this). Untreated it parses as an empty success.
+        ({"return_value": _proc(json.dumps(
+            {"is_error": True, "result": "Error: refused", "usage": {}}))},
+         "is_error"),
     ])
     def test_failures_degrade_to_not_ok(self, failure, marker):
         with patch("src.claude_cli.is_available", return_value=True), \

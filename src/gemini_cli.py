@@ -12,7 +12,9 @@ NOT written to ``logs/model_usage.log``. That file is the basis for the spend
 ceiling in ``src/budget.py``; counting membership work there would make the
 daily cap refuse runs over money nobody was charged.
 
-**Measured 2026-08-19** (`agy` v1.1.15), against `claude -p`'s ~23k:
+**Measured 2026-08-19** (`agy` v1.1.15); the `claude -p` figure to compare it
+against is in ``docs/MODELS.md`` ("Per-call overhead"), and moved after this
+was written:
 
 - Per-call overhead is **~14k input tokens**, and `cache_read_tokens` shows
   the preamble caching across calls within a session.
