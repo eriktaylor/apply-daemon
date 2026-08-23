@@ -441,7 +441,8 @@ def _fmt_page(page: dict) -> str:
 
 
 def _enrichment_headroom(db: Database,
-                         decision: BudgetDecision | None = None) -> dict:
+                         decision: BudgetDecision | None = None,
+                         *, cap_override: int | None = None) -> dict:
     """Enrichment slots left today, and whether a run may spend them.
 
     THE computation — `status` renders all of it, `next` reports the two
@@ -455,12 +456,15 @@ def _enrichment_headroom(db: Database,
 
     ``decision`` is passed in by `status`, which needs the whole
     ``BudgetDecision`` for its own budget block, so the check runs once.
+    ``cap_override`` is ``enrich --top-n N``: that raises the cap for the run,
+    so the slots it would actually have are counted against N, not against
+    the env default.
     """
     from src.budget import check_run_allowed
     from src.process_queue import _top_n
 
     decision = check_run_allowed() if decision is None else decision
-    cap = _top_n()
+    cap = _top_n() if cap_override is None else cap_override
     used = db.count_autopilot_processed_today()
     return {
         "enrichment_cap": cap,
@@ -1019,6 +1023,31 @@ def cmd_enrich(db: Database, *, top_n: int | None, force: bool,
     decision = check_run_allowed()
     if not decision.allowed and not force:
         return _emit_budget_blocked("enrich", decision, as_json)
+
+    # Refuse a run that provably cannot enrich anything. The daily cap is
+    # enforced inside process_queue, so a capped run starts, does nothing, and
+    # still trips `record_run` below — the next genuine enrich is then refused
+    # for the whole cooldown on account of a no-op. `--force` deliberately does
+    # not override this: it overrides a *budget* judgement, and no amount of
+    # forcing makes a spent cap do work. `--top-n N` is the real escape hatch,
+    # and is why the check counts against it. `refresh` gets no such guard —
+    # it still scrapes and scores with the cap spent, which is real work.
+    head = _enrichment_headroom(db, decision, cap_override=top_n)
+    if head["enrichment_remaining"] == 0:
+        _emit(
+            {"verb": "enrich", "ok": False, "error": "enrichment_capped",
+             "reason": (f"today's enrichment cap is spent "
+                        f"({head['enriched_today']} of "
+                        f"{head['enrichment_cap']} used)"),
+             **head},
+            as_json,
+            f"Refused — today's enrichment cap is spent "
+            f"({head['enriched_today']} of {head['enrichment_cap']} used).\n"
+            "Nothing would be enriched, and the run would still start the "
+            "cooldown.\nRaise it for this run with --top-n N, or wait for the "
+            "UTC day to roll over.",
+        )
+        return 1
 
     env = dict(os.environ)
     if top_n is not None:

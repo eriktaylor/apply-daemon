@@ -142,6 +142,10 @@ surface is speed *to a decision*, and a decision needs the posting.
 
 **A thin page with `enrichment_remaining > 0` and `budget_can_run: true` is an
 un-topped-up queue, not an empty one — offer `enrich`, not `refresh`.**
+At `enrichment_remaining: 0` `enrich` refuses with
+`error: "enrichment_capped"` rather than running — say the cap is spent and
+that it resets at 00:00 UTC; do not reach for `--force`, which does not
+override it.
 `refresh` is for *new* listings; `enrich` converts the backlog that is already
 stored. It spends metered money, so say so, but roughly a tenth of a refresh
 and in a fraction of the time. Its envelope is refresh's with a single `stage`

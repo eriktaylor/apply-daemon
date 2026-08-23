@@ -253,11 +253,21 @@ status, returncode, seconds, log}`, `status` one of `"ok"` / `"failed"` /
 **Flags:** `--top-n N` · `--force`. (No `--dry-run`, `--no-next`, or
 `--wait` — it runs exactly one stage.)
 
+**Refuses when the day's enrichment cap is spent**, before the cooldown is
+recorded — a capped run would enrich nothing and still block the next genuine
+one. `--force` does not override this (it overrides a budget judgement, not an
+exhausted cap); `--top-n N` raises the cap for the run, and the check counts
+against it. `refresh` has no such guard: it still scrapes and scores with the
+cap spent.
+
 **Mutates:** yes — runs `python -m src.process_queue` alone against rows
 already stored, gated and recorded exactly as `refresh` gates and records.
 
 **Returns (budget refused, no `--force`):** the same `budget_blocked` shape
 as `refresh`, with `verb: "enrich"`.
+**Returns (cap spent):** `{verb, ok: false, error: "enrichment_capped",
+reason, enrichment_cap, enriched_today, enrichment_remaining,
+budget_can_run}` — nothing ran, and the cooldown was not started.
 **Returns (ran):** `{verb, ok, stage, spent_usd_this_run, spent_usd_today,
 page}` — `stage` is a single record in the same shape as one of `refresh`'s
 `stages[]` entries, and `page` always chains.
@@ -272,6 +282,7 @@ SKILL.md's call, not this table's.
 | `not_found` | `show`, `deep-dive`, `tailor`, the asset verbs, `save`, `pass` | no listing with that id |
 | `no_transition` | `save`, `pass` | already at the target status, or refused by `src/decisions.py` (terminal status, or a downgrade a save may not make) |
 | `budget_blocked` | `refresh`, `enrich` | the spend ceiling or run cooldown refused; nothing ran |
+| `enrichment_capped` | `enrich` | the day's enrichment cap is spent; nothing ran and no cooldown was started |
 | `empty_input` | `tailor`, the asset verbs | `--apply -` read nothing from stdin |
 | `invalid_response` | `tailor`, the asset verbs | the piped JSON didn't parse or validate; nothing was written |
 | `unavailable` | the asset verbs | the asset's prerequisite isn't met yet |

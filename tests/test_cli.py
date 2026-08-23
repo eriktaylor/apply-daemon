@@ -1550,6 +1550,64 @@ class TestEnrichVerb(_RefreshFixtures):
         assert "Cooldown" in payload["reason"]
         run.assert_not_called()          # nothing spent
 
+    def _cap_spent(self, db, monkeypatch, cap=1):
+        """Put the day's enrichment cap exactly at its limit."""
+        monkeypatch.setenv("AUTOPILOT_TOP_N", str(cap))
+        for _ in range(cap):
+            db.mark_autopilot_processed(_seed(db, status="auto"))
+
+    def test_refuses_when_the_cap_is_spent(self, db, capsys, mocker,
+                                           monkeypatch):
+        """A capped enrich would enrich nothing and still start the cooldown,
+        refusing the next genuine one for an hour on account of a no-op."""
+        self._cap_spent(db, monkeypatch, cap=2)
+        run = self._ok(mocker)
+        code, payload = _run_json(capsys, "enrich")
+        assert code == 1 and payload["ok"] is False
+        assert payload["error"] == "enrichment_capped"
+        assert payload["enrichment_remaining"] == 0
+        assert payload["enriched_today"] == 2
+        run.assert_not_called()
+
+    def test_a_capped_refusal_does_not_start_the_cooldown(
+            self, db, capsys, mocker, monkeypatch):
+        """The whole point: a later enrich must still be allowed to run."""
+        from src.budget import check_run_allowed
+        monkeypatch.setenv("MIN_RUN_INTERVAL_MINUTES", "60")
+        self._cap_spent(db, monkeypatch)
+        self._ok(mocker)
+        _run_json(capsys, "enrich")
+        assert check_run_allowed().allowed is True
+
+    def test_force_does_not_override_a_spent_cap(self, db, capsys, mocker,
+                                                 monkeypatch):
+        """--force overrides a budget judgement; it cannot make a spent cap do
+        work. --top-n is the escape hatch."""
+        self._cap_spent(db, monkeypatch)
+        run = self._ok(mocker)
+        code, payload = _run_json(capsys, "enrich", "--force")
+        assert code == 1 and payload["error"] == "enrichment_capped"
+        run.assert_not_called()
+
+    def test_top_n_raises_the_cap_and_the_run_proceeds(self, db, capsys,
+                                                       mocker, monkeypatch):
+        """The headroom check counts against --top-n, not the env default."""
+        self._cap_spent(db, monkeypatch)
+        run = self._ok(mocker)
+        code, payload = _run_json(capsys, "enrich", "--top-n", "5")
+        assert code == 0 and payload["ok"] is True
+        assert run.call_count == 1
+
+    def test_refresh_still_runs_with_the_cap_spent(self, db, capsys, mocker,
+                                                   monkeypatch):
+        """Only enrich is guarded: a refresh with no slots left still scrapes
+        and scores, which is real work."""
+        self._cap_spent(db, monkeypatch)
+        run = self._ok(mocker)
+        code, payload = _run_json(capsys, "refresh")
+        assert code == 0 and payload["ok"] is True
+        assert run.call_count >= 1
+
     def test_force_overrides_the_block(self, db, capsys, mocker, monkeypatch):
         from src.budget import record_run
         monkeypatch.setenv("MIN_RUN_INTERVAL_MINUTES", "60")
