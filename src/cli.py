@@ -5,6 +5,7 @@ are testable in-process:
 
     python -m src.cli status              # queue freshness + spend vs budget
     python -m src.cli refresh             # run the pipeline (budget-gated)
+    python -m src.cli enrich              # enrich stored rows only (budget-gated)
     python -m src.cli next [--top 3]      # next page of candidates
     python -m src.cli show <id>           # one listing in full
     python -m src.cli deep-dive <id>      # + post-research verdict, dossier
@@ -44,6 +45,7 @@ import sys
 import time
 from datetime import datetime, timezone
 from pathlib import Path
+from typing import TYPE_CHECKING
 
 from dotenv import load_dotenv
 
@@ -64,6 +66,9 @@ from src.listing_card import (
     format_verdict_line,
     parse_post_research,
 )
+
+if TYPE_CHECKING:      # src.budget is imported lazily; this is annotation-only
+    from src.budget import BudgetDecision
 
 logger = logging.getLogger(__name__)
 
@@ -110,6 +115,11 @@ _ASSET_VERBS = (
 )
 _ASSET_VERB_NAMES = {verb: verb.replace("-", "_") for verb, _ in _ASSET_VERBS}
 
+# Autopilot enrichment: research + re-score over rows that are ALREADY stored,
+# so it ingests nothing. Named once because two verbs run it — `refresh` last
+# in the chain below, `enrich` on its own.
+ENRICH_STAGE: tuple[str, str] = ("autopilot", "src.process_queue")
+
 # The ingestion sequence, in order. THE definition — script.sh wraps this
 # verb rather than repeating the chain (R-1). digest runs twice on purpose:
 # once after each track, so Slack sees Track A's listings without waiting on
@@ -119,7 +129,7 @@ REFRESH_STAGES: tuple[tuple[str, str], ...] = (
     ("digest (A)", "src.digest"),
     ("track B email", "src.pipeline"),
     ("digest (B)", "src.digest"),
-    ("autopilot", "src.process_queue"),
+    ENRICH_STAGE,
 )
 
 # Consecutive stage failures that abandon the chain. No stage feeds another —
@@ -365,7 +375,19 @@ def review_page(db: Database, *, top: int, max_age: int | None = None,
             max_age_days=max_age or None, statuses=statuses,
         ),
         "tiers": list(statuses),
+        # A thin page needs the reason it is thin. `awaiting_enrichment` says
+        # work is waiting; these two say whether it can be converted right
+        # now, which is the difference between offering `enrich` and offering
+        # nothing. On the page itself so `next`, `refresh.page` and
+        # `enrich.page` tell one story.
+        **_headroom_keys(db),
     }
+
+
+def _headroom_keys(db: Database) -> dict:
+    head = _enrichment_headroom(db)
+    return {"enrichment_remaining": head["enrichment_remaining"],
+            "budget_can_run": head["budget_can_run"]}
 
 
 def _backlog_note(page: dict) -> str:
@@ -395,7 +417,7 @@ def _fmt_page(page: dict) -> str:
             out = (
                 f"No new enriched listings — {page['awaiting_enrichment']} fresh "
                 "listing(s) are awaiting autopilot enrichment.\n"
-                "Run a refresh to enrich the next batch, or "
+                "`enrich` converts the next batch (metered, no scrape), or "
                 "`next --all-tiers` to review them raw."
             )
         elif page["hidden_stale"]:
@@ -416,6 +438,36 @@ def _fmt_page(page: dict) -> str:
     if backlog and page.get("seen") != SEEN_ONLY:
         out += f"\n{backlog}"
     return out
+
+
+def _enrichment_headroom(db: Database,
+                         decision: BudgetDecision | None = None) -> dict:
+    """Enrichment slots left today, and whether a run may spend them.
+
+    THE computation — `status` renders all of it, `next` reports the two
+    numbers that decide whether a thin page is worth topping up (C-12). A
+    page of one listing with fifteen slots and the whole budget unused is an
+    un-topped-up queue, not an empty one, and nothing in the payload said so.
+
+    Free: `_top_n` reads env, the count is one indexed query, and the budget
+    check reads the usage log — no network, no spend, which is what lets
+    `next` stay a pure read.
+
+    ``decision`` is passed in by `status`, which needs the whole
+    ``BudgetDecision`` for its own budget block, so the check runs once.
+    """
+    from src.budget import check_run_allowed
+    from src.process_queue import _top_n
+
+    decision = check_run_allowed() if decision is None else decision
+    cap = _top_n()
+    used = db.count_autopilot_processed_today()
+    return {
+        "enrichment_cap": cap,
+        "enriched_today": used,
+        "enrichment_remaining": max(0, cap - used),
+        "budget_can_run": decision.allowed,
+    }
 
 
 def cmd_next(db: Database, top: int, as_json: bool, max_age: int | None,
@@ -554,9 +606,8 @@ def cmd_status(db: Database, as_json: bool) -> int:
     # the enriched feed, so when its daily cap is spent a refresh still costs
     # money and still ingests, but produces no new cards anywhere — which
     # looks like a broken integration unless something says so.
-    from src.process_queue import _top_n
-    enrich_cap = _top_n()
-    enriched_today = db.count_autopilot_processed_today()
+    head = _enrichment_headroom(db, decision)
+    remaining = head["enrichment_remaining"]
 
     payload = {
         "verb": "status",
@@ -566,9 +617,9 @@ def cmd_status(db: Database, as_json: bool) -> int:
             "ready": ready,
             "backlog": backlog,
             "awaiting_enrichment": awaiting,
-            "enrichment_cap": enrich_cap,
-            "enriched_today": enriched_today,
-            "enrichment_remaining": max(0, enrich_cap - enriched_today),
+            "enrichment_cap": head["enrichment_cap"],
+            "enriched_today": head["enriched_today"],
+            "enrichment_remaining": remaining,
             "stale_hidden": stale,
             "max_age_days": max_age,
             "by_tier": stats["by_status"],
@@ -596,12 +647,11 @@ def cmd_status(db: Database, as_json: bool) -> int:
         },
     }
 
-    remaining = max(0, enrich_cap - enriched_today)
     lines = [
         f"Queue:   {ready} new  ·  {backlog} undecided from earlier  ·  "
         f"{awaiting} awaiting enrichment  ·  {stale} stale  "
         f"({stats['reviewable']} total)",
-        f"Enrich:  {enriched_today}/{enrich_cap} used today"
+        f"Enrich:  {head['enriched_today']}/{head['enrichment_cap']} used today"
         + ("   ⚠️  cap reached — a refresh will ingest but produce no new "
            "cards until tomorrow" if remaining == 0 else
            f"   ·   {remaining} left"),
@@ -676,11 +726,101 @@ def _launch_detached(stage: str, module: str, env: dict) -> dict:
             "returncode": None, "seconds": 0.0, "log": str(path)}
 
 
+def _progress(text: str) -> None:
+    """Stage progress → stderr.
+
+    Never stdout: that carries ``--json`` and a skill parses it. A human
+    watching a 10-minute scrape still needs to tell "slow" from "hung".
+    """
+    print(text, file=sys.stderr, flush=True)
+
+
+def _run_stage(stage: str, module: str, env: dict, *, stream: bool,
+               prefix: str = "") -> dict:
+    """Run one pipeline stage as a subprocess and describe what happened.
+
+    THE stage runner: `refresh` walks the whole chain through it and `enrich`
+    runs ``ENRICH_STAGE`` alone through it, so the two verbs cannot disagree
+    about how a stage is invoked, timed, or reported. The record it returns is
+    the ``stages[]`` element of refresh's envelope and the ``stage`` of
+    enrich's — one shape, pinned by tests.
+
+    ``stream`` passes the child's output through (human mode); with ``--json``
+    it is captured instead, which is why the failure tail is echoed here — a
+    captured stderr that nobody prints is a stage that failed silently.
+    """
+    _progress(f"{prefix}{stage} ({module}) …")
+    started = time.monotonic()
+    proc = subprocess.run(
+        [sys.executable, "-m", module],
+        env=env,
+        capture_output=not stream,
+        text=True,
+    )
+    elapsed = time.monotonic() - started
+    ok = proc.returncode == 0
+    mark = "ok" if ok else f"FAILED rc={proc.returncode}"
+    _progress(f"{prefix}{stage} — {mark} in {elapsed:.0f}s\n")
+    if not ok:
+        if not stream and proc.stderr:
+            _progress(proc.stderr[-800:])
+        logger.error("Stage %s failed (rc=%d)", stage, proc.returncode)
+    return {"stage": stage, "module": module,
+            "status": "ok" if ok else "failed",
+            "returncode": proc.returncode,
+            "seconds": round(elapsed, 1), "log": None}
+
+
+def _emit_budget_blocked(verb: str, decision: BudgetDecision,
+                         as_json: bool) -> int:
+    """The refusal both spending verbs share, and the exit code for it.
+
+    ``error: "budget_blocked"`` is the one ``ok: false`` where nothing ran at
+    all — the skill routes on that distinction, so `refresh` and `enrich` must
+    say it identically rather than each inventing a shape.
+    """
+    _emit(
+        {"verb": verb, "ok": False, "error": "budget_blocked",
+         "reason": decision.reason,
+         "spent_usd_today": decision.spent_usd,
+         "budget_usd": decision.budget_usd},
+        as_json,
+        f"Refused — {decision.reason}\n"
+        "Override with --force if you mean it.",
+    )
+    return 1
+
+
+def _spent_since(before: BudgetDecision, after: BudgetDecision) -> float | None:
+    """What this run cost, from two budget checks around it.
+
+    None when the run's end can't be priced — an unknown, which the caller
+    reports as such rather than rendering as $0.00. An unpriced *start* with a
+    priced end is not unknown: ``spend_today`` sums only rows it can price, so
+    a ``None`` before means nothing priceable existed yet — the first run of a
+    UTC day — and none of it is inside ``after``'s total either way. The run
+    cost everything ``after`` shows.
+    """
+    if after.spent_usd is None:
+        return None
+    return round(after.spent_usd - (before.spent_usd or 0.0), 4)
+
+
 def _fmt_stage(result: dict) -> str:
     marks = {"ok": "ok", "failed": "FAIL", "detached": ".."}
     line = f"  {marks[result['status']]:<4}  {result['stage']}"
     if result["status"] == "detached":
         line += f" — detached → {result['log']}"
+    return line
+
+
+def _fmt_spend(spent: float | None, after: BudgetDecision) -> str:
+    """The one-line cost report both spending verbs end with."""
+    if spent is None:
+        return ""
+    line = f"\n\nThis run cost ~${spent:.4f}"
+    if after.budget_usd > 0 and after.spent_usd is not None:
+        line += f" (${after.spent_usd:.2f} of ${after.budget_usd:.2f} today)"
     return line
 
 
@@ -740,16 +880,7 @@ def cmd_refresh(db: Database, *, top_n: int | None, force: bool,
         return 0
 
     if not decision.allowed and not force:
-        _emit(
-            {"verb": "refresh", "ok": False, "error": "budget_blocked",
-             "reason": decision.reason,
-             "spent_usd_today": decision.spent_usd,
-             "budget_usd": decision.budget_usd},
-            as_json,
-            f"Refused — {decision.reason}\n"
-            "Override with --force if you mean it.",
-        )
-        return 1
+        return _emit_budget_blocked("refresh", decision, as_json)
 
     env = dict(os.environ)
     if top_n is not None:
@@ -760,15 +891,10 @@ def cmd_refresh(db: Database, *, top_n: int | None, force: bool,
     # not only a success, or a crashing run could be retried without limit.
     record_run("cli")
 
-    # Progress goes to stderr so it never pollutes --json on stdout, and so a
-    # human watching a 10-minute scrape can tell the difference between "slow"
-    # and "hung". Stage output streams through in human mode: capturing it
-    # (as this did originally) turned `./script.sh` into a silent wait, which
-    # is worse than the noisy chain it replaced.
+    # Stage output streams through in human mode: capturing it (as this did
+    # originally) turned `./script.sh` into a silent wait, which is worse than
+    # the noisy chain it replaced.
     stream = not as_json
-
-    def _progress(text: str) -> None:
-        print(text, file=sys.stderr, flush=True)
 
     _progress(f"Running {len(stages)} stages — {' → '.join(n for n, _ in stages)}\n")
     if not detach and not wait:
@@ -781,9 +907,10 @@ def cmd_refresh(db: Database, *, top_n: int | None, force: bool,
     consecutive = 0
     broke = False
     for i, (name, module) in enumerate(stages, 1):
-        _progress(f"[{i}/{len(stages)}] {name} ({module}) …")
+        prefix = f"[{i}/{len(stages)}] "
 
         if detach and module in _DETACHABLE_MODULES:
+            _progress(f"{prefix}{name} ({module}) …")
             try:
                 record = _launch_detached(name, module, env)
             except OSError:
@@ -792,36 +919,20 @@ def cmd_refresh(db: Database, *, top_n: int | None, force: bool,
                           "returncode": -1, "seconds": 0.0, "log": None}
             results.append(record)
             if record["status"] == "detached":
-                _progress(f"[{i}/{len(stages)}] {name} — detached, logging to "
+                _progress(f"{prefix}{name} — detached, logging to "
                           f"{record['log']}\n")
                 # Not observed, so neither trips nor resets the breaker.
                 continue
             failed.append(name)
             consecutive += 1
         else:
-            started = time.monotonic()
-            proc = subprocess.run(
-                [sys.executable, "-m", module],
-                env=env,
-                capture_output=not stream,
-                text=True,
-            )
-            elapsed = time.monotonic() - started
-            ok = proc.returncode == 0
-            results.append({"stage": name, "module": module,
-                            "status": "ok" if ok else "failed",
-                            "returncode": proc.returncode,
-                            "seconds": round(elapsed, 1), "log": None})
-            mark = "ok" if ok else f"FAILED rc={proc.returncode}"
-            _progress(f"[{i}/{len(stages)}] {name} — {mark} in {elapsed:.0f}s\n")
-            if ok:
+            record = _run_stage(name, module, env, stream=stream, prefix=prefix)
+            results.append(record)
+            if record["status"] == "ok":
                 consecutive = 0
                 continue
             failed.append(name)
             consecutive += 1
-            if not stream and proc.stderr:
-                _progress(proc.stderr[-800:])
-            logger.error("Stage %s failed (rc=%d)", name, proc.returncode)
 
         if consecutive >= _MAX_CONSECUTIVE_STAGE_FAILURES:
             broke = True
@@ -833,9 +944,7 @@ def cmd_refresh(db: Database, *, top_n: int | None, force: bool,
             break
 
     after = check_run_allowed()
-    spent = None
-    if after.spent_usd is not None and decision.spent_usd is not None:
-        spent = round(after.spent_usd - decision.spent_usd, 4)
+    spent = _spent_since(decision, after)
 
     succeeded = [r["stage"] for r in results if r["status"] == "ok"]
     detached = [r for r in results if r["status"] == "detached"]
@@ -874,10 +983,7 @@ def cmd_refresh(db: Database, *, top_n: int | None, force: bool,
     if detached:
         human += ("\n\nSlack posting is still running in the background — "
                   "this verb does not wait for it.")
-    if spent is not None:
-        human += f"\n\nThis run cost ~${spent:.4f}"
-        if after.budget_usd > 0 and after.spent_usd is not None:
-            human += f" (${after.spent_usd:.2f} of ${after.budget_usd:.2f} today)"
+    human += _fmt_spend(spent, after)
     if page is not None:
         human += "\n\n" + _fmt_page(page)
         if page["listings"]:
@@ -889,6 +995,67 @@ def cmd_refresh(db: Database, *, top_n: int | None, force: bool,
     # run that scraped and enriched but failed to post to Slack is not a failed
     # run — script.sh execs this verb, so this is also the shell's exit code.
     return 0 if succeeded and not broke else 1
+
+
+def cmd_enrich(db: Database, *, top_n: int | None, force: bool,
+               as_json: bool) -> int:
+    """Convert the backlog: autopilot only, no ingestion (C-12).
+
+    ``refresh`` without the scrape. ``ENRICH_STAGE`` runs on rows that are
+    *already stored*, so this researches and re-scores what the queue is
+    holding instead of fetching more of it — the right verb for a thin page
+    with slots free, where a refresh would spend minutes and roughly ten times
+    the tokens ingesting listings that will not be reviewable until something
+    enriches them. Measured basis: plans/cli_skill_interface.md, C-12.
+
+    **This is the gated route to a module that is otherwise ungated.**
+    ``python -m src.process_queue`` spends metered money outside the ceiling
+    and the cooldown; every spending *verb* goes through ``budget.py``, so
+    this one gates and records exactly as `refresh` does — same check, same
+    ``record_run``, same ``budget_blocked`` envelope.
+    """
+    from src.budget import check_run_allowed, record_run
+
+    decision = check_run_allowed()
+    if not decision.allowed and not force:
+        return _emit_budget_blocked("enrich", decision, as_json)
+
+    env = dict(os.environ)
+    if top_n is not None:
+        # Per-run enrichment budget without editing .env — same override
+        # `refresh --top-n` applies, reaching the same module.
+        env["AUTOPILOT_TOP_N"] = str(top_n)
+
+    # Before the stage, for the same reason refresh does it: the cooldown must
+    # apply to an attempt, not only a success.
+    record_run("cli")
+
+    stage, module = ENRICH_STAGE
+    record = _run_stage(stage, module, env, stream=not as_json)
+    ok = record["status"] == "ok"
+
+    after = check_run_allowed()
+    spent = _spent_since(decision, after)
+
+    # Chains into a page like `refresh` (C-5): the verb exists for the rows it
+    # just made reviewable, and a second call to see them is the regression
+    # C-5 closed.
+    page = review_page(db, top=DEFAULT_TOP)
+    payload = {"verb": "enrich", "ok": ok, "stage": record,
+               "spent_usd_this_run": spent,
+               "spent_usd_today": after.spent_usd,
+               "page": page}
+
+    human = _fmt_stage(record)
+    if not ok:
+        human += ("\n\nEnrichment failed — see the logs. Nothing new was "
+                  "researched or re-scored.")
+    human += _fmt_spend(spent, after)
+    human += "\n\n" + _fmt_page(page)
+    if page["listings"]:
+        human += "\n\nDeep-dive one, or pass what doesn't fit."
+    _emit(payload, as_json, human)
+    return 0 if ok else 1
 
 
 def cmd_deep_dive(db: Database, job_id: str, as_json: bool) -> int:
@@ -1248,6 +1415,16 @@ def build_parser() -> argparse.ArgumentParser:
                            help="Run the Slack digests in-line instead of "
                                 "detaching them (cron/CI)")
 
+    p_enrich = sub.add_parser(
+        "enrich", parents=[common],
+        help="Enrich already-stored listings (budget-gated) — no scrape, no "
+             "email; ~10x cheaper than a refresh")
+    p_enrich.add_argument("--top-n", type=int, default=None, dest="top_n",
+                          metavar="N",
+                          help="Autopilot enrichment budget for this run only")
+    p_enrich.add_argument("--force", action="store_true",
+                          help="Run even if the budget check refuses")
+
     p_show = sub.add_parser("show", parents=[common],
                             help="Show one listing in full")
     p_show.add_argument("id")
@@ -1316,6 +1493,9 @@ def main(argv: list[str] | None = None) -> int:
             return cmd_refresh(db, top_n=args.top_n, force=args.force,
                                dry_run=args.dry_run, as_json=args.json,
                                no_next=args.no_next, wait=args.wait)
+        if args.verb == "enrich":
+            return cmd_enrich(db, top_n=args.top_n, force=args.force,
+                              as_json=args.json)
         if args.verb == "next":
             return cmd_next(db, args.top, args.json, args.max_age,
                             args.all_tiers, args.seen)

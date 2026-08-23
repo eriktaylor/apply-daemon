@@ -234,6 +234,14 @@ def _dispatch_reactions(
     identical either way, which is the point of putting the switch here rather
     than in a second dispatcher.
 
+    Whether pass and save are *permitted* is not decided here — that is
+    ``decisions.is_allowed``. This dispatcher once carried its own
+    ``current_status == "triaged"`` copy in front of it, which silently
+    refused every 👍 on an autopilot row and skipped its ledger write. The
+    tailor branch still switches on status literals, but that is routing to
+    different work (cached research, checkpoint recovery), not a second
+    permission rule.
+
     Exclusive-action priority order: pass > tailor > save.
     Only the highest-priority reaction present on each card fires; lower-priority
     co-reactions are no-ops (prevents backwards state clobbering across sweeps).
@@ -273,12 +281,12 @@ def _dispatch_reactions(
         highest = next((a for a in _PRIORITY if a in action_to_reaction), None)
 
         if highest == "pass":
-            if current_status == "passed":
-                counts["skipped"] += 1
-            else:
+            if is_allowed(current_status, "pass"):
                 _append_human_label(job_id, "pass", row)
                 _handle_pass(app, db, channel, ts, job_id, msg)
                 counts["passed"] += 1
+            else:
+                counts["skipped"] += 1
 
         elif highest == "tailor":
             if current_status in ("triaged", "saved"):
@@ -373,7 +381,7 @@ def _dispatch_reactions(
                 counts["skipped"] += 1
 
         elif highest == "save":
-            if current_status == "triaged":
+            if is_allowed(current_status, "save"):
                 _append_human_label(job_id, "save", row)
                 _handle_save(app, db, channel, ts, job_id)
                 counts["saved"] += 1

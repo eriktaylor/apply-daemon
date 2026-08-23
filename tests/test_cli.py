@@ -135,7 +135,8 @@ class TestJsonContract:
         _, payload = _run_json(capsys, "next")
         assert set(payload) == {"verb", "count", "listings", "max_age_days",
                                 "hidden_stale", "awaiting_enrichment", "tiers",
-                                "seen", "backlog"}
+                                "seen", "backlog", "enrichment_remaining",
+                                "budget_can_run"}
         assert set(payload["listings"][0]) == self.CARD_KEYS
 
     def test_show_card_keys(self, db, capsys):
@@ -1137,6 +1138,15 @@ class TestRefreshVerb(_RefreshFixtures):
         assert payload["page"] is not None
         assert [c["id"] for c in payload["page"]["listings"]] == [job_id]
 
+    def test_chained_page_carries_headroom(self, db, capsys, mocker):
+        """The page is one contract: `next`, `refresh.page` and `enrich.page`
+        must carry the same keys. The first real `enrich` (2026-08-23) shipped
+        a page without these while `next` had them."""
+        self._ok(mocker)
+        _seed(db, title="Fresh Match", company="Acme", status="auto")
+        _, payload = _run_json(capsys, "refresh")
+        assert {"enrichment_remaining", "budget_can_run"} <= payload["page"].keys()
+
     def test_chain_renders_cards_in_human_output(self, db, capsys, mocker):
         self._ok(mocker)
         _seed(db, title="Fresh Match", company="Acme", status="auto")
@@ -1447,6 +1457,188 @@ class TestEnrichmentCapacityIsVisible:
         assert "0/10 used today" in out and "10 left" in out
 
 
+class TestNextReportsHeadroom:
+    """C-12 half A — a thin page must say whether it can be topped up.
+
+    `awaiting_enrichment` says work is waiting; on its own it sent the reader
+    to a 9-minute refresh. These two say whether the cheap verb can convert
+    that backlog right now.
+    """
+
+    @pytest.fixture(autouse=True)
+    def _budget_env(self, tmp_path, monkeypatch):
+        monkeypatch.setenv("RUN_LOG_PATH", str(tmp_path / "run_log"))
+        monkeypatch.setenv("MODEL_USAGE_LOG_PATH", str(tmp_path / "usage.log"))
+        for k in ("DAILY_USD_BUDGET", "MIN_RUN_INTERVAL_MINUTES",
+                  "RUN_USD_ESTIMATE", "BUDGET_ALLOW_UNPRICED"):
+            monkeypatch.delenv(k, raising=False)
+
+    def test_reports_slots_and_permission(self, db, capsys, monkeypatch):
+        monkeypatch.setenv("AUTOPILOT_TOP_N", "15")
+        _seed(db, title="Raw", company="R", status="auto_queued")
+        _, payload = _run_json(capsys, "next")
+        assert payload["enrichment_remaining"] == 15
+        assert payload["budget_can_run"] is True
+
+    def test_reports_a_budget_block(self, db, capsys, monkeypatch):
+        from src.budget import record_run
+        monkeypatch.setenv("MIN_RUN_INTERVAL_MINUTES", "60")
+        record_run("prior")
+        _, payload = _run_json(capsys, "next")
+        assert payload["budget_can_run"] is False
+
+    def test_cap_spent_is_reported_as_zero(self, db, capsys, monkeypatch):
+        monkeypatch.setenv("AUTOPILOT_TOP_N", "0")
+        _, payload = _run_json(capsys, "next")
+        assert payload["enrichment_remaining"] == 0
+
+    def test_next_still_spends_nothing_and_runs_nothing(self, db, capsys,
+                                                        mocker, monkeypatch):
+        """Settled in C-12 and not to be re-litigated: reporting headroom must
+        not start spending it. `next` stays a pure DB read."""
+        monkeypatch.setenv("AUTOPILOT_TOP_N", "15")
+        run = mocker.patch("subprocess.run")
+        popen = mocker.patch("subprocess.Popen")
+        _seed(db, title="Raw", company="R", status="auto_queued")
+        code, _ = _run_json(capsys, "next")
+        assert code == 0
+        run.assert_not_called()
+        popen.assert_not_called()
+
+    def test_status_and_next_agree_on_the_number(self, db, capsys, monkeypatch):
+        """One computation, two surfaces — the point of the extraction."""
+        monkeypatch.setenv("AUTOPILOT_TOP_N", "7")
+        _, page = _run_json(capsys, "next")
+        _, status = _run_json(capsys, "status")
+        assert page["enrichment_remaining"] == \
+            status["queue"]["enrichment_remaining"] == 7
+        assert page["budget_can_run"] == status["budget"]["can_run"]
+
+
+class TestEnrichVerb(_RefreshFixtures):
+    """C-12 half B — the gated route to autopilot alone.
+
+    `python -m src.process_queue` spends outside the ceiling and the cooldown;
+    this verb is the same work under the same gate. Every test mocks
+    subprocess; none of these may actually launch a stage.
+    """
+
+    def test_is_a_registered_subcommand(self):
+        from src.cli import build_parser
+        args = build_parser().parse_args(["enrich", "--json"])
+        assert args.verb == "enrich"
+        assert args.top_n is None and args.force is False
+
+    def test_runs_only_the_autopilot_stage(self, db, capsys, mocker):
+        from src.cli import ENRICH_STAGE
+        run = self._ok(mocker)
+        code, payload = _run_json(capsys, "enrich")
+        assert code == 0 and payload["ok"] is True
+        assert run.call_count == 1                      # no scrape, no email
+        assert run.call_args.args[0][-1] == ENRICH_STAGE[1] == "src.process_queue"
+        assert payload["stage"]["module"] == "src.process_queue"
+
+    def test_blocked_by_budget_runs_nothing(self, db, capsys, mocker,
+                                            monkeypatch):
+        from src.budget import record_run
+        monkeypatch.setenv("MIN_RUN_INTERVAL_MINUTES", "60")
+        record_run("prior")
+        run = self._ok(mocker)
+        code, payload = _run_json(capsys, "enrich")
+        assert code == 1 and payload["ok"] is False
+        assert payload["error"] == "budget_blocked"
+        assert "Cooldown" in payload["reason"]
+        run.assert_not_called()          # nothing spent
+
+    def test_force_overrides_the_block(self, db, capsys, mocker, monkeypatch):
+        from src.budget import record_run
+        monkeypatch.setenv("MIN_RUN_INTERVAL_MINUTES", "60")
+        record_run("prior")
+        run = self._ok(mocker)
+        code, payload = _run_json(capsys, "enrich", "--force")
+        assert code == 0 and payload["ok"] is True
+        assert run.call_count == 1
+
+    def test_records_the_run_for_the_cooldown(self, db, capsys, mocker):
+        """The gap this verb closes: the module itself records nothing, so a
+        loop of direct calls was uncapped."""
+        from src.budget import last_run_at
+        self._ok(mocker)
+        assert last_run_at() is None
+        _run_json(capsys, "enrich")
+        assert last_run_at() is not None
+
+    def test_top_n_overrides_env_for_this_run_only(self, db, capsys, mocker,
+                                                   monkeypatch):
+        import os
+        monkeypatch.setenv("AUTOPILOT_TOP_N", "10")
+        run = self._ok(mocker)
+        _run_json(capsys, "enrich", "--top-n", "3")
+        assert run.call_args.kwargs["env"]["AUTOPILOT_TOP_N"] == "3"
+        assert os.environ["AUTOPILOT_TOP_N"] == "10"   # process env untouched
+
+    def test_json_envelope_keys(self, db, capsys, mocker):
+        self._ok(mocker)
+        _, payload = _run_json(capsys, "enrich")
+        assert set(payload) == {"verb", "ok", "stage", "spent_usd_this_run",
+                                "spent_usd_today", "page"}
+        assert payload["verb"] == "enrich"
+        assert set(payload["stage"]) == {"stage", "module", "status",
+                                         "returncode", "seconds", "log"}
+
+    def test_chains_into_the_first_page(self, db, capsys, mocker):
+        """Same C-5 contract as refresh: the verb exists for the rows it made
+        reviewable, so it shows them."""
+        self._ok(mocker)
+        job_id = _seed(db, title="Fresh Match", company="Acme", status="auto")
+        _, payload = _run_json(capsys, "enrich")
+        assert [c["id"] for c in payload["page"]["listings"]] == [job_id]
+
+    def test_chained_page_carries_headroom(self, db, capsys, mocker):
+        """Same page contract as refresh — see the refresh test of this name."""
+        self._ok(mocker)
+        _seed(db, title="Fresh Match", company="Acme", status="auto")
+        _, payload = _run_json(capsys, "enrich")
+        assert {"enrichment_remaining", "budget_can_run"} <= payload["page"].keys()
+
+    def test_reports_incremental_cost(self, db, capsys, mocker, tmp_path):
+        import subprocess
+        from datetime import datetime, timezone
+        log = tmp_path / "usage.log"
+        now = datetime.now(timezone.utc).isoformat()
+        log.write_text(f"{now}|research_synth|google/gemini-3.1-flash-lite|1000\n",
+                       encoding="utf-8")
+
+        def _spend(*a, **k):
+            with open(log, "a", encoding="utf-8") as f:
+                f.write(f"{now}|research_synth|google/gemini-3.1-flash-lite|1000\n")
+            return subprocess.CompletedProcess(args=[], returncode=0,
+                                               stdout="", stderr="")
+        mocker.patch("subprocess.run", side_effect=_spend)
+        _, payload = _run_json(capsys, "enrich")
+        assert payload["spent_usd_this_run"] > 0
+        assert payload["spent_usd_today"] > payload["spent_usd_this_run"]
+
+    def test_failure_is_reported_not_raised(self, db, capsys, mocker):
+        import subprocess
+        mocker.patch("subprocess.run", return_value=subprocess.CompletedProcess(
+            args=[], returncode=1, stdout="", stderr="boom"))
+        code, payload = _run_json(capsys, "enrich")
+        assert code == 1
+        assert payload["ok"] is False
+        assert payload["stage"]["status"] == "failed"
+        assert payload["page"] is not None     # the queue still answers
+
+    def test_shares_the_stage_runner_with_refresh(self, db, capsys, mocker):
+        """One subprocess block, not two: patching the runner must stop both."""
+        stage = mocker.patch("src.cli._run_stage", return_value={
+            "stage": "autopilot", "module": "src.process_queue", "status": "ok",
+            "returncode": 0, "seconds": 0.1, "log": None})
+        _run_json(capsys, "enrich")
+        _run_json(capsys, "refresh", "--force")
+        assert stage.call_count == 1 + len(self._blocking())
+
+
 class TestSweepVerb:
     """`cli sweep` is sweeper's dispatch with ✏️ deferred — the JSON contract
     the skill reads, and the promise that a failed sweep is reported, not
@@ -1477,3 +1669,27 @@ class TestSweepVerb:
         code, payload = _run_json(capsys, "sweep")
         assert code == 1
         assert payload["error"] == "sweep_failed" and "slack down" in payload["detail"]
+
+
+class TestSpentSince:
+    """The first run of a UTC day starts from an empty usage log, so the
+    budget check *before* it is unpriced. That is $0.00, not unknown — the
+    first real `enrich` (2026-08-23) reported `spent_usd_this_run: null` on a
+    run that spent $0.07, and `refresh` had always done the same."""
+
+    def _d(self, usd):
+        from src.budget import BudgetDecision
+        return BudgetDecision(allowed=True, spent_usd=usd)
+
+    def test_unpriced_start_priced_end_is_the_whole_run(self):
+        from src.cli import _spent_since
+        assert _spent_since(self._d(None), self._d(0.0744)) == 0.0744
+
+    def test_priced_both_ends_is_the_difference(self):
+        from src.cli import _spent_since
+        assert _spent_since(self._d(0.12), self._d(0.19)) == 0.07
+
+    def test_unpriced_end_is_unknown(self):
+        from src.cli import _spent_since
+        assert _spent_since(self._d(0.12), self._d(None)) is None
+        assert _spent_since(self._d(None), self._d(None)) is None

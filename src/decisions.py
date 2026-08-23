@@ -43,6 +43,14 @@ DECISIONS: dict[str, tuple[str, str]] = {
 # goes through re-triage, not a save.
 TERMINAL_STATUSES = frozenset({"passed", "expired"})
 
+# Statuses a save may not *downgrade* out of. `saved` is the promotion out of
+# review; these rows are already past it, and `db.update_pipeline_status` is
+# an unconditional UPDATE, so without this rule a 👍 on a tailored card — or
+# `cli save <id>` on one — silently regresses it to `saved`. Both surfaces
+# allowed that before 2026-08-22 (the CLI by omission, Slack only because an
+# unrelated guard refused every non-triaged save; see plan R-6).
+NO_DOWNGRADE_TO_SAVED = frozenset({"tailored", "applied", "interviewing"})
+
 
 def target_status(verb: str) -> str:
     """The `pipeline_status` a verb transitions to."""
@@ -59,14 +67,17 @@ def is_allowed(current_status: str | None, verb: str) -> bool:
 
     False when the row is already at the target status (so a repeated action
     doesn't append duplicate ledger rows and inflate the preference-pair
-    corpus with phantom decisions), and False for a save out of a terminal
-    status.
+    corpus with phantom decisions), False for a save out of a terminal
+    status, and False for a save that would downgrade a row already past
+    ``saved`` (``NO_DOWNGRADE_TO_SAVED``).
     """
     if verb not in DECISIONS:
         return False
     if current_status == target_status(verb):
         return False
     if verb == "save" and current_status in TERMINAL_STATUSES:
+        return False
+    if verb == "save" and current_status in NO_DOWNGRADE_TO_SAVED:
         return False
     return True
 

@@ -117,6 +117,29 @@ OWNERSHIP: list[tuple[str, str, str]] = [
     ),
 ]
 
+# (concept, module, regex) — concepts whose callers ALL live in one module,
+# counted *within* that file. OWNERSHIP cannot see these: a second copy inside
+# the owner is not an intruder, so the lint above passes while the drift is
+# already there. `status` and `next` both need the enrichment headroom and
+# both live in cli.py, which is exactly that shape (C-12).
+SINGLE_SITE: list[tuple[str, str, str]] = [
+    (
+        "enrichment headroom (cap minus what autopilot finalized today)",
+        "cli.py",
+        r"count_autopilot_processed_today\(",
+    ),
+    (
+        "pipeline stage subprocess launch (refresh's chain and enrich's one)",
+        "cli.py",
+        r"subprocess\.run\(",
+    ),
+    (
+        "pre-run budget refusal envelope (error: budget_blocked)",
+        "cli.py",
+        r'"error": "budget_blocked"',
+    ),
+]
+
 # Patterns no module may contain, with the reason. Distinct from OWNERSHIP:
 # these have no owner — the shape itself is the defect.
 BANNED: list[tuple[str, str]] = [
@@ -167,8 +190,72 @@ def test_owner_still_implements_it(concept: str, owner: str, pattern: str) -> No
     )
 
 
+@pytest.mark.parametrize(
+    "concept,module,pattern", SINGLE_SITE,
+    ids=[row[1] + ":" + row[0][:28] for row in SINGLE_SITE],
+)
+def test_concept_has_exactly_one_call_site(concept: str, module: str,
+                                           pattern: str) -> None:
+    """One implementation *within* a file, for concepts with one owning module.
+
+    Fails in both directions on purpose: two hits is the copy this guards
+    against, zero hits is a stale entry protecting nothing.
+    """
+    text = (SRC / module).read_text(encoding="utf-8")
+    hits = re.findall(pattern, text)
+    assert len(hits) == 1, (
+        f"{concept!r} appears {len(hits)}x in src/{module}; it must be "
+        f"computed in exactly one function and called from the rest "
+        f"(see CLAUDE.md → Anti-drift in code)."
+    )
+
+
 @pytest.mark.parametrize("pattern,why", BANNED, ids=[row[0][:32] for row in BANNED])
 def test_banned_pattern_absent(pattern: str, why: str) -> None:
     # eval/ is in scope: the original offender for the first entry lived there.
     offenders = _modules_matching(pattern, roots=(SRC, EVAL))
     assert not offenders, f"{', '.join(sorted(offenders))}: {why}"
+
+
+# Branch headers in sweeper._dispatch_reactions whose first statement must be
+# the shared guard. Save and pass only — see the docstring below.
+DISPATCH_POLICY_BRANCHES: list[tuple[str, str]] = [
+    ("pass", 'if highest == "pass":'),
+    ("save", 'elif highest == "save":'),
+]
+
+
+@pytest.mark.parametrize(
+    "verb,header", DISPATCH_POLICY_BRANCHES,
+    ids=[row[0] for row in DISPATCH_POLICY_BRANCHES],
+)
+def test_reaction_dispatch_defers_to_decision_policy(verb: str, header: str) -> None:
+    """The import being present is not evidence the call site uses it.
+
+    That is exactly how R-6 survived R-1: ``sweeper.py`` imported
+    ``decisions.is_allowed`` and ``_handle_save`` called it correctly, so every
+    grep for the policy looked clean — while ``_dispatch_reactions`` kept a
+    stricter hard-coded ``current_status == "triaged"`` in front of it. The
+    correct guard was unreachable, and a 👍 on any autopilot row was counted
+    skipped with no ledger write.
+
+    So this asserts the *call site*: the first statement of each of these
+    branches must be an ``is_allowed(`` test. Scoped to save and pass — the
+    tailor branch legitimately switches on status literals (``in ("triaged",
+    "saved")``, ``== "auto"``) because it is routing to different work, not
+    applying a second permission rule.
+    """
+    lines = (SRC / "sweeper.py").read_text(encoding="utf-8").splitlines()
+    starts = [i for i, line in enumerate(lines) if line.strip() == header]
+    assert len(starts) == 1, (
+        f"Expected exactly one {header!r} branch in src/sweeper.py, found "
+        f"{len(starts)} — this lint is keyed to that line and is now stale."
+    )
+
+    body = next(line for line in lines[starts[0] + 1:] if line.strip())
+    assert "is_allowed(" in body, (
+        f"The {verb!r} branch of sweeper._dispatch_reactions guards with "
+        f"{body.strip()!r} instead of decisions.is_allowed(). A status literal "
+        f"here shadows the shared policy rather than consulting it — that is "
+        f"the R-6 defect (see CLAUDE.md → Anti-drift in code)."
+    )

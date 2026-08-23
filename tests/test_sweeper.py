@@ -408,11 +408,11 @@ def _run_dispatch(db, mocker, job_id, status, reactions):
     mock_tailor = mocker.patch("src.sweeper._handle_tailor")
     mock_pass = mocker.patch("src.sweeper._handle_pass")
     mock_router = mocker.patch("src.sweeper._handle_smart_router", return_value="questions")
-    mocker.patch("src.sweeper._append_human_label")
+    mock_label = mocker.patch("src.sweeper._append_human_label")
 
     _dispatch_reactions(mock_app, db, "C_TEST", [job_card], counts)
 
-    return counts, mock_save, mock_tailor, mock_pass, mock_router, listing.id
+    return counts, mock_save, mock_tailor, mock_pass, mock_router, listing.id, mock_label
 
 
 class TestReactionDispatchGates:
@@ -425,6 +425,46 @@ class TestReactionDispatchGates:
         mock_save.assert_called_once()
         mock_tailor.assert_not_called()
         mock_pass.assert_not_called()
+        assert counts["saved"] == 1
+
+    def test_save_from_auto(self, db, mocker):
+        """R-6 regression: 👍 on an autopilot card must save, not skip.
+
+        The live DB is almost entirely `auto` / `auto_queued`; the old
+        `current_status == "triaged"` guard refused every one of them.
+        """
+        counts, mock_save, mock_tailor, mock_pass, *_ = _run_dispatch(
+            db, mocker, "jid-save-auto", "auto", ["+1"]
+        )
+        mock_save.assert_called_once()
+        mock_tailor.assert_not_called()
+        mock_pass.assert_not_called()
+        assert counts["saved"] == 1
+        assert counts["skipped"] == 0
+
+    def test_save_from_auto_queued(self, db, mocker):
+        counts, mock_save, mock_tailor, mock_pass, *_ = _run_dispatch(
+            db, mocker, "jid-save-auto-queued", "auto_queued", ["+1"]
+        )
+        mock_save.assert_called_once()
+        mock_tailor.assert_not_called()
+        mock_pass.assert_not_called()
+        assert counts["saved"] == 1
+        assert counts["skipped"] == 0
+
+    def test_save_from_auto_writes_ledger(self, db, mocker):
+        """The second-order damage: a refused save also loses the human label.
+
+        `data/human_labels.jsonl` is the only input to the preference-pair
+        extractor, so a save that never appends is invisible to the ranking
+        work — with no error and no count to notice it by.
+        """
+        counts, _, __, ___, ____, job_id, mock_label = _run_dispatch(
+            db, mocker, "jid-save-auto-ledger", "auto", ["+1"]
+        )
+        mock_label.assert_called_once()
+        assert mock_label.call_args.args[0] == job_id
+        assert mock_label.call_args.args[1] == "save"
         assert counts["saved"] == 1
 
     def test_save_skipped_when_already_saved(self, db, mocker):

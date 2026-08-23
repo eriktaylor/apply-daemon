@@ -24,7 +24,7 @@ python -m src.jobspy_ingest     # Track A: proactive JobSpy scrape
 python -m src.pipeline          # Track B: email ingestion
 python -m src.digest            # Post Slack digest cards
 python -m src.sweeper           # Process Slack reactions + ChatOps commands
-python -m src.cli status        # CLI review surface (also: refresh/next/saved/sweep/show/deep-dive/save/pass)
+python -m src.cli status        # CLI review surface (also: refresh/enrich/next/saved/sweep/show/deep-dive/save/pass)
                                 # tailor + polish/cover-letter/interview-prep/answers: in-session by default
 python -m src.batch_process     # Concurrent tailor for all saved listings
 python -m src.process_queue     # Autopilot Speculative Agent (no-op unless AUTOPILOT_ENABLED=true)
@@ -179,10 +179,10 @@ intended driver is the bundled skill in `.claude/skills/apply-daemon/`, which
 is where per-verb guidance lives — this section covers only what a coding
 agent working *on* the repo needs.
 
-**`refresh` chains into a page in the same call** (`page` in its JSON) — a
-listing-producing verb should never require a follow-up call to show its
-results. *When* to call `refresh` versus `sweep`/`next` is runtime routing
-policy, owned by the skill, not this file.
+**`refresh` and `enrich` both chain into a page in the same call** (`page` in
+their JSON) — a listing-producing verb should never require a follow-up call
+to show its results. *When* to call `refresh` versus `enrich`/`sweep`/`next`
+is runtime routing policy, owned by the skill, not this file.
 
 **A new on-demand asset is a registry entry, never a new code path.**
 `polish`, `cover-letter`, `interview-prep`, and `answers` share `tailor`'s

@@ -15,15 +15,16 @@ Every verb takes `--json`; parse that, never the prose output.
 default shell here, and `source .venv/bin/activate` does not persist between
 tool calls. The explicit interpreter path always works and needs no setup.
 
-Reviewing is free. **`refresh` is the one verb that spends metered money on
-its own** (any verb given `--via api` also does) — check `status` first and
-say what it will cost.
+Reviewing is free. **`refresh` and `enrich` are the two verbs that spend
+metered money on their own** (any verb given `--via api` also does) — check
+`status` first and say what it will cost.
 
 ## The loop
 
 ```
 .venv/bin/python -m src.cli status --json            # worth running? can it afford to?
 .venv/bin/python -m src.cli refresh --json          # get fresh listings (spends money)
+.venv/bin/python -m src.cli enrich --json            # enrich already-stored rows (spends, ~10x cheaper than refresh)
 .venv/bin/python -m src.cli next --top 3 --json      # a page of NEW candidates
 .venv/bin/python -m src.cli next --seen --json       # the backlog: shown, still undecided
 .venv/bin/python -m src.cli saved --json             # what they kept
@@ -47,8 +48,10 @@ only question that matters: is there already fresh work?
   that will not be reviewable until the *next* run enriches them, so
   refreshing on a stocked queue makes the user wait and pay for nothing they
   can act on now.
-- **`queue.ready == 0`** → refresh is the right call. Say what it will cost
-  and that it takes a few minutes, then run it; it chains into a page.
+- **`queue.ready == 0`** → something has to run. With
+  `queue.awaiting_enrichment > 0` and slots left, that is `enrich`; otherwise
+  `refresh`. Say what it will cost and roughly how long, then run it — both
+  chain into a page.
 - **`queue.enrichment_remaining == 0`** → say so before refreshing. Autopilot
   is what produces reviewable cards and Slack posts; with its daily cap spent
   a refresh still ingests and still bills, but adds nothing to either surface
@@ -132,11 +135,19 @@ surface is speed *to a decision*, and a decision needs the posting.
   `max_age_days`. Report it when nonzero. If the user wants them anyway,
   `next --max-age 0`.
 - `count: 0` with `awaiting_enrichment > 0` means fresh listings exist but
-  autopilot hasn't enriched them — a refresh enriches the next batch. This is
-  the common empty page; offer the refresh (and its cost) rather than saying
-  "nothing to review".
+  autopilot hasn't enriched them. This is the common empty page; offer
+  `enrich` (below) rather than saying "nothing to review".
 - `count: 0` with `hidden_stale > 0` means the queue is stale, not empty —
   say a refresh would bring new listings rather than "nothing to review".
+
+**A thin page with `enrichment_remaining > 0` and `budget_can_run: true` is an
+un-topped-up queue, not an empty one — offer `enrich`, not `refresh`.**
+`refresh` is for *new* listings; `enrich` converts the backlog that is already
+stored. It spends metered money, so say so, but roughly a tenth of a refresh
+and in a fraction of the time. Its envelope is refresh's with a single `stage`
+instead of `stages`, and it chains into a `page` the same way. With
+`enrichment_remaining: 0` neither verb adds cards today; with
+`budget_can_run: false` neither may run at all.
 
 **The feed never repeats itself.** A listing shown once leaves `next`
 permanently — delivery already happened, and re-showing it is staleness, not
@@ -166,8 +177,8 @@ and returns any ✏️ ids in `pending_tailors`. It is free and fast.
   that is the expensive path. From here, `cli tailor <id>` is strictly better
   and produces identical artifacts.
 
-**`refresh`** runs the pipeline and returns the first page. It, and any verb
-given `--via api`, are the only ways to spend metered money.
+**`refresh`** runs the pipeline and returns the first page. It, `enrich`, and
+any verb given `--via api`, are the only ways to spend metered money.
 
 - Check `status` first — see "Default motion" above. Refreshing a stocked
   queue costs minutes and money for listings that are not yet reviewable.
