@@ -9,7 +9,8 @@
 > `!prep`, `!polish`, `!regenerate`, `!update`, `!answer`, …) are frozen:**
 > they work as documented, but no new verbs will be added here. New
 > post-triage functionality goes to the CLI review surface
-> (`python -m src.cli`), which a Claude Code skill drives conversationally.
+> (`python -m src.cli`; verb reference: [`docs/CLI.md`](CLI.md)), which a
+> Claude Code skill drives conversationally.
 >
 > Rationale: thread commands grew to ~2,000 lines re-implementing an
 > interactive shell inside Slack messages. The same verbs are cheaper and
