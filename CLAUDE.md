@@ -169,6 +169,7 @@ apply-daemon/
 
 - Never commit `.env`, `*.db`, `my_profile/`, or any `my_profile_*/` variant other than `my_profile_example/`.
 - Test fixtures must be synthetic — no real listings, real emails, or real credentials.
+- `plans/` is public — record aggregates, never rows. Raw output on real data goes in `data/reports/` (gitignored); the plan keeps a pointer. Full rule: SECURITY.md; enforced by `tests/test_plans_hygiene.py`.
 - Logging must emit listing IDs + decisions only — **never raw email content, LLM prompts/responses, or credentials.**
 - Don't weaken `.gitignore`, disable TLS verification, or add raw-content logging.
 

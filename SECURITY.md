@@ -81,6 +81,11 @@ this is a personal-data tool that ships in public.
    for installs. New dependencies require a brief justification in the PR.
 8. **Boundary checks live at I/O.** Validate on the way in (email
    parser, web fetch, user-supplied config). Trust internal calls.
+9. **`plans/` is public — record aggregates, never rows.** No listing
+   IDs, company/title pairs of real listings, email addresses, invoice
+   figures, or local/scratchpad paths in a development plan. Raw output
+   on real data belongs in `data/reports/` (gitignored); the plan keeps
+   a pointer to it. Enforced by `tests/test_plans_hygiene.py`.
 
 ## Files that must never be committed
 
